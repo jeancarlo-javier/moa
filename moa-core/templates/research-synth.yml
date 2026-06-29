@@ -1,0 +1,54 @@
+# .moa.yml — research-synth
+# Two-stage research: a fast gatherer collects cited facts, a strong synthesizer
+# turns them into a written artifact. Ends with a validate gate for synthesis quality.
+# Use for write-ups, briefings, and analyses that summarize external evidence.
+schemaVersion: 1
+
+template:
+  base: research
+  projectType: auto
+
+# Model registry — filled by init with ONLY the models the roles below use (the union of init's
+# per-role picks), not the full list the host can serve. Keys are model short-names (e.g. gpt-5.5);
+# capability labels go in `tags`. Empty until init runs. Roles ship `use: [auto]` as a
+# placeholder — init pins the latest capable model per role (one primary + a trailing `auto`); a
+# remaining `auto` is resolved by the master at run time.
+models: {}
+
+master:
+  selfCertification: forbidden
+  hardVerificationTags: [strong]
+
+roles:
+  gatherer:
+    use: [auto]
+    tools: web_research
+    instructions: |
+      Collect cited facts only — no synthesis, no prose. Emit a research-facts.json
+      with claim/source/quote/confidence/relevance per item. Raw pages stay out of
+      write-capable roles.
+
+  synthesizer:
+    use: [auto]
+    tools: repo_read_only
+    instructions: |
+      Turn the typed research-facts.json into the requested artifact. Cite every
+      non-trivial claim to its source row; do not invent evidence the facts do not
+      support.
+
+  verifier:
+    use: [auto]
+    tools: verify_test
+    differentModelFrom: synthesizer
+    instructions: |
+      Independently check that every claim in the artifact traces to a row in
+      research-facts.json and that no invented evidence slipped in.
+
+pipelines:
+  research:
+    steps:
+      - { phase: frame,      role: master }
+      - { phase: gather,     role: gatherer }
+      - { phase: synthesize, role: synthesizer }
+      - { phase: validate,   role: verifier, gate: critical }
+      - { phase: finalize,   role: master }

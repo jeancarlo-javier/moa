@@ -1,0 +1,186 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://moa/config.schema.json",
+  "title": "moa project config (.moa.yml)",
+  "description": "Source of truth for the per-project workflow. YAML is parsed as a safe subset (no anchors, no merge keys, no duplicate keys, known keys only) and normalized to this JSON before execution. Names NO specific CLI; runtime specifics live in binding packages.\n\nSERIALIZATION STANDARD (what `init` emits, what templates follow): (1) Every key is MONOMORPHIC — one YAML type, always; no key is 'sometimes a scalar, sometimes an array'. Every multi-value field is an array (incl. 'effort'); every named collection ('models' registry, 'roles', 'toolPolicies') is a map. (2) STYLE: block style for all maps; flow style ONLY for short scalar arrays (e.g. tags: [strong, fast], use: [opus, auto]) and for the tabular step rows under pipelines.<name>.steps ({ phase, role, gate }). (3) EMPTIES: empty map -> {}, empty list -> []. (4) DEFAULTS: omit any key equal to its schema default; write a key only to override.",
+  "type": "object",
+  "required": ["schemaVersion"],
+  "additionalProperties": false,
+  "properties": {
+    "schemaVersion": { "const": 1 },
+
+    "runtime": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "resolution": { "enum": ["by-model"], "default": "by-model",
+          "description": "Route each role to the binding that serves its model; constraint-first, then prefer native." },
+        "subagents": { "enum": ["auto", "native", "external", "blocked"], "default": "auto",
+          "description": "Spawn-source policy — a filter on binding routing. auto: best available (prefer cross-family/external for gate verifiers, fall back to host-native). native: host-native subagents only. external: learned-tool subagents only. blocked: no subagents (master works solo, self-check only). Default auto prompts only at consequential forks (first external-tool use; critical work with no cross-family verifier) and offers to pin; a pinned value runs silent. The verification grade reached (cross-family > same-family > self-check) is always named; only master.mode strict halts a critical gate that cannot reach cross-family." },
+        "requireEnforcement": { "enum": ["strict", "sandbox", "best-effort"], "default": "strict",
+          "description": "PARKED (currently inert — graded tool-policy enforcement is archived in the repo's bindings/). Kept so existing configs validate. When enforcement is re-implemented: fail-closed floor — a binding whose enforcementGrade is below this cannot run the role." },
+        "workDir": { "type": "string", "default": ".moa" },
+        "defaults": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "timeoutSeconds": { "type": "integer", "minimum": 1, "default": 1800 },
+            "maxParallel": { "type": "integer", "minimum": 1, "default": 4 },
+            "maxGateLoops": { "type": "integer", "minimum": 0, "default": 2 },
+            "maxCost": { "type": "number", "minimum": 0 },
+            "maxTokens": { "type": "integer", "minimum": 0 },
+            "noExternalSkills": { "type": "boolean", "default": true },
+            "noExternalExtensions": { "type": "boolean", "default": true },
+            "failOnUnknownTool": { "type": "boolean", "default": true },
+            "allowInlineWithoutGates": { "type": "boolean", "default": false,
+              "description": "Opt-in: permit non-critical repo mutations to skip gates; such results are labeled 'unverified inline mode'." }
+          }
+        }
+      }
+    },
+
+    "template": {
+      "type": "object",
+      "additionalProperties": false,
+      "properties": {
+        "base": { "enum": ["research", "engineering", "migration", "qa", "design", "custom"] },
+        "projectType": { "type": "string", "default": "auto" }
+      }
+    },
+
+    "models": {
+      "type": "object",
+      "description": "Model registry: ONLY the models THIS project's roles actually use, declared once with their properties — init writes the union of its per-role picks, NOT the full set the host can serve (that dump is bloat the team pays for on every run). Replaces the old 'tiers' map. Optional and may be empty {} — roles that use 'auto' resolve against live host discovery. The key is the model's SHORT-NAME (e.g. 'gemini-3-pro', 'opus'); 'id' holds the full provider ref. Capability labels (strong, cheap, fast, smol, designer, vision, …) go in 'tags' — NEVER in the key. 'auto' is reserved as the role wildcard and must not be used as a key. Roles select models by listing their short-names in 'role.use' (the per-role list; 'models' here is always the registry MAP).",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "id": { "type": "string",
+            "description": "Concrete model ref the binding understands (e.g. 'google-antigravity/gemini-3-pro'). The registry key is this model's short-name; 'id' is the full ref. If omitted, the key itself is used as the ref. A ':<effort>' suffix on the ref is a baked default that 'effort' overrides." },
+          "effort": {
+            "type": "array", "items": { "type": "string" }, "minItems": 1, "default": ["auto"],
+            "description": "Reasoning/thinking effort — ALWAYS an array (one shape, never a bare scalar). A single-element array (e.g. ['medium'], or the default ['auto'] to let the binding choose) PINS one effort. A multi-element ascending array (e.g. ['low','medium','xhigh']) is an escalation LADDER: the master starts at rung 0 and climbs one rung per gate loop-back. Overrides any ':<effort>' suffix baked into 'id'/key; ignored by models without effort control." },
+          "tags": { "type": "array", "items": { "type": "string" }, "default": [],
+            "description": "Capability labels — the successor to tier names. The master matches these when a role uses 'auto', and the floor 'master.hardVerificationTags' filters on them. Conventional: strong, cheap, fast, vision. Freeform welcome: maths, architecture, hard, smol, designer, reasoning, coder, triage." },
+          "family": { "type": "string",
+            "description": "Independence group / model family, used for verifier-independence at gates. If omitted, discovered via the binding's serves(). Pinning it makes gate independence deterministic and resolvable offline." },
+          "binding": { "type": "string",
+            "description": "Optional: pin the binding that serves this model (host-native, or a learned tool profile in ~/.moa/bindings/), overriding routing preference." },
+          "provider": { "type": "string",
+            "description": "Optional provider label; usually derivable from the 'id'/key prefix." },
+          "context": { "type": "integer", "minimum": 1,
+            "description": "Optional: context-window size in tokens. Lets the master route large tasks to large-context models." },
+          "cost": { "enum": ["cheap", "standard", "premium"],
+            "description": "Optional coarse cost class for budget-aware routing; complements runtime.defaults.maxCost." },
+          "priority": { "type": "integer",
+            "description": "Optional tie-break order among tag-matched candidates (lower = preferred). Defaults to declaration order." },
+          "enabled": { "type": "boolean", "default": true,
+            "description": "Set false to keep a model declared but exclude it from resolution." }
+        }
+      }
+    },
+
+    "master": {
+      "type": "object",
+      "additionalProperties": false,
+      "description": "The conductor = the agent running the skill (host agent). Not a spawn target.",
+      "properties": {
+        "mode": { "enum": ["strict", "auto"], "default": "auto",
+          "description": "How literally the master runs the pipeline. 'strict': pipeline verbatim — every declared phase runs with its declared role×model, nothing skipped/merged/inlined, master performs no producing role (use for CI/release). 'auto' (default): master may right-size non-gate, non-critical phases and may author small mutations itself, each with a logged reason — but the gate floor is absolute: every gatesRequired phase runs with the config-resolved model, and verifier independence holds against the ACTUAL producer (the coder, or the master if it authored the change)." },
+        "modelAdvisory": {
+          "type": "object",
+          "additionalProperties": false,
+          "description": "Advisory only: if the host model is weaker than this, lean harder on gates.",
+          "properties": {
+            "minContextTokens": { "type": "integer", "minimum": 0 },
+            "optimizeFor": { "type": "array", "items": { "type": "string" } }
+          }
+        },
+        "selfCertification": { "enum": ["forbidden"], "default": "forbidden" },
+        "hardVerificationTags": { "type": "array", "items": { "type": "string" }, "default": ["strong"],
+          "description": "The hard/critical verifier must be a model carrying ALL these tags (successor to hardVerificationTier). Default ['strong']." },
+        "instructions": { "type": "string" }
+      }
+    },
+
+    "toolPolicies": {
+      "type": "object",
+      "description": "PARKED (currently advisory, not enforced — graded enforcement is archived in the repo's bindings/). Named least-privilege bundles. Kept so existing configs validate and so the master can still scope tools best-effort. When enforcement is re-implemented, a binding translates these canonical tool names to runtime controls.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "allow": { "type": "array", "items": { "type": "string" } },
+          "deny": { "type": "array", "items": { "type": "string" } },
+          "network": { "enum": ["none", "web_only", "off_sandbox"] },
+          "filesystem": { "enum": ["none", "scratch_only", "read_only", "worktree_write", "worktree_copy"] },
+          "secrets": { "enum": ["scrubbed", "available"], "default": "scrubbed" },
+          "bash": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "mode": { "enum": ["argv_allowlist"], "default": "argv_allowlist" },
+              "allow": { "type": "array", "items": { "type": "array", "items": { "type": "string" } },
+                "description": "Each entry is a parsed argv pattern (tokens), NOT a shell glob string." },
+              "noShellMetachars": { "type": "boolean", "default": true }
+            }
+          }
+        }
+      }
+    },
+
+    "roles": {
+      "type": "object",
+      "minProperties": 1,
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "description": { "type": "string" },
+          "use": { "type": "array", "items": { "type": "string" }, "minItems": 1,
+            "description": "Ordered model candidates for this role — each a short-name from the top-level 'models' registry, or the literal 'auto' to let the master pick the best fit. (Renamed from the old 'models' to avoid colliding with the registry map: 'models' is always the registry MAP, 'use' is always a role's LIST of refs into it.) Tried left to right; the first available wins. 'auto' anywhere is a wildcard the master resolves (and as a trailing entry, a fallback if the pinned names ahead of it are unavailable). The sole model selector. For CI/release, pin explicit short-names instead of 'auto'." },
+          "effort": { "type": "array", "items": { "type": "string" }, "minItems": 1,
+            "description": "Optional per-role reasoning/thinking effort — ALWAYS an array, same shape and rules as models.<name>.effort. A single-element array pins (e.g. ['high']); a multi-element ascending array is an escalation ladder climbed one rung per gate loop-back. Overrides the model's 'effort' and any ':<effort>' suffix baked into its id/key; ignored by models without effort control." },
+          "binding": { "type": "string", "description": "Optional: pin a specific binding (host-native or a learned tool profile), overriding routing preference." },
+          "tools": { "type": "string", "description": "Reference into toolPolicies (PARKED — advisory scoping only; enforcement is archived in the repo's bindings/)." },
+          "skills": { "type": "array", "items": { "type": "string" }, "default": [] },
+          "instructions": { "type": "string" },
+          "instructionsFile": { "type": "string" },
+          "differentModelFrom": { "type": "string", "description": "Role name whose model family this role must differ from." }
+        },
+        "required": ["use"]
+      }
+    },
+
+    "pipelines": {
+      "type": "object",
+      "description": "Named workflows (replaces the flat 'pipeline' list). Each key is a pipeline name. 'default' is special: its PRESENCE selects deterministic workflow mode (run it, right-sized per master.mode); its ABSENCE selects adaptive mode (config-present fork: the master adapts per task — answer inline, run a named pipeline chosen via its 'description', or compose an ad-hoc one from the role palette). 'default' is NOT required; the map may be {} (fully composed adaptive). 'roles' and 'models' are shared across every pipeline.",
+      "additionalProperties": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["steps"],
+        "properties": {
+          "description": { "type": "string",
+            "description": "One-liner the master uses to auto-select this pipeline for a task. Emit only when the config declares >=2 pipelines; a single-pipeline config selects by name." },
+          "steps": {
+            "type": "array",
+            "minItems": 1,
+            "items": {
+              "type": "object",
+              "additionalProperties": false,
+              "required": ["phase", "role"],
+              "properties": {
+                "phase": { "type": "string", "description": "Phase name; unique within this pipeline (loader-checked)." },
+                "role": { "type": "string", "description": "A role name, or 'master' for a master-owned phase." },
+                "gate": { "enum": ["none", "standard", "critical"], "default": "none",
+                  "description": "Gate tier — collapses the old gate+critical booleans and the top-level gatesRequired list into one field. 'none' (default, omit): a producing/master phase, right-sizeable in auto mode. 'standard': a mandatory checkpoint whose verifier is a DIFFERENT family than the producer (the nearest preceding non-gate, non-master phase). 'critical': standard PLUS the verifier carries all master.hardVerificationTags. No optional gates — a lighter flow is a different pipeline. Because 'critical' is a value of 'gate', 'critical-without-a-gate' is unrepresentable." },
+                "fanout": { "enum": ["none", "byDisjointWriteSet"], "default": "none" },
+                "loopBackTo": { "type": "string", "description": "Phase to return to on REVISE; must name a phase in this pipeline." }
+              }
+            }
+          }
+        }
+      }
+    }
+  }
+}

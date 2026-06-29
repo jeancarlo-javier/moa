@@ -1,0 +1,52 @@
+# .moa.yml — design
+# Design-review pipeline: a design consultant frames the surface, a builder produces
+# the artifact (mock, copy, tokens, prototype), and an independent design-reviewer gates it.
+# Use for product/UX/visual work where correctness = matching the brief and the system.
+schemaVersion: 1
+
+template:
+  base: design
+  projectType: auto
+
+# Model registry — filled by init with ONLY the models the roles below use (the union of init's
+# per-role picks), not the full list the host can serve. Keys are model short-names (e.g. gpt-5.5);
+# capability labels go in `tags`. Tag a vision/design-strong model `designer` so init routes the
+# consult/review roles to it. Roles ship `use: [auto]` as a placeholder — init pins the latest
+# capable model per role (one primary + a trailing `auto`); a remaining `auto` is resolved by the
+# master at run time.
+models: {}
+
+master:
+  selfCertification: forbidden
+  hardVerificationTags: [strong]
+
+roles:
+  design-consult:
+    use: [auto]
+    tools: repo_read_only
+    instructions: |
+      Frame the design brief: goals, audience, constraints, tokens to honor,
+      and the artifact(s) the builder must produce.
+
+  builder:
+    use: [auto]
+    tools: code_write_test
+    instructions: |
+      Produce the design artifact within the declared write-set (assets, tokens,
+      code). If something required is outside it, surface it instead of expanding.
+
+  design-reviewer:
+    use: [auto]
+    tools: repo_read_only
+    differentModelFrom: builder
+    instructions: |
+      Compare the artifact to the brief and to the surrounding system. Check
+      consistency, accessibility, and scope. APPROVE only when the brief is met.
+
+pipelines:
+  design:
+    steps:
+      - { phase: consult,  role: design-consult }
+      - { phase: build,    role: builder, loopBackTo: consult }
+      - { phase: review,   role: design-reviewer, gate: critical, loopBackTo: build }
+      - { phase: finalize, role: master }

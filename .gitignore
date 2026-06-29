@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# omp run scratch (logs/results/tasks from subagent runs)
+.omp-work/
+.omp-subagents.json
+
+# disposable working docs (design specs, analyses, scratch) — see AGENTS.md
+/temp-docs/
+
+# moa runtime artifacts
+.moa/runs/
+effective-config.json
+
+# local dogfooding config — this repo IS the moa skill source; running moa on
+# itself is a dev-time choice, not something to ship to skill consumers
+.moa.yml
+
+# Python
+__pycache__/
+*.pyc

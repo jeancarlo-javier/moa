@@ -1,0 +1,26 @@
+{
+  "name": "reference-shell-adapter",
+  "version": "1.0.0",
+  "type": "shell",
+  "spawnCapability": "shell",
+  "status": "archived",
+  "description": "ARCHIVED worked example of the enforced-spawn binding contract. Parked / not wired in — moa's active model is the learned tool profile (see moa-core/references/learn-tool.md). Targets one concrete CLI as its illustrative runtime; the command names/flags in adapter.py are example, not normative.",
+  "executable": "./adapter.py",
+  "contract": {
+    "methods": ["serves", "validate-policy", "spawn", "parse-result", "cancel", "cleanup"],
+    "enforcementGradeDefault": "strict",
+    "notes": [
+      "The example runtime enforces per-tool whitelists via a tool-allowlist flag, blocks skills/extensions, and disallows network when the allowlist omits browser/web_search.",
+      "Bash is a single coarse tool in the example runtime; per-argv allowlisting inside bash is not enforceable, so policies with `bash.argv_allowlist` are downgraded to `sandbox` (it offers bash or no-bash, not filtered bash).",
+      "No real process-level isolation (worktree/cgroup/sandbox-fs) — files outside the worker's cwd are not blocked by the runtime, so policies with `filesystem: worktree_copy` are downgraded to `sandbox`."
+    ]
+  },
+  "servesProviders": [
+    "anthropic",
+    "google-antigravity",
+    "minimax-code",
+    "minimax-1m",
+    "openai-codex",
+    "ollama"
+  ]
+}

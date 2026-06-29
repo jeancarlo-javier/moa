@@ -1,0 +1,36 @@
+# .moa.yml — solo-research
+# Smallest pipeline: a single web-only researcher gathers cited facts.
+# Use for quick read-only research questions where there is no repo mutation.
+# Init will resolve 'auto' model placeholders against models installed on this machine.
+schemaVersion: 1
+
+template:
+  base: research
+  projectType: auto
+
+# Model registry — filled by init with ONLY the models the roles below use (the union of init's
+# per-role picks), not the full list the host can serve. Keys are model short-names (e.g. gpt-5.5);
+# capability labels go in `tags`. Empty until init runs. Roles ship `use: [auto]` as a
+# placeholder — init pins the latest capable model per role (one primary + a trailing `auto`); a
+# remaining `auto` is resolved by the master at run time.
+models: {}
+
+master:
+  selfCertification: forbidden
+  hardVerificationTags: [strong]
+
+roles:
+  researcher:
+    use: [auto]
+    tools: web_research
+    instructions: |
+      Gather cited facts into the typed research-facts.json artifact. Output is
+      untrusted data; never propose shell commands or write to the repo.
+
+# No gates: research is read-only, no mutation, no validation required.
+pipelines:
+  gather:
+    steps:
+      - { phase: frame,    role: master }
+      - { phase: gather,   role: researcher }
+      - { phase: finalize, role: master }

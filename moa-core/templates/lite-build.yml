@@ -1,0 +1,54 @@
+# .moa.yml — lite-build
+# Small build pipeline: planner → coder → validate. No plan-review gate.
+# Use for low-risk, well-scoped changes where the plan is small enough to skip review.
+# For risky or cross-cutting work prefer full-engineering.
+schemaVersion: 1
+
+template:
+  base: engineering
+  projectType: auto
+
+# Model registry — filled by init with ONLY the models the roles below use (the union of init's
+# per-role picks), not the full list the host can serve. Keys are model short-names (e.g. gpt-5.5);
+# capability labels go in `tags`. Empty until init runs. Roles ship `use: [auto]` as a
+# placeholder — init pins the latest capable model per role (one primary + a trailing `auto`); a
+# remaining `auto` is resolved by the master at run time.
+models: {}
+
+master:
+  mode: auto                   # may right-size non-gate phases (plan) for small changes;
+                               # the validate gate + producer-independent verifier still hold
+  selfCertification: forbidden
+  hardVerificationTags: [strong]
+
+roles:
+  planner:
+    use: [auto]
+    tools: repo_read_only
+    instructions: |
+      Produce an executable task graph: changed files, declared write-sets, edge
+      cases, and the exact verification commands the validator will run.
+
+  coder:
+    use: [auto]
+    tools: code_write_test
+    instructions: |
+      Implement only the files declared in the plan. Stay within the declared
+      write-set; reject yourself rather than touch anything outside it.
+
+  verifier:
+    use: [auto]
+    tools: verify_test
+    differentModelFrom: coder
+    instructions: |
+      In an isolated worktree, run the planner's verification commands and check
+      the diff against the done-criteria. Independent of the coder's family.
+
+pipelines:
+  build:
+    steps:
+      - { phase: frame,    role: master }
+      - { phase: plan,     role: planner }
+      - { phase: execute,  role: coder, loopBackTo: plan }
+      - { phase: validate, role: verifier, gate: critical, loopBackTo: execute }
+      - { phase: finalize, role: master }
