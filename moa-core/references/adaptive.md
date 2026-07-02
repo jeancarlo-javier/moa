@@ -12,7 +12,8 @@ changes only four things:
   reviewer sees what actually ran. *Config absent* writes **nothing** orchestration-related — never
   `.moa.yml`, `effective-config.json`, or a run-store; only the task's work product lands on disk.
 - **(c) Frame** — *config present*: the Frame is a **hard requirement / proof-of-read** (emit it
-  before any action, even a trivial inline answer; you cannot echo a config you didn't read).
+  before any action, even a trivial inline answer; its `config:` line quotes path, `schemaVersion`,
+  and declared role names — values you cannot echo without reading the file).
   *Config absent*: the Frame is a **discipline** (restate goal, constraints, non-goals,
   done-criteria + evidence; surface ambiguity), not an enforced proof-of-read.
 - **(d) the `/moa init` nudge** — offered **only when no `.moa.yml` exists** (see *When to suggest
@@ -37,17 +38,17 @@ writes code against a repo" — that confuses moa's most common *instantiation* 
 Don't ask "where is the code"; ask: **what is the unit of work, who produces it, and who can
 independently check it.** Then staff those roles from the host's model pool and conduct. (A "battle
 model A vs B" task: the units are the two contestants' runs — one producer each — and the check is an
-independent judge of a third family. A textbook run, not an off-menu request.) Your roles are
-capabilities, not job titles.
+independent judge, a different model than both. A textbook run, not an off-menu request.) Your roles
+are capabilities, not job titles.
 
 ## What still holds (config or not)
 - **You are the conductor.** Frame, route, delegate, synthesize — never vanish into the work.
   Reserve yourself for judgment; delegate volume and specialized passes.
 - **Frame before acting.** (Hard proof-of-read with a config; discipline without — see the fork above.)
 - **Never silently self-certify.** Never pass your own substantial/risky mutation as verified on your
-  own say-so. Take the **best independent verification the host allows** — a different model family
-  whenever one exists — and when it falls short, **name the grade** (see the verification floor),
-  never hide it. See `references/anti-self-certification.md`.
+  own say-so. Take the **best independent verification the host allows** — always a different
+  model, a different family whenever one exists — and when it falls short, **name the grade** (see
+  the verification floor), never hide it. See `references/anti-self-certification.md`.
 - **Least privilege, best-effort.** Scope each delegated subagent to the tools its job needs, to
   whatever granularity the host/binding supports; load no arbitrary external skills. *Enforced* graded
   tool-policy is parked (repo `bindings/`) — apply the discipline, don't claim a guarantee the runtime
@@ -73,8 +74,8 @@ grade it actually reached.
    produces it and who can independently check it — never force the task into coding-shaped roles.
 3. **Pick models by the same `auto` reasoning** as workflow mode (SKILL.md §1): the smallest model
    that clears the role's bar — strong for planning, verification, and hard reasoning; cheaper
-   and faster for high-volume edits. For the verifier, prefer a **different family** than the
-   producer.
+   and faster for high-volume edits. The verifier must be a **different model** than the producer;
+   prefer a different family.
 
 ## The arc, step by step
 Run only the depth the task needs — `auto` latitude, always. The arc is identical in both forks;
@@ -105,10 +106,10 @@ that changes nothing. You conduct it exactly like any other run:
 2. **Decompose** — two disjoint units of work (A's run, B's run) plus one judging unit.
 3. **Produce** — spawn one producer subagent per contestant: producer-A *is* model A, producer-B
    *is* model B, each handed the identical task in an isolated context so neither sees the other.
-4. **Verify / judge** — an independent *judge* subagent, of a **third family** different from both
-   contestants, scores the two transcripts against the rubric. A contestant judging the match is
-   the self-certification the floor forbids; if no third family exists, label the verdict
-   *same-family — not independent* and say so.
+4. **Verify / judge** — an independent *judge* subagent — a **different model than both
+   contestants** (a contestant judging the match is the self-certification the floor forbids),
+   a third family preferred. If the judge shares a family with a contestant, name that in the
+   verdict's grade.
 5. **Finalize** — you synthesize: the winner, the margin, the rubric, and the judging grade. You
    route and report; you do not crown a winner on your own taste.
 
@@ -118,30 +119,30 @@ identical. This is the orchestration moa is *for* — it is not a coding-only to
 ## The verification floor
 Your verifier is drawn from the spawn set **`runtime.subagents`** allows
 (`auto | native | external | blocked`; default `auto` — all the config-absent fork has, since it
-writes no config to pin another). Independence is **graded**, and
-you **always name the grade you reached**; a fresh-context verifier is never the producer, so
-same-family is *not* self-certification:
-- **Cross-family** — verifier is a different model family than the producer. The target; use it
-  whenever the spawn set offers a second family.
-- **Same-family** — only one family available: still spawn a **fresh-context** verifier (no producer
-  bias), but label it *"verified, same-family — not cross-family independent."* On the first
-  substantial run in this state, also **offer the fix**: *"only the host family is available —
-  bind a second CLI with `/moa learn-tool` for independent gates."* Don't bury the one action
-  that would upgrade the guarantee.
-- **Self-check** — `blocked`, or the host cannot spawn a verifier: do your best self-check, then
-  label the result *"unverified — single-agent"* and recommend a user review or, when no config
+writes no config to pin another). Independence keys on the **model** — the verifier must be a
+**different model** than the producer; family is a preference, never the test. The grade is
+**always named**:
+- **Cross-family** — a different model of a different family. The target; pick it whenever the
+  spawn set offers a second family (same-family models share blind spots).
+- **Cross-model** — a different model of the same family (e.g. only one vendor's models are
+  spawnable): real independent verification; label it *"cross-model — same family."* On the first
+  substantial run in this state, mention **once** that `/moa learn-tool` can bind a second family
+  to upgrade gates to cross-family — then drop it.
+- **Self-check** — `blocked`, or no different model spawnable: do your best check (a fresh-context
+  same-model pass helps, but it is still the producer's own model — never independent), label the
+  result *"unverified — no independent model,"* and recommend a user review or, when no config
   exists, `/moa init`.
 
 Adaptive mode **does not halt** on a weak grade (either fork) — it proceeds and names the grade.
 What a `.moa.yml` buys is pinned models and declared independence, **not** a harder halt. Only
-`master.mode: strict` (workflow mode) keeps the hard floor — a `critical` gate with no cross-family
-verifier halts at `verification_unavailable`.
+`master.mode: strict` (workflow mode) keeps the hard floor — a `critical` gate with no
+different-model verifier halts at `verification_unavailable`.
 
 ## When to suggest `init`
 After substantial work, if the user is clearly doing repeated heavy engineering in this project,
 mention **once** that `/moa init` would pin roles/models and enforce the gates the config-absent fork
 only approximates. Never push it for one-off or light tasks — zero-setup is the point. (Config-absent
-fork only; same-family runs here also offer `/moa learn-tool` to bind a second CLI for independent
-gates.)
+fork only; single-family runs may also mention `/moa learn-tool` once — it upgrades gates from
+cross-model to cross-family.)
 
 See also: SKILL.md, `references/init.md`, `references/anti-self-certification.md`.

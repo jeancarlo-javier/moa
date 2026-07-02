@@ -51,16 +51,19 @@ not be the final word on correctness of hard work.
 - Every phase result carries `verdict` + `verifiedBy` + `confidence`.
 - The master MAY accept low-stakes results on its own judgment.
 - Any phase with `gate: critical` (or whenever master confidence < threshold)
-  REQUIRES independent verification by a **`strong`-tagged model of a different
-  family** than the producer (no shared blind spots).
+  REQUIRES independent verification by a **`strong`-tagged, different MODEL** than
+  the producer — a different family preferred (no shared blind spots), but the
+  model, not the family, is the independence test.
 - At a gate the master may only **route + synthesize** the verdict — it can
   *reject* a gate result but can **never replace a required gate with its own
   "looks good."** `selfCertification: forbidden` is a hard config invariant.
 - `tiers.strong` makes "delegate to the most capable" resolvable on any machine.
 
-**"Different family" is enforced, not hoped** (blocker #4). Discovery returns
+**"Different model" is enforced, not hoped** (blocker #4). Discovery returns
 normalized `{ provider, modelFamily, modelId, capabilityTier, independenceGroup }`
-per model. A verifier must have a *different* `independenceGroup` than the producer
+per model, where `independenceGroup` identifies the underlying MODEL (provider
+aliases collapse; family powers only the cross-family preference). A verifier must
+have a *different* `independenceGroup` than the producer
 — two aliases of one underlying model can't pose as independent verification. If no
 independent `strong` model exists on this machine, the run does **not** silently
 self-certify: it halts at terminal state `verification_unavailable` and surfaces
@@ -142,7 +145,7 @@ pipelines:
 
 Precedence: **per-run override > project config > template default > skill built-in.**
 
-**Four-way dispatch:** `init` / learn-tool / `.moa.yml` with `pipelines.default` (workflow mode) / `.moa.yml` without `default` (dynamic mode — adaptive arc from config) / no `.moa.yml` (zero-config). Verification grade degrades: cross-family → same-family native (labeled, not self-cert) → self-check; governed by `runtime.subagents` (auto|native|external|blocked, default auto). `master.mode: strict` halts a `critical` gate that cannot reach a cross-family verifier.
+**Four-way dispatch:** `init` / learn-tool / `.moa.yml` with `pipelines.default` (workflow mode) / `.moa.yml` without `default` (dynamic mode — adaptive arc from config) / no `.moa.yml` (zero-config). Verification grade degrades: cross-family → cross-model (same family, different model; labeled) → self-check; governed by `runtime.subagents` (auto|native|external|blocked, default auto). `master.mode: strict` halts a `critical` gate with no different-model verifier.
 
 ---
 
@@ -177,7 +180,7 @@ validatePolicy(role, toolPolicy) -> EnforcementGrade   // can I actually enforce
 spawn(SpawnRequest) -> SpawnResult                      // argv only; prompt/attachments via temp-file/stdin, never shell-interpolated
 parseResult(raw) -> { verdict?, resultText, changedFiles[], usage }
 cancel(handle); cleanup(handle)                          // timeouts, partial runs
-serves() -> [{ provider, modelFamily, modelId, capabilityTier, independenceGroup }]  // normalized; powers routing + family-independence
+serves() -> [{ provider, modelFamily, modelId, capabilityTier, independenceGroup }]  // normalized; powers routing + model-independence (family = preference)
 ```
 
 ```ts
@@ -191,7 +194,7 @@ SpawnResult  = { status: ok|failed|timeout|policy_unsupported, resolvedModel, pr
 native-first). For each role, given its resolved model:
 1. **Filter** bindings: `serves(model)` ∧ enforces the role's exact tool policy ∧
    `enforcementGrade ≥ requireEnforcement` ∧ network/fs sandbox satisfied ∧
-   family-independence constraint (for verifiers).
+   model-independence constraint (for verifiers).
 2. **Rank** survivors: explicit `role.binding` > host-native > declared priority.
 3. **No survivor** → deterministic diagnostic (`blocked_no_binding`); **ambiguous
    tie** → diagnostic, never silent pick. This prevents fail-closed-when-a-strict-
@@ -264,7 +267,7 @@ moa-core/            # names NO CLI
   schema/config.schema.json       # JSON Schema = source of truth (normalized ids, enums)
   references/
     adapter-contract.md           # spawn() capability + validatePolicy/spawn/parseResult/cancel/cleanup/serves
-    anti-self-certification.md    # family-independence verification protocol + terminal states
+    anti-self-certification.md    # model-independence verification protocol + terminal states
     run-store.md                  # run manifest, patches-first, resume, effective-config
   templates/ solo-research.yml  research-synth.yml  lite-build.yml  full-engineering.yml  design.yml
   scripts/

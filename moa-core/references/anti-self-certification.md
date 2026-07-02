@@ -15,22 +15,25 @@ hard work**. This is the skill's top safety invariant (`master.selfCertification
 ## "Independent" is enforced, not hoped
 
 Discovery returns normalized metadata per model: `{ provider, modelFamily, modelId,
-capabilityTier, independenceGroup }`. A verifier of a producer's work must have a
-**different `independenceGroup`** than that producer — two aliases of the same underlying
-model cannot pose as independent verification. A `gate: critical` verifier must **also** carry
-every tag in `master.hardVerificationTags` (default `[strong]`); `gate: standard` needs only a
-different family.
+capabilityTier, independenceGroup }`. **`independenceGroup` identifies the underlying MODEL,
+collapsing provider aliases** — two routes to one model cannot pose as independent verification.
+Independence keys on the **model, never the family**: a verifier must have a **different
+`independenceGroup`** than the producer — Opus checking Sonnet's work is independent; Sonnet
+checking Sonnet's (any provider, any fresh context) is not. Family is a **preference, not the
+test**: same-family models share training lineage and blind spots, so `auto` picks a cross-family
+verifier whenever one exists and the grade names what it got. A `gate: critical` verifier must
+**also** carry every tag in `master.hardVerificationTags` (default `[strong]`).
 
 **The producer is derived, never guessed: the nearest preceding `gate: none`, non-`master`
 phase** — the phase whose artifact the gate reviews (under `fanout`, all workers of that phase's
-role, one family). Independence holds when the verifier's family differs from the producer's. A
+role, one model). Independence holds when the verifier's model differs from the producer's. A
 role's `differentModelFrom` is an **explicit cross-check** of this target: the loader **warns
-(errors under `strict`)** when it names a role whose family disagrees with the inferred producer.
+(errors under `strict`)** when it names a role whose model matches the inferred producer.
 Inference is primary; a disagreeing `differentModelFrom` is a config bug to surface.
 
 Under `master.mode: auto` the master may right-size that producing phase and author the mutation
 itself; then **the master is the actual producer**, independence is measured against the
-*master's* family, and it must hand the check to a separate verifier — grading its own output is
+*master's* model, and it must hand the check to a separate verifier — grading its own output is
 self-certification wearing a verifier's hat.
 
 ## The grade ladder — degrade, but never silently
@@ -38,19 +41,20 @@ self-certification wearing a verifier's hat.
 When the target (cross-family) verifier isn't reachable, independence **degrades by grade**, and
 moa always names the grade reached:
 
-> **cross-family** (verifier family ≠ producer — the target) → **same-family** (a fresh-context
-> native subagent, no producer bias; labeled *"same-family — not cross-family independent"*) →
-> **self-check** (no spawn; labeled *"unverified — single-agent"*).
+> **cross-family** (different model, different family — the target) → **cross-model** (different
+> model, same family; labeled *"cross-model — same family"*) → **self-check** (no different model
+> spawnable; best effort — a fresh-context same-model pass helps but stays this rung — labeled
+> *"unverified — no independent model"*).
 
-A fresh-context subagent is never the producer, so **same-family native verification is not
-self-certification** — it is a weaker but honest independent grade. Only the bottom rung — the
-producer grading its own work — is self-certification.
+The top two rungs are both real independent verification — the model differs. Only the bottom
+rung fails the test: the producer's own model grading the producer's work — fresh context or not,
+any provider alias — is self-certification, and it never passes a gate.
 
 The spawn source is set by **`runtime.subagents`** (`auto` | `native` | `external` | `blocked`,
 default `auto`); `blocked` empties the spawn set, forcing self-check. **`master.mode` sets how far
-the grade may fall:** `auto` (and adaptive mode) degrades gracefully — same-family native, labeled,
-never blocking while a subagent is spawnable; **`strict`** holds the hard floor — a `gate:
-critical` phase with **no cross-family** verifier halts at **`verification_unavailable`**
+the grade may fall:** `auto` (and adaptive mode) degrades gracefully — labeled, never blocking
+while a different-model subagent is spawnable; **`strict`** holds the hard floor — a `gate:
+critical` phase with **no different-model** verifier halts at **`verification_unavailable`**
 ("unverifiable here — pin a remote strong model, connect a tool, or override"). moa uses the best
 rung the policy and host allow, and offers to connect a tool to climb. See
 `references/adaptive.md`.
@@ -61,9 +65,9 @@ rung the policy and host allow, and offers to connect a tool to climb. See
 helps. But a gate checking **constraint/format adherence** — strict output shape, length or schema
 limits, a required template — wants a *literal, instruction-following* verifier, and there a smaller
 cheaper model often **beats** a strong one (strong models add reasoning and verbosity that itself
-breaks strict formats). So a critical **correctness** gate keeps `strong` + cross-family; a
-**constraint-adherence** gate prefers the strictest-following independent model over the most
-capable — different-family independence still holds either way.
+breaks strict formats). So a critical **correctness** gate keeps `strong` (cross-family
+preferred); a **constraint-adherence** gate prefers the strictest-following independent model over
+the most capable — different-model independence still holds either way.
 
 ## The mutation gate floor
 
@@ -74,7 +78,7 @@ then the output is labeled **"unverified inline mode"** so no one mistakes it fo
 
 ## On disagreement
 
-If the verifier and a reviewer disagree, an independent **arbiter** (another model with a
-third `independenceGroup`, strong-tagged) breaks the tie. If no arbiter is available, the run
+If the verifier and a reviewer disagree, an independent **arbiter** (a third model —
+`independenceGroup` differing from both, a third family preferred, strong-tagged) breaks the tie. If no arbiter is available, the run
 halts at `blocked_verifier_disagreement` with both positions and the deciding evidence
 recorded in the run store. The master never casts the deciding vote itself.

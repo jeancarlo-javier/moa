@@ -2,7 +2,7 @@
 # Two pipelines: engineering (7-phase canonical) and quick (5-phase lean).
 # Gates: review-plan(standard), review-work(standard), validate(critical). Plan-reviewer
 # and code-reviewer use differentModelFrom to keep reviews independent. Verifier is critical
-# and from a different family than the coder. Pick engineering for real mutation risk;
+# and a different model than the coder (different family preferred). Pick engineering for real mutation risk;
 # quick for low-risk, well-scoped changes that still need a critical validate gate.
 schemaVersion: 1
 
@@ -71,7 +71,7 @@ roles:
     differentModelFrom: coder
     instructions: |
       In an isolated worktree, run the planner's verification commands and confirm
-      the framed done-criteria. Independent of the coder's family.
+      the framed done-criteria. Independent of the coder (a different model).
 
 pipelines:
   engineering:

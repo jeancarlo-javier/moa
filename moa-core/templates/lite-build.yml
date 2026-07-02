@@ -42,7 +42,7 @@ roles:
     differentModelFrom: coder
     instructions: |
       In an isolated worktree, run the planner's verification commands and check
-      the diff against the done-criteria. Independent of the coder's family.
+      the diff against the done-criteria. Independent of the coder (a different model).
 
 pipelines:
   build:

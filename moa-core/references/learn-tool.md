@@ -39,8 +39,9 @@ command lives in the *profile* you write to disk (data), never in your reasoning
 - **Offered by `init`** — after the template is chosen, `init` checks what's bound; if only the
   host family is available, it surfaces candidate launcher CLIs and offers to learn one before
   writing `.moa.yml` (see `references/init.md`).
-- **Offered on first adaptive run (no config)** — if the only model family is host-native, name that out
-  loud (verification can't be cross-family independent yet) and offer `learn-tool` to fix it.
+- **Offered on first adaptive run (no config)** — if the only model family is host-native, mention
+  once that gates run cross-model, not cross-family (the preferred grade), and offer `learn-tool`
+  to upgrade.
 
 You never *require* it — binding is always opt-in, and the host-native capability always works
 without it. learn-tool exists to add **more, and more independent, families**.
@@ -66,7 +67,7 @@ output:
   resultPath: <how to extract the assistant's final text>   # e.g. "stdout" or a JSON path
 models:                            # the serves() equivalent — learned from the list command
   - id: <full model ref>
-    family: <independence group>   # REQUIRED for verifier independence; infer + confirm
+    family: <model lineage>        # REQUIRED — cross-family preference + alias collapsing; infer + confirm
     tags: [<strong|cheap|fast|vision|...>]
 listModels: [<bin>, <list-subcmd>, "--json"]   # how to re-enumerate models later
 capabilities:                      # OBSERVED facts (see "Capability notes"), not a contract
@@ -109,7 +110,8 @@ side-effect-free. From the help text, extract the *shape* and draft an invocatio
 
 ### Phase 2 — Acquire model knowledge
 Call the discovered list-models command and parse it into the profile's `models` — `{ id,
-family, tags }` per model. **Family is required** (it's what verifier-independence keys on); when
+family, tags }` per model. **Family is required** (it powers the cross-family preference and
+collapses provider aliases of one model; independence itself keys on the model); when
 the CLI doesn't report lineage, infer it and have the user confirm. No list command → ask the
 user which models, or probe one known id.
 
@@ -155,8 +157,8 @@ read it and run the tool with your own shell. Global location ⇒ every project 
 ### Phase 6 — Report + close the independence loop
 Show the user: the tool bound, the models now available **with their families**, the roles it
 can serve, the capability/safety notes, and any role it *can't* serve and why. Then the key
-move: if this bind introduced a **new model family**, say so — *"cross-family independent
-verification is now available."* If only the host family still exists, repeat the offer. Point
+move: if this bind introduced a **new model family**, say so — *"cross-family verification (the
+preferred grade) is now available."* If only the host family still exists, repeat the offer. Point
 them at `/moa init` (or a re-resolve) so the new models actually get used.
 
 ## Suitability: what makes a CLI bindable <a id="suitability"></a>
@@ -176,8 +178,9 @@ polices. Don't imply otherwise. (Re-introducing real enforcement later means gro
 profile's restriction section into something the master verifies — see `../../bindings/README.md`.)
 
 What is **not** parked and stays fully active: **verifier independence.** Because the profile
-records each model's `family`, the master can still route a gate to a different family than the
-producer. Anti-self-certification does not depend on the permissions layer — see
+records each model's `id` and `family`, the master can still route a gate to a different model
+than the producer (different family preferred). Anti-self-certification does not depend on the
+permissions layer — see
 `references/anti-self-certification.md`.
 
 ## UX — what the user sees <a id="ux"></a>
@@ -210,7 +213,7 @@ Learning <tool> …
   T4 prompt safety     ✓  metacharacters not executed
   T5 read-only         ·  observed: honors read-only (note only — not enforced)
 Bound globally → ~/.moa/bindings/<tool>/profile.yml
-Now available: <models, with families>.  New family added → independent gates now possible.
+Now available: <models, with families>.  New family added → cross-family gates now possible.
 Next: /moa init  (or re-run your task to pick up the new models).
 ```
 

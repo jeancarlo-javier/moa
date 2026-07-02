@@ -108,9 +108,11 @@ Both say the same thing; the second hides nothing that matters and never sends t
 4b. **Offer to bind more tools (the on-ramp — this is where moa "finds" your other CLIs).**
     Discovery reports what is *already* connected; it cannot *connect* anything. So, before
     resolving roles, look at what you found and decide whether to offer `learn-tool`:
-    - **Only one model family is available** (e.g. just the host) — say so plainly: a
-      cross-family independent verifier (moa's headline guarantee) is **impossible** in this
-      state. This is the moment to fix it, not silently write a weaker config.
+    - **Only one model family is available** (e.g. just the host) — gates still work when it
+      serves several models (independence = a different *model*), but a **cross-family** verifier —
+      the preferred grade — is impossible in this state; say so plainly and offer the upgrade.
+      If only one *model* is available, independent gates are impossible — that is the real gap
+      to fix, not silently write a weaker config.
     - **Probe for candidate launcher CLIs** the user could connect — names come from a *data*
       catalog of known launchers (outside the skill core) or from asking the user which CLI they
       have; never hardcode a CLI name here. For each plausible candidate found on `PATH` but not
@@ -136,10 +138,11 @@ Both say the same thing; the second hides nothing that matters and never sends t
      primary, or a context/independence gap the fallback must cover); never pad the list. Three
      explicit names on one role is a smell, not thoroughness.
    - **Independence:** resolve roles in dependency order so a `differentModelFrom`/verifier role is
-     pinned to a **different family** than the role it guards (verifier independence is vs the
-     *producer* it checks). Keep verifiers/critical roles in `master.hardVerificationTags` (`strong`).
+     pinned to a **different model** than the role it guards (verifier independence is vs the
+     *producer* it checks; different family preferred). Keep verifiers/critical roles in
+     `master.hardVerificationTags` (`strong`).
    - **Stay `[auto]`** for a role only when the pool is empty, no model clearly fits, or independence
-     can't be guaranteed here (one family) — and name which roles stayed `auto` and why.
+     can't be guaranteed here (one model) — and name which roles stayed `auto` and why.
 
 ### Pick few, pick current (what keeps `.moa.yml` lean)
 The registry is the **union of the per-role picks**, nothing more — so fewer, newer models is the
@@ -202,8 +205,9 @@ model only if a research role exists. Everything else the host serves stays out 
 
 ## Edge cases
 - Only host-native models available → one family, nothing to route: roles stay `[auto]`, so the
-  union of picks is empty and the registry is `{}` + comment; success, but flag that independent
-  (cross-family) verification needs a second tool bound via `learn-tool`.
+  union of picks is empty and the registry is `{}` + comment; success — gates stay independent
+  across the host's models — but flag that the preferred cross-family grade needs a second tool
+  bound via `learn-tool`.
 - A learned profile that won't parse / is stale → register what's usable, skip the rest, say
   which models resolved and which profile to re-learn.
 - Unknown template arg → list the five names, stop.

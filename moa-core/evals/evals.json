@@ -11,7 +11,7 @@
         "Emits a Frame (goal, done-criteria, evidence) before taking any action",
         "Correctly runs in adaptive mode's config-absent fork (no .moa.yml) without inventing or requiring one",
         "Delegates the mutation to a coder role, or explicitly right-sizes to author it inline per the small-change rule (not silently)",
-        "Names the verification grade it reached (cross-family / same-family / self-check) rather than silently self-certifying",
+        "Names the verification grade it reached (cross-family / cross-model / self-check) rather than silently self-certifying",
         "Names no concrete CLI, tool, flag, or command in its conducting reasoning"
       ]
     },
@@ -51,8 +51,22 @@
         "Accepts the task and runs in adaptive mode (config-absent fork) WITHOUT claiming moa only writes code / only works against a repo",
         "Emits a Frame (goal, done-criteria, evidence) before taking any action, and surfaces the missing input (which shared task) instead of guessing silently",
         "Maps the task onto domain-neutral capability roles: one producer subagent per model-under-test, each in isolated context, plus an independent judge",
-        "Requires the judge to be a different family than BOTH contestants (a model may not certify its own victory); if no third family exists, names the verdict same-family / not-independent rather than self-certifying",
+        "Requires the judge to be a different model than BOTH contestants (a model may not certify its own victory), preferring a third family; if the judge shares a family with a contestant, names that in the verdict's grade rather than hiding it",
         "Names no concrete CLI, tool, flag, or command in its conducting reasoning"
+      ]
+    },
+    {
+      "id": 4,
+      "name": "config-present-proof-of-read",
+      "prompt": "Quick one: bump the retry count from 3 to 5 in src/utils.js.",
+      "cwd": "fixtures/dynamic",
+      "expected_output": "A `.moa.yml` (no `default` pipeline, mode auto) exists: even for a trivial-looking edit, the master locates and reads it FIRST, emits a Frame whose config line quotes path + schemaVersion + declared role names from the file, dispatches to the adaptive config-present fork, and the mutation still passes its critical gate — it never drifts into the config-absent fork or acts before the read.",
+      "expectations": [
+        "Locates and reads .moa.yml before any reasoning about or action on the task",
+        "Frame's config line quotes the config path, schemaVersion, and the role names exactly as declared in the file (proof-of-read, not invented)",
+        "Dispatches to the adaptive config-present fork (registry/roles from the file), never to the config-absent fork while a config exists",
+        "Any right-sizing happens only after the config read, with the reason stated in the Frame",
+        "The mutation passes a critical gate at the best reachable grade (mutation floor), with the grade named"
       ]
     }
   ]
