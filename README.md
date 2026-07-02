@@ -36,6 +36,8 @@ npx skills add jeancarlo-javier/moa
 
 (Manual: copy the `moa-core/` skill directory into your agent's skills folder.)
 
+How moa is published, resolved, and released: [docs/PUBLISHING.md](docs/PUBLISHING.md).
+
 ## Use
 
 In your agent, just ask:
