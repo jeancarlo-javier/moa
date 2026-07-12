@@ -12,7 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { fileURLToPath, pathToFileURL } from "node:url";
+import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import { z } from "zod";
 
@@ -659,7 +659,10 @@ export function opBindingSave({ profile } = {}) {
 
 // --- CLI mode (debugging) --------------------------------------------------
 
-const isMain = process.argv[1] && import.meta.url === pathToFileURL(process.argv[1]).href;
+// realpath both sides: node resolves ESM URLs to the real file, but argv keeps
+// the symlink path (e.g. ~/.claude/skills/moa/mcp/server.mjs)
+const isMain = process.argv[1] &&
+  fileURLToPath(import.meta.url) === fs.realpathSync(path.resolve(process.argv[1]));
 if (isMain && process.argv[2] === "load") {
   console.log(JSON.stringify(opLoad({ cwd: process.argv[3] ?? process.cwd() }), null, 2));
   process.exit(0);
