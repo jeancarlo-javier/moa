@@ -1,0 +1,13 @@
+{
+  "name": "moa-mcp",
+  "version": "0.6.0",
+  "private": true,
+  "type": "module",
+  "bin": { "moa-mcp": "server.mjs" },
+  "scripts": { "test": "node test.mjs" },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.0",
+    "yaml": "^2.4.0",
+    "zod": "^3.23.0"
+  }
+}

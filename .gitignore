@@ -19,3 +19,6 @@ effective-config.json
 # Python
 __pycache__/
 *.pyc
+
+# node
+node_modules/
