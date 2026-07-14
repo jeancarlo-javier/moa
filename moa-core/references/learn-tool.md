@@ -92,6 +92,8 @@ evidence:                          # what proved each claim, + date — so a rev
 # The saved profile contains only the run/output/capability metadata above — it never
 # stores a list of model ids; inventory is fetched live every time the tool is queried.
 
+```
+
 ## The learning protocol <a id="the-learning-protocol"></a>
 
 Binding is itself a small **gated moa task**: probe (read-only) → prove (live tests) → bind.
@@ -136,9 +138,12 @@ The profile itself never stores a model list; the server validates the recipe by
 during `moa_binding_save` and rejects it if the output cannot be parsed, the array is empty,
 or any id fails the canonical shape (see the rules below). After binding, `moa_tools` and
 `moa_resolve` re-run the recipe live every call — there is no cached inventory.
-If the CLI has no programmatic list command, ask the user which models to expose and probe one
-known id; without a real recipe the tool is not bindable as a model server (it can still
-surface as a read-only launcher after the user accepts the smaller role set).
+**No programmatic list ⇒ not bindable.** A CLI without a real model-list operation cannot
+be bound as a model server, and there is no read-only launcher fallback: the profile
+carries the discovery recipe or it carries nothing, and the server rejects the bind. Stop
+or decline here — do not collect a hand-curated model inventory and do not let the tool
+surface in any smaller role set.
+
 ### Phase 3 — Trial launch (the live tests — the crux)
 Run real subagents through the *draft* profile, cheapest model, in a scratch dir. Generate a
 fresh random **nonce** per test and require it in the result — this is what stops a false

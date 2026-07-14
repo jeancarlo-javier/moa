@@ -19,7 +19,7 @@ registered external tools; host-native phases still use the host's own subagent 
 | `moa_spawn` | Current registered-tool phase | re-runs `modelDiscovery` against the bound tool's current inventory; refuses to launch when the frozen model is no longer served (`model_not_served`); exact route, file or stdin prompt transport, `shell: false`, timeout, 4 MiB output bound, normalized result; never advances state |
 | `moa_init` | `/moa init` | overwrite guard, comment-preserving template splice, registry = union of picks (only the aliases roles chose — never the full live inventory), validation before write |
 | `moa_binding_save` | `/moa learn-tool` | refuses profiles without `modelDiscovery` + T1 + T2 + T4 = pass and `promptSafe: true`; runs the discovery recipe once before persistence to confirm the live model inventory |
-|
+
 ## Native vs external
 
 A route the server can spawn on is one of two kinds, and the terminology is strict:
@@ -61,8 +61,8 @@ roles:
 ## Discovery errors (the seven)
 
 `moa_tools`, `moa_resolve`, `moa_spawn`, and `moa_binding_save` share the same
-`modelDiscovery` machinery. Every failure they surface uses one of these seven codes; treat
-the code, not the prose, as the contract:
+`modelDiscovery` machinery. **Every `modelDiscovery` failure** — and only those failures —
+surfaces as one of these seven codes; treat the code, not the prose, as the contract:
 
 | Code | Meaning |
 |---|---|

@@ -80,10 +80,11 @@ Both say the same thing; the second hides nothing that matters and never sends t
    never block a write). Get the live inventory through the MCP server, not by reading profile
    files by hand:
    0. **Call `moa_tools`** — the server runs the registered `modelDiscovery` recipe for every
-      bound tool and returns the *current* inventory each tool serves now, plus the host-native
-      routes the server has been told about. This is the **only** read of external inventory you
-      need: there is no stored `models`/`listModels` field on a profile to consult, and you do
-      **not** parse `~/.moa/bindings/*/profile.yml` yourself.
+      bound tool and returns the *current* inventory each learned tool serves now. This is the
+      **only** read of external inventory you need: there is no stored `models`/`listModels`
+      field on a profile to consult, and you do **not** parse `~/.moa/bindings/*/profile.yml`
+      yourself. Host-native routes are **not** part of `moa_tools` — they come separately
+      from the host's own subagent capability (see the next step).
    1. **Add your host-native models** to the same candidate set — the host always has models
       only it knows about, so append whatever the host can spawn subagents on; `moa_resolve`
       will intersect them with the discovered external routes.
