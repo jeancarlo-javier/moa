@@ -159,8 +159,8 @@ function profileRejectionReason(profile) {
   if ((profile.run.promptVia ?? "file") === "file" &&
       !profile.run.argv.some((arg) => arg.includes("{promptFile}")))
     return "invalid_profile";
-  if (!profile.run.modelPlaceholder ||
-      !profile.run.argv.some((arg) => arg.includes(profile.run.modelPlaceholder)))
+  if (profile.run.modelPlaceholder !== "{model}" ||
+      !profile.run.argv.some((arg) => arg.includes("{model}")))
     return "invalid_profile";
   if (profile.modelDiscovery.argv[0] !== "{bin}")
     return "invalid_profile";
@@ -666,8 +666,12 @@ const poolRow = (model) => ({
   id: model.id,
   family: model.family ?? null,
   tags: model.tags,
-  routes: model.routes.map((route) => ({ binding: route.binding, modelId: route.modelId })),
-
+  sources: model.sources,
+  routes: model.routes.map((route) => ({
+    binding: route.binding,
+    modelId: route.modelId,
+    source: route.source,
+  })),
 });
 
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;

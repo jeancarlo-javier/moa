@@ -192,6 +192,7 @@ await ta("binding_save: rejects obsolete and incomplete discovery profiles", asy
   for (const mutate of [
     (p) => delete p.modelDiscovery,
     (p) => delete p.run.modelPlaceholder,
+    (p) => p.run.modelPlaceholder = "model",
     (p) => p.run.argv.splice(p.run.argv.indexOf("{model}"), 1),
     (p) => p.capabilities.canSelectModel = false,
     (p) => p.evidence.tests.modelDiscovery = "fail",
@@ -541,8 +542,13 @@ await ta("resolve: adaptive-bare includes current external models", async () => 
   fs.mkdirSync(bare, { recursive: true });
   opLoad({ cwd: bare });
   const result = await opResolve({ hostModels: [] });
-  assert.ok(result.pool.some((model) =>
-    model.id === CANONICAL_FAKE_MODEL && model.routes.some((route) => route.binding === "fakecli")));
+  const candidate = result.pool.find((model) => model.id === CANONICAL_FAKE_MODEL);
+  assert.ok(candidate);
+  assert.ok(candidate.sources.includes("binding:fakecli"));
+  assert.equal(
+    candidate.routes.find((route) => route.binding === "fakecli").source,
+    "binding:fakecli",
+  );
 });
 
 
