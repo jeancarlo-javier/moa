@@ -17,8 +17,8 @@
           "description": "Route each role to the binding that serves its model; constraint-first, then prefer native." },
         "subagents": { "enum": ["auto", "native", "external", "blocked"], "default": "auto",
           "description": "Spawn-source policy — a filter on binding routing. auto: best available (prefer cross-family/external for gate verifiers, fall back to host-native). native: host-native subagents only. external: learned-tool subagents only. blocked: no subagents (master works solo, self-check only). Default auto prompts only at consequential forks (first external-tool use; critical work with no independent verifier) and offers to pin; a pinned value runs silent. The verification grade reached (cross-family > cross-model > self-check) is always named; only master.mode strict halts a critical gate with no different-model verifier." },
-        "requireEnforcement": { "enum": ["strict", "sandbox", "best-effort"], "default": "strict",
-          "description": "PARKED (currently inert — graded tool-policy enforcement is archived in the repo's bindings/). Kept so existing configs validate. When enforcement is re-implemented: fail-closed floor — a binding whose enforcementGrade is below this cannot run the role." },
+        "requireEnforcement": { "enum": ["strict", "sandbox", "best-effort"], "default": "best-effort",
+          "description": "Fail-closed floor for the compiled per-role tool-list policy at moa_spawn. strict/sandbox: an external spawn whose currently loaded binding can't express the frozen role policy (missing disableAll/allowList adapter, unmapped tool, deny-only) is blocked before launch (tool_policy_unsupported). best-effort (default): the spawn still launches without tool-list flags and the degraded state/reason are recorded in both the spawn result and the run manifest — never silently. Host-native phases receive the frozen policy only as a request; this floor does not apply to them." },
         "workDir": { "type": "string", "default": ".moa" },
         "defaults": {
           "type": "object",
@@ -105,7 +105,7 @@
 
     "toolPolicies": {
       "type": "object",
-      "description": "Named least-privilege bundles, keyed by policy name. When this map is declared, every roles.<name>.tools reference must resolve to a key here (checked at load). Policy content (network/filesystem/secrets/bash) stays advisory best-effort scoping until a binding's learned-tool profile declares a toolControl adapter that translates allow/deny into that tool's runtime flags at spawn time.",
+      "description": "Named least-privilege bundles, keyed by policy name. Every roles.<name>.tools reference must resolve to a key here (checked at load, whether or not this map is declared). allow/deny are the only fields compiled into the currently loaded binding's proven toolControl adapter at moa_spawn (strict/sandbox fail closed when unsupported; best-effort degrades and reports it); network/filesystem/secrets/bash stay advisory and are returned as unenforced dimensions, never claimed as enforced.",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
@@ -141,7 +141,7 @@
             "description": "Ordered model aliases, or the literal auto wildcard. This is the only role-level route selector; roles never pin learned tools directly." },
           "effort": { "type": "array", "items": { "type": "string" }, "minItems": 1,
             "description": "Optional per-role reasoning/thinking effort — ALWAYS an array, same shape and rules as models.<name>.effort. A single-element array pins (e.g. ['high']); a multi-element ascending array is an escalation ladder climbed one rung per gate loop-back. Overrides the model's 'effort' and any ':<effort>' suffix baked into its id/key; ignored by models without effort control." },
-          "tools": { "type": "string", "description": "Reference into toolPolicies. When toolPolicies is declared, this must name a key there (checked at load); policy content stays advisory best-effort scoping until a binding's toolControl adapter enforces it at spawn time." },
+          "tools": { "type": "string", "description": "Reference into toolPolicies; must name a key declared there (checked at load — declaring toolPolicies is not a precondition). allow/deny compile into the currently loaded binding's proven toolControl adapter at moa_spawn; other policy fields stay advisory best-effort scoping." },
           "skills": { "type": "array", "items": { "type": "string" }, "default": [] },
           "instructions": { "type": "string" },
           "instructionsFile": { "type": "string" },

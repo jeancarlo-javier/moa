@@ -50,17 +50,18 @@ without it. learn-tool exists to add **more, and more independent, families**.
 A profile is a small declarative descriptor saved **globally** so every project benefits:
 `~/.moa/bindings/<tool>/profile.yml`. It is the entire binding — there is no code beside it.
 
-```yaml
 # ~/.moa/bindings/<tool>/profile.yml   (illustrative shape; you fill it from the probe)
 tool: <short-name>                 # how moa refers to this binding
 bin: <executable>                  # resolved on PATH or an absolute path
 version: <captured --version>      # for staleness detection
 run:                               # the recipe to launch ONE non-interactive subagent
-  argv: ["{bin}", <run-subcmd>, "--model", "{model}", "--file", "{promptFile}", "--cwd", "{cwd}"]
+  argv: ["{bin}", <run-subcmd>, "{toolArgs}", "--model", "{model}", "--file", "{promptFile}", "--cwd", "{cwd}"]
   promptVia: file                  # file | stdin; arg is refused
   modelPlaceholder: "{model}"
-  isolationFlags: [<...>]          # e.g. a no-session / no-extensions flag set, if the CLI has one
   timeoutSeconds: 1800
+  # {toolArgs} is a STRUCTURAL marker — exactly one bare element in `argv`, required if
+  # and only if `toolControl` (below) is declared. It expands to zero or more argv
+  # elements at spawn time; never a shell string, never embedded in a larger literal.
 output:
   format: text                     # text | json | jsonl
   resultPath: <how to extract the assistant's final text>   # e.g. "stdout" or a JSON path
@@ -81,7 +82,22 @@ capabilities:                      # OBSERVED facts (see "Capability notes"), no
   toolRestriction: observed-honors-readonly | observed-ignores | none
 evidence:                          # what proved each claim, + date — so a reviewer can trust it
   probedOn: <absolute date>
-  tests: { T1: pass, T2: pass, T3: pass, T4: pass, T5: <result|skipped> }
+  tests: { T1: pass, T2: pass, T3: pass, T4: pass, T5: <result|skipped>,
+           disableAll: <pass — only if toolControl.disableAll is declared>,
+           allowList: <pass — only if toolControl.allowList is declared> }
+toolControl:                       # OPTIONAL — declare only a mode you have LIVE proof for
+  disableAll:
+    argv: ["--no-tools"]           # literal argv fragment inserted when the compiled
+                                    # allow-list is empty; no placeholders allowed
+  allowList:
+    names: { read: Read, search: Grep, edit: Edit }   # canonical → native tool name;
+                                                        # every requested canonical name
+                                                        # must have a mapping
+    joined:                        # exactly ONE of joined / repeated
+      argv: ["--allowed-tools", "{tools}"]
+      separator: ","
+    # repeated:
+    #   argv: ["--allowed-tool", "{tool}"]   # {tool} exactly once, one fragment per name
 # A second example for a CLI that prints one canonical id per line:
 #
 # modelDiscovery:
@@ -89,10 +105,9 @@ evidence:                          # what proved each claim, + date — so a rev
 #   output:
 #     format: lines
 #   timeoutSeconds: 10
-# The saved profile contains only the run/output/capability metadata above — it never
-# stores a list of model ids; inventory is fetched live every time the tool is queried.
-
-```
+# The saved profile contains only the run/output/capability/toolControl metadata above —
+# it never stores a list of model ids; inventory is fetched live every time the tool is
+# queried, and no `toolControl` mode is trusted without evidence.tests proving it live.
 
 ## The learning protocol <a id="the-learning-protocol"></a>
 
@@ -170,8 +185,25 @@ fresh random **nonce** per test and require it in the result — this is what st
   not bind** until the prompt channel is fixed.
 - **T5 — tool-restriction observation (optional; only if Phase 1 found a restriction flag).**
   Launch read-only (deny write/edit) and ask it to write a file; observe whether the write was
-  blocked. **Record the result as a capability note — do not grade or enforce it** (enforcement
-  is parked; see `../../bindings/`).
+  blocked. Record the result as a `capabilities.toolRestriction` note — informal, for routing and
+  the user only. It is NOT proof of a `toolControl` mode; help output and one-off observations are
+  candidate information, never proof. Only the live probes below earn `toolControl`.
+
+### Phase 3b — Tool-control probes (optional; only if you found a disable-all or allow-list flag)
+Declare `toolControl.disableAll` and/or `toolControl.allowList` only after a passing live probe —
+`moa_binding_save` rejects an advertised mode whose matching `evidence.tests` key is not `pass`,
+even if the adapter shape itself is valid:
+- **disableAll probe.** Launch with the candidate disable-all flag and ask the agent to invoke one
+  harmless built-in tool (e.g. read a file). Confirm the launcher refuses or exposes no tool at
+  all. Passing sets `evidence.tests.disableAll: pass` and licenses `toolControl.disableAll`.
+- **allowList probe.** Launch with the candidate allow-list flag naming exactly one harmless
+  scratch operation while withholding another. Confirm the allowed operation succeeds and the
+  withheld one is unavailable (refused, not merely unused). Passing sets
+  `evidence.tests.allowList: pass` and licenses `toolControl.allowList`.
+A failed or ambiguous probe means that mode is omitted from `toolControl` — the profile still
+binds on T1∧T4 alone; it just carries no live tool-control adapter, and `moa_spawn` reports the
+role's tool policy as unsupported for this binding (fail-closed in `strict`/`sandbox`, degraded
+and explicit in `best-effort`) rather than silently doing nothing.
 
 ### Phase 4 — Decide suitability + the roles it can serve
 Minimum bar to bind at all: **T1 ∧ T4**. From the tests, set the profile's `capabilities` and
@@ -181,13 +213,16 @@ evidence**, so the user learns *why*, not just "no."
 
 ### Phase 5 — Register globally
 Save the proven profile through `moa_binding_save`, including the evidence block (test results,
-date, captured version). The server re-runs `modelDiscovery` to confirm the recipe still
-parses, persists the profile under `~/.moa/bindings/<tool>/profile.yml`, and makes it
-immediately visible through `moa_tools`. Global registration means every project can resolve
-it without restarting the MCP server — and because the profile never stores a model list,
-adding or removing a model tomorrow is a discovery event, not a re-bind.
+date, captured version). A declared `toolControl.disableAll` or `toolControl.allowList` is
+rejected here unless its matching `evidence.tests.disableAll` / `.allowList` is also `pass` —
+no advertised control mode is trusted without its own live probe. The server re-runs
+`modelDiscovery` to confirm the recipe still parses, persists the profile under
+`~/.moa/bindings/<tool>/profile.yml`, and makes it immediately visible through `moa_tools`.
+Global registration means every project can resolve it without restarting the MCP server — and
+because the profile never stores a model list, adding or removing a model tomorrow is a
+discovery event, not a re-bind.
 
-## The ten learning rules (all required for a clean bind)
+## The eleven learning rules (all required for a clean bind)
 Every successful `learn-tool` workflow satisfies these in order. The server enforces the ones
 that are mechanically checkable; the rest are master judgment the user audits:
 1. **Start with the root `--help`.** Inspect the help, then drill into the run/list subcommand
@@ -210,6 +245,11 @@ that are mechanically checkable; the rest are master judgment the user audits:
 10. **Re-learn only on invocation/parser drift, not on model-catalog drift.** The tool adding or
     removing a model is a discovery event the next `moa_tools` call will surface; only flag
     changes to the run argv, the output shape, or the binary/version require a re-bind.
+11. **Prove every declared `toolControl` mode before saving.** `disableAll`/`allowList` each
+    need their own passing live probe (Phase 3b) recorded as `evidence.tests.disableAll` /
+    `.allowList`; `moa_binding_save` rejects a declared mode without it, and an undeclared mode
+    simply means the CLI can't enforce that shape — `moa_spawn` reports it as unsupported rather
+    than guessing.
 
 ### Phase 6 — Report + close the independence loop
 Show the user: the tool bound, the models now available **with their families** (queried live
@@ -227,19 +267,21 @@ you can capture, and the prompt can be passed without shell interpolation (T4). 
 serve. A CLI that only runs an interactive session, or whose output can't be captured
 programmatically, is *not* suitable; say so plainly and record why.
 
-## Capability notes are observed, not enforced <a id="capability-notes"></a>
-This mode **observes** what a tool can do; it does not **enforce** a permissions contract. There
-is no `enforcementGrade`, no fail-closed `policy_unsupported`, no graded tool-policy here — that
-whole layer is parked in `../../bindings/`. When you note `toolRestriction: observed-honors-
-readonly`, that is honest knowledge for routing and for the user, **not** a guarantee moa
-polices. Don't imply otherwise. (Re-introducing real enforcement later means growing this
-profile's restriction section into something the master verifies — see `../../bindings/README.md`.)
+## Capability notes vs. proven tool control <a id="capability-notes"></a>
+Two different things live on a profile, and they are not interchangeable:
+- **`capabilities.toolRestriction`** is an *observation* (Phase 3, T5) — honest knowledge for
+  routing and the user, never proof, never enforced on its own. Don't imply otherwise.
+- **`toolControl`** is a *proven adapter* (Phase 3b) — the server compiles a role's canonical
+  `toolPolicies` allow/deny into this adapter's argv at `moa_spawn`, live, every call. A mode you
+  didn't declare (or declared without proof) means that binding can't express the role's policy:
+  `strict`/`sandbox` fail closed with `tool_policy_unsupported` before anything launches;
+  `best-effort` launches without tool-list flags and reports the degradation explicitly in the
+  result and the run manifest.
 
-What is **not** parked and stays fully active: **verifier independence.** Because the profile
-records each model's `id` and `family`, the master can still route a gate to a different model
-than the producer (different family preferred). Anti-self-certification does not depend on the
-permissions layer — see
-`references/anti-self-certification.md`.
+What stays fully active regardless of `toolControl`: **verifier independence.** Because the
+profile records each model's `id` and `family`, the master can still route a gate to a different
+model than the producer (different family preferred). Anti-self-certification does not depend on
+tool-control coverage — see `references/anti-self-certification.md`.
 
 ## UX — what the user sees <a id="ux"></a>
 Design the experience around these commitments:
@@ -256,8 +298,9 @@ Design the experience around these commitments:
    one-line result, so a failure points at exactly which rung broke.
 4. **Verify before you claim.** Never say "bound" without T1 green; report incompatibility with
    the *actual* captured error.
-5. **Honest grade.** State what was observed, including "tool restriction not enforced — parked."
-   Never over-promise.
+5. **Honest grade.** State what was observed and what was proven: which `toolControl` modes (if
+   any) passed their live probe and are now enforced at spawn, versus an informal
+   `toolRestriction` note that isn't. Never over-promise.
 
 ```
 $ moa learn-tool <hint>
@@ -269,7 +312,9 @@ Learning <tool> …
   T2 model select      ✓  ran on <model>
   T3 producer roundtrip✓  wrote moa_probe_<nonce>.txt
   T4 prompt safety     ✓  metacharacters not executed
-  T5 read-only         ·  observed: honors read-only (note only — not enforced)
+  T5 read-only         ·  observed: honors read-only (note only — not proof)
+  disable-all probe    ✓  --no-tools refuses every tool call
+  allow-list probe     ✓  --allowed-tools allows read, refuses write
 Bound globally → ~/.moa/bindings/<tool>/profile.yml
 Now available: <models, with families>.  New family added → cross-family gates now possible.
 Next: /moa init  (or re-run your task to pick up the new models).
@@ -309,4 +354,5 @@ automatically; you do not re-bind to track a catalog change.
 - `declined` — the user chose to skip; no profile written, host-native still works.
 
 See also: SKILL.md, `references/init.md`, `references/adaptive.md`,
-`references/anti-self-certification.md`, and `../../bindings/` (the parked enforced model).
+`references/anti-self-certification.md`, and `../../bindings/` (an archived adapter-process
+design superseded by the live `toolControl` contract above).

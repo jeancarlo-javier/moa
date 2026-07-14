@@ -17,6 +17,20 @@ master:
   selfCertification: forbidden
   hardVerificationTags: [strong]
 
+toolPolicies:
+  web_research:
+    allow: [web_search, todo, write_facts]
+    network: web_only
+    filesystem: scratch_only
+  repo_read_only:
+    allow: [read, find, search, lsp, ast_grep, todo]
+    network: none
+    filesystem: read_only
+  verify_test:
+    allow: [read, find, search, lsp, bash, todo]
+    network: off_sandbox
+    filesystem: worktree_copy
+
 roles:
   gatherer:
     use: [auto]

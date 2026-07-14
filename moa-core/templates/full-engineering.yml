@@ -11,8 +11,9 @@ template:
   projectType: auto
 
 runtime:
-  # PARKED: graded tool-policy enforcement is currently inert (archived in the repo's bindings/).
-  # Kept so this template still documents intent and re-validates when enforcement returns.
+  # Fail-closed floor for the compiled per-role tool policy (toolPolicies, below): strict
+  # blocks an external spawn before launch when the selected binding's toolControl adapter
+  # can't express it; best-effort would launch without tool-list flags and report the gap.
   requireEnforcement: strict
   defaults:
     maxGateLoops: 2
@@ -29,6 +30,25 @@ master:
   mode: auto                   # right-sizes non-gate phases; gate floor is absolute
   selfCertification: forbidden
   hardVerificationTags: [strong]
+
+toolPolicies:
+  repo_read_only:
+    allow: [read, find, search, lsp, ast_grep, todo]
+    network: none
+    filesystem: read_only
+  code_write_test:
+    allow: [read, find, search, lsp, ast_grep, ast_edit, edit, write, bash, todo]
+    network: off_sandbox
+    filesystem: worktree_write
+    secrets: scrubbed
+    bash:
+      mode: argv_allowlist
+      allow: [["*", "test"], ["git", "diff"], ["git", "status"]]
+      noShellMetachars: true
+  verify_test:
+    allow: [read, find, search, lsp, bash, todo]
+    network: off_sandbox
+    filesystem: worktree_copy
 
 roles:
   planner:

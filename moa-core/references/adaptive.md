@@ -54,10 +54,15 @@ are capabilities, not job titles.
   own say-so. Take the **best independent verification the host allows** — always a different
   model, a different family whenever one exists — and when it falls short, **name the grade** (see
   the verification floor), never hide it. See `references/anti-self-certification.md`.
-- **Least privilege, best-effort.** Scope each delegated subagent to the tools its job needs, to
-  whatever granularity the host/binding supports; load no arbitrary external skills. *Enforced* graded
-  tool-policy is parked (repo `bindings/`) — apply the discipline, don't claim a guarantee the runtime
-  isn't policing.
+- **Least privilege, best-effort.** Config-present: each role names a canonical `toolPolicies`
+  bundle in `.moa.yml`; `moa_run_start` freezes the reference, and `moa_spawn` compiles it
+  against whichever launcher is currently loaded for that role — `strict`/`sandbox` block an
+  external control the launcher can't express before anything runs, `best-effort` still launches
+  and reports the degradation explicitly (never hidden). Host-native phases receive that same
+  frozen policy only as a request; the host, not the server, applies it. Config-absent: there is
+  no declared policy to compile, so scope each delegated subagent to the tools its job needs to
+  whatever granularity the host/binding supports, and load no arbitrary external skills, as
+  discipline rather than a runtime guarantee.
 - **Verify, don't assume.** A subagent's "done" is a claim until you see the artifacts.
 
 ## The config-absent fork: what you drop

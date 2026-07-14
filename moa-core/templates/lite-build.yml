@@ -19,6 +19,25 @@ master:
   selfCertification: forbidden
   hardVerificationTags: [strong]
 
+toolPolicies:
+  repo_read_only:
+    allow: [read, find, search, lsp, ast_grep, todo]
+    network: none
+    filesystem: read_only
+  code_write_test:
+    allow: [read, find, search, lsp, ast_grep, ast_edit, edit, write, bash, todo]
+    network: off_sandbox
+    filesystem: worktree_write
+    secrets: scrubbed
+    bash:
+      mode: argv_allowlist
+      allow: [["*", "test"], ["git", "diff"], ["git", "status"]]
+      noShellMetachars: true
+  verify_test:
+    allow: [read, find, search, lsp, bash, todo]
+    network: off_sandbox
+    filesystem: worktree_copy
+
 roles:
   planner:
     use: [auto]

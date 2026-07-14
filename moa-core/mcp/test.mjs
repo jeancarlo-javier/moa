@@ -191,6 +191,17 @@ roles:
   assert.equal(ok.errors, undefined, JSON.stringify(ok.errors));
 });
 
+t("load: role tools reference is rejected when the toolPolicies map is absent entirely", () => {
+  const bad = path.join(TMP, "tools-no-policies-map"); fs.mkdirSync(bad, { recursive: true });
+  fs.writeFileSync(path.join(bad, ".moa.yml"), `
+schemaVersion: 1
+roles:
+  worker: { use: [auto], tools: repo_read_only }
+`);
+  const r = opLoad({ cwd: bad });
+  assert.ok(r.errors.includes("role 'worker': tools names unknown policy 'repo_read_only'"), JSON.stringify(r.errors));
+});
+
 t("load: YAML anchors rejected (safe subset)", () => {
   const bad = path.join(TMP, "anchors"); fs.mkdirSync(bad, { recursive: true });
   fs.writeFileSync(path.join(bad, ".moa.yml"), "schemaVersion: 1\nx: &a 1\ny: *a\n");
@@ -334,6 +345,17 @@ await ta("binding_save: rejects invalid tool-control adapters", async () => {
         joined: { argv: ["--tools", "{tools}"], separator: "" },
       } };
     },
+    // duplicate exact {toolArgs} marker
+    (p) => {
+      p.run.argv.push("{toolArgs}", "{toolArgs}");
+      p.toolControl = { disableAll: { argv: ["--none"] } };
+      p.evidence.tests.disableAll = "pass";
+    },
+    // toolControl declared with the marker but no control mode advertised
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = {};
+    },
   ]) {
     const profile = provenProfile({ tool: `toolcontrol-${crypto.randomUUID()}` });
     mutate(profile);
@@ -342,9 +364,43 @@ await ta("binding_save: rejects invalid tool-control adapters", async () => {
   }
 });
 
+await ta("binding_save: requires live proof matching each declared tool-control mode", async () => {
+  const disableAllOnly = () => {
+    const p = provenProfile({ tool: `toolcontrol-proof-${crypto.randomUUID()}` });
+    p.run.argv.push("{toolArgs}");
+    p.toolControl = { disableAll: { argv: ["--none"] } };
+    return p;
+  };
+
+  let profile = disableAllOnly();
+  let result = await opBindingSave({ profile });
+  assert.equal(result.code, "unproven_profile", JSON.stringify(result));
+
+  profile = disableAllOnly();
+  profile.toolControl.allowList = { names: { read: "read" }, repeated: { argv: ["--tool", "{tool}"] } };
+  result = await opBindingSave({ profile });
+  assert.equal(result.code, "unproven_profile", JSON.stringify(result));
+
+  profile.evidence.tests.disableAll = "pass";
+  result = await opBindingSave({ profile });
+  assert.equal(result.code, "unproven_profile", JSON.stringify(result));
+
+  profile.evidence.tests.allowList = "pass";
+  result = await opBindingSave({ profile });
+  assert.equal(result.error, undefined, JSON.stringify(result));
+
+  const singleMode = disableAllOnly();
+  singleMode.tool = `toolcontrol-proof-${crypto.randomUUID()}`;
+  singleMode.evidence.tests.disableAll = "pass";
+  result = await opBindingSave({ profile: singleMode });
+  assert.equal(result.error, undefined, JSON.stringify(result));
+});
+
 await ta("binding_save: accepts joined and repeated tool-control adapters", async () => {
   const joined = provenProfile({ tool: "joinedcli" });
   joined.run.argv.push("{toolArgs}");
+  joined.evidence.tests.disableAll = "pass";
+  joined.evidence.tests.allowList = "pass";
   joined.toolControl = {
     disableAll: { argv: ["--fake-no-tools"] },
     allowList: {
@@ -357,6 +413,8 @@ await ta("binding_save: accepts joined and repeated tool-control adapters", asyn
 
   const repeated = provenProfile({ tool: "repeatedcli" });
   repeated.run.argv.push("{toolArgs}");
+  repeated.evidence.tests.disableAll = "pass";
+  repeated.evidence.tests.allowList = "pass";
   repeated.toolControl = {
     disableAll: { argv: ["--fake-no-tools"] },
     allowList: {
@@ -866,6 +924,14 @@ function runnableProfile({
     },
     output: output ?? { format: "text", resultPath: "stdout" },
     ...(toolControl ? { toolControl } : {}),
+    ...(toolControl ? { evidence: {
+      probedOn: "2026-07-14",
+      tests: {
+        modelDiscovery: "pass", T1: "pass", T2: "pass", T3: "pass", T4: "pass",
+        ...(toolControl.disableAll ? { disableAll: "pass" } : {}),
+        ...(toolControl.allowList ? { allowList: "pass" } : {}),
+      },
+    } } : {}),
   });
 }
 
@@ -1289,6 +1355,58 @@ await ta("spawn: best-effort degrades and launches without tool args, recording 
     manifest.enforcement?.some((e) => e.reason === "disable_all_unsupported"),
     JSON.stringify(manifest.enforcement),
   );
+});
+
+await ta("spawn: best-effort degrade preserves failure-specific evidence extras like the unmapped tool name", async () => {
+  const profile = runnableProfile({
+    tool: `policy-degrade-unmapped-${crypto.randomUUID()}`,
+    toolControl: JOINED_TOOL_CONTROL,
+  });
+  const { repo, run } = await startExternalRun(profile, { policyName: "p", policy: { allow: ["write"] } });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  assert.equal(result.code, undefined, JSON.stringify(result));
+  assert.equal(result.enforcement.state, "degraded");
+  assert.equal(result.enforcement.reason, "unmapped_tool");
+  assert.equal(result.enforcement.tool, "write");
+
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(repo, ".moa", "runs", run.runId, "manifest.json"), "utf8",
+  ));
+  const entry = manifest.enforcement.find((e) => e.reason === "unmapped_tool");
+  assert.equal(entry?.tool, "write");
+});
+
+await ta("spawn: manifest records every compiled enforcement outcome, not only degraded", async () => {
+  const enforcedProfile = argsProfile({
+    tool: `policy-manifest-enforced-${crypto.randomUUID()}`,
+    toolControl: JOINED_TOOL_CONTROL,
+  });
+  const { repo: enforcedRepo, run: enforcedRun } = await startExternalRun(enforcedProfile, {
+    policyName: "p", policy: { allow: ["read"] },
+  });
+  const enforcedResult = await opSpawn({ runId: enforcedRun.runId, phase: "work", prompt: "x" });
+  assert.equal(enforcedResult.code, undefined, JSON.stringify(enforcedResult));
+  const enforcedManifest = JSON.parse(fs.readFileSync(
+    path.join(enforcedRepo, ".moa", "runs", enforcedRun.runId, "manifest.json"), "utf8",
+  ));
+  const enforcedEntries = enforcedManifest.enforcement.filter((e) => e.phase === "work");
+  assert.equal(enforcedEntries.length, 1, JSON.stringify(enforcedEntries));
+  const [enforcedEntry] = enforcedEntries;
+  assert.equal(enforcedEntry.role, "worker");
+  assert.equal(enforcedEntry.binding, enforcedProfile.tool);
+  assert.equal(enforcedEntry.state, "enforced");
+  for (const [key, value] of Object.entries(enforcedResult.enforcement))
+    assert.deepEqual(enforcedEntry[key], value);
+
+  const noneProfile = argsProfile({ tool: `policy-manifest-none-${crypto.randomUUID()}` });
+  const { repo: noneRepo, run: noneRun } = await startExternalRun(noneProfile);
+  await opSpawn({ runId: noneRun.runId, phase: "work", prompt: "x" });
+  const noneManifest = JSON.parse(fs.readFileSync(
+    path.join(noneRepo, ".moa", "runs", noneRun.runId, "manifest.json"), "utf8",
+  ));
+  const noneEntry = noneManifest.enforcement.find((e) => e.phase === "work");
+  assert.equal(noneEntry?.state, "not_requested");
+  assert.equal(noneEntry?.binding, noneProfile.tool);
 });
 
 await ta("spawn: deny-only policies are unsupported — strict fails, best-effort degrades", async () => {

@@ -181,6 +181,10 @@ function profileRejectionReason(profile) {
       profile.evidence.tests.T2 !== "pass" ||
       profile.evidence.tests.T4 !== "pass")
     return "unproven_profile";
+  if (profile.toolControl?.disableAll && profile.evidence.tests.disableAll !== "pass")
+    return "unproven_profile";
+  if (profile.toolControl?.allowList && profile.evidence.tests.allowList !== "pass")
+    return "unproven_profile";
   if ((profile.run.promptVia ?? "file") === "arg")
     return "unsafe_prompt_transport";
   if ((profile.run.promptVia ?? "file") === "file" &&
@@ -202,6 +206,7 @@ function profileRejectionReason(profile) {
   if (profile.toolControl) {
     const placeholdersOf = (argv) => argv.flatMap((arg) => arg.match(/\{[^{}]+\}/g) ?? []);
     const { disableAll, allowList } = profile.toolControl;
+    if (!disableAll && !allowList) return "invalid_profile";
     if (disableAll && placeholdersOf(disableAll.argv).length)
       return "invalid_profile";
     if (allowList) {
@@ -245,7 +250,7 @@ function crossCheck(cfg) {
         errs.push(`role '${rname}': use '${u}' is not in the models registry (and not 'auto')`);
     if (role.differentModelFrom && !roleNames.has(role.differentModelFrom))
       errs.push(`role '${rname}': differentModelFrom names unknown role '${role.differentModelFrom}'`);
-    if (role.tools && toolPolicyNames && !toolPolicyNames.has(role.tools))
+    if (role.tools && !toolPolicyNames?.has(role.tools))
       errs.push(`role '${rname}': tools names unknown policy '${role.tools}'`);
   }
   for (const [mname, entry] of Object.entries(cfg.models ?? {})) {
@@ -1078,7 +1083,7 @@ function compileToolPolicy({ role, policyName, policy, profile, enforcement }) {
   const base = { policy: policyName, binding: profile.tool, ...(unenforced ? { unenforced } : {}) };
   const fail = (reason, extra = {}) =>
     enforcement === "best-effort"
-      ? { args: [], evidence: { state: "degraded", ...base, reason } }
+      ? { args: [], evidence: { state: "degraded", ...base, reason, ...extra } }
       : errorResult(
           "tool_policy_unsupported",
           `role '${role}': tool policy '${policyName}' unsupported (${reason})`,
@@ -1161,11 +1166,9 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
     enforcement: manifest.enforcementMode ?? "best-effort",
   });
   if (compiled.error) return compiled;
-  if (compiled.evidence.state === "degraded") {
-    manifest.enforcement ??= [];
-    manifest.enforcement.push({ phase, role: step.role, ...compiled.evidence });
-    saveRun(manifest);
-  }
+  manifest.enforcement ??= [];
+  manifest.enforcement.push({ phase, role: step.role, binding: profile.tool, ...compiled.evidence });
+  saveRun(manifest);
 
   const dir = runDir(runId);
   fs.mkdirSync(dir, { recursive: true });
@@ -1311,7 +1314,7 @@ if (isMain) await startMcp();
 async function startMcp() {
   const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
   const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
-  const server = new McpServer({ name: "moa", version: "0.8.0" });
+  const server = new McpServer({ name: "moa", version: "0.9.0" });
   const json = (r) => ({ content: [{ type: "text", text: JSON.stringify(r) }], isError: !!r?.error });
 
   server.tool(
@@ -1343,7 +1346,7 @@ async function startMcp() {
 
   server.tool(
     "moa_run_start",
-    "Start a gated run. Selects the pipeline (named; 'default' in workflow mode; or explicit ad-hoc steps in adaptive mode), creates the run store + manifest, and returns {runId, frame, next}. Print the frame to the user, then execute `next`.",
+    "Start a gated run. Selects the pipeline (named; 'default' in workflow mode; or explicit ad-hoc steps in adaptive mode), creates the run store + manifest — freezing each role's tool-policy reference and runtime.requireEnforcement mode for the run's lifetime — and returns {runId, frame, next}. Print the frame to the user, then execute `next`.",
     {
       task: z.string().describe("one-line task statement"),
       pipeline: z.string().optional().describe("named pipeline from the config"),
@@ -1377,7 +1380,7 @@ async function startMcp() {
 
   server.tool(
     "moa_spawn",
-    "Executes the current run phase through its resolved registered external agent tool. Before launch, re-runs the bound tool's modelDiscovery against its CURRENT inventory and refuses to launch when the frozen model is no longer served (model_not_served, instead of routing through a stale assumption). Transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result. Does not advance the run; inspect the result and call moa_step_report separately.",
+    "Executes the current run phase through its resolved registered external agent tool. Before launch, re-runs the bound tool's modelDiscovery against its CURRENT inventory and refuses to launch when the frozen model is no longer served (model_not_served, instead of routing through a stale assumption). Compiles the run's frozen role tool policy against the currently loaded binding's proven toolControl adapter: strict/sandbox block launch with tool_policy_unsupported when the adapter can't express it, best-effort launches without tool-list flags and reports the degraded state/reason. Transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result plus an explicit enforcement block (also recorded in the run manifest). Does not advance the run; inspect the result and call moa_step_report separately.",
     {
       runId: z.string(),
       phase: z.string().describe("must be the run's current non-master external phase"),
@@ -1406,7 +1409,7 @@ async function startMcp() {
 
   server.tool(
     "moa_binding_save",
-    "Validate, discover (live), and persist a learn-tool profile to ~/.moa/bindings/<tool>/profile.yml. Refuses in code any profile whose evidence lacks modelDiscovery+T1+T2+T4 = pass or promptSafe: true; runs the discovery recipe once before persistence to confirm the model inventory currently served by the tool. The saved profile contains only run/output/capability metadata — never the resolved model list.",
+    "Validate, discover (live), and persist a learn-tool profile to ~/.moa/bindings/<tool>/profile.yml. Refuses in code any profile whose evidence lacks modelDiscovery+T1+T2+T4 = pass or promptSafe: true; a declared toolControl.disableAll/allowList mode is refused unless evidence.tests.disableAll/allowList is also 'pass' — no advertised control mode is trusted without its own live probe. Runs the discovery recipe once before persistence to confirm the model inventory currently served by the tool. The saved profile contains only run/output/capability/toolControl metadata — never the resolved model list.",
     { profile: z.any().describe("the full profile object per references/learn-tool.md") },
     async (a) => json(await opBindingSave(a))
   );

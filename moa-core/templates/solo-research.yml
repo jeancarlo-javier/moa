@@ -17,6 +17,12 @@ master:
   selfCertification: forbidden
   hardVerificationTags: [strong]
 
+toolPolicies:
+  web_research:
+    allow: [web_search, todo, write_facts]
+    network: web_only
+    filesystem: scratch_only
+
 roles:
   researcher:
     use: [auto]
