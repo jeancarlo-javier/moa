@@ -1,6 +1,6 @@
 ---
 name: moa
-version: 0.6.0
+version: 0.7.0
 allowed-tools: mcp__moa__*
 description: |
   Master of Agents (moa) — per-project, runtime-AGNOSTIC multi-agent orchestration. Become the
@@ -35,6 +35,8 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
    - first arg `learn-tool` → `references/learn-tool.md` (probe + prove; `moa_binding_save` binds).
    - otherwise → orchestrate (workflow if a `default` pipeline exists; adaptive if not — see
      `references/adaptive.md` for the config-absent fork and its arc).
+   Call `moa_tools` only when you need an on-demand compact list of connected external tools,
+   models, and capabilities; it reloads newly learned tools without a server restart.
 2. **`moa_resolve`** — pass the models YOUR host can spawn subagents on (only you know them).
    The server merges registry + learned tools + host, pins every role's model/effort/binding with
    a recorded reason, and writes `effective-config.json`. Surface its diagnostics plainly
@@ -46,8 +48,8 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
 4. **Execute each step, then `moa_step_report`** — the ONLY way to advance. Per step:
    - `spawn.kind: native` → launch the subagent with your host capability on the step's
      `model`/`effort`, scoped to the role's tools as far as the host allows.
-   - `spawn.kind: profile` → `moa_spawn_prep` with the role's prompt; run the returned argv with
-     your shell; read the result per `output`. Never inline a prompt into a command.
+   - `spawn.kind: profile` → call `moa_spawn` with the role's prompt; inspect the normalized
+     result and actual workspace effects, then report the phase. The MCP server owns safe execution.
    - `isMaster: true` → the phase is yours (frame, finalize).
    - Report honestly: gate phases need the verifier's parseable verdict; producing phases need
      `changedFiles` and the **actual** `producerModel` (yourself included, if you authored).

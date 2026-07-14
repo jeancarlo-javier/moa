@@ -1034,7 +1034,7 @@ if (isMain) await startMcp();
 async function startMcp() {
   const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
   const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
-  const server = new McpServer({ name: "moa", version: "0.6.0" });
+  const server = new McpServer({ name: "moa", version: "0.7.0" });
   const json = (r) => ({ content: [{ type: "text", text: JSON.stringify(r) }], isError: !!r?.error });
 
   server.tool(
@@ -1042,6 +1042,13 @@ async function startMcp() {
     "FIRST CALL of every moa run. Locates .moa.yml (cwd→root), parses + validates it, reads learned tool profiles (~/.moa/bindings). Returns the normalized config, dispatch mode (workflow|adaptive-config|adaptive-bare), roles, pipelines, and connected tools. Replaces reading the config by hand.",
     { cwd: z.string().optional().describe("directory to search from; defaults to the server's cwd") },
     async (a) => json(opLoad(a))
+  );
+
+  server.tool(
+    "moa_tools",
+    "Lists registered external agent tools that are currently executable, their models and capabilities, and the stable MCP call used to run them. Reloads profiles on every call, so newly learned tools appear without a server restart.",
+    {},
+    async () => json(opTools())
   );
 
   server.tool(
@@ -1092,10 +1099,14 @@ async function startMcp() {
   );
 
   server.tool(
-    "moa_spawn_prep",
-    "For phases bound to a learned CLI tool: pass the role's prompt; the server writes it to a temp file and returns ready-to-run argv (model/promptFile/cwd filled from the profile). The prompt never transits the command line — run the argv with your shell, read the result per `output`.",
-    { runId: z.string(), phase: z.string(), prompt: z.string() },
-    async (a) => json(opSpawnPrep(a))
+    "moa_spawn",
+    "Executes the current run phase through its resolved registered external agent tool. Validates phase order and model support, transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result. Does not advance the run; inspect the result and call moa_step_report separately.",
+    {
+      runId: z.string(),
+      phase: z.string().describe("must be the run's current non-master external phase"),
+      prompt: z.string(),
+    },
+    async (args) => json(await opSpawn(args))
   );
 
   server.tool(

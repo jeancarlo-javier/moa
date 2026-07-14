@@ -12,12 +12,11 @@ The old binding was a *program the master called* — a hand-written adapter imp
 enforced `spawn()` (archived in `../../bindings/`). It required authoring a security-sensitive
 plugin and a language runtime the user may not have.
 
-The new binding is **data the master learns and then drives with its own shell.** You — the
-master — *are* the host agent, so you already have a shell. "Spawn a subagent on tool *T*" just
-means: run *T*'s non-interactive command with a prompt and read back its output. So a binding is
-nothing more than **the recipe for that command + how to read the result + which models *T* can
-drive.** Learning it = deriving that recipe by probing *T*, then *proving* it with a live
-round-trip. No adapter process. No Python. No runtime dependency.
+The new binding is validated launcher data executed by the MCP server. A profile records the
+non-interactive argv template, safe prompt channel, output contract, timeout, capabilities, and
+models a launcher serves. Learning it means deriving that data by probing the launcher, proving it
+with live round-trips, then registering it through `moa_binding_save`. The MCP server owns process
+execution; the master never receives argv or hands the profile to a shell.
 
 This keeps the founding invariant intact: **the skill core still names no CLI.** Every concrete
 command lives in the *profile* you write to disk (data), never in your reasoning or this file.
@@ -57,8 +56,8 @@ tool: <short-name>                 # how moa refers to this binding
 bin: <executable>                  # resolved on PATH or an absolute path
 version: <captured --version>      # for staleness detection
 run:                               # the recipe to launch ONE non-interactive subagent
-  argv: [<bin>, <run-subcmd>, "--model", "{model}", "--file", "{promptFile}", "--cwd", "{cwd}"]
-  promptVia: file                  # file | stdin | arg  (prefer file/stdin — never interpolated)
+  argv: ["{bin}", <run-subcmd>, "--model", "{model}", "--file", "{promptFile}", "--cwd", "{cwd}"]
+  promptVia: file                  # file | stdin; arg is refused
   modelPlaceholder: "{model}"
   isolationFlags: [<...>]          # e.g. a no-session / no-extensions flag set, if the CLI has one
   timeoutSeconds: 1800
@@ -107,6 +106,8 @@ side-effect-free. From the help text, extract the *shape* and draft an invocatio
 - **effort/thinking** controls, if any.
 - the **output shape** (text / JSON / JSONL) and where the assistant's final text lives.
 - optional niceties: a **cwd** flag, a **no-session / no-extensions** flag, a **timeout** flag.
+The executable template may use `{bin}`, `{model}`, `{promptFile}`, `{cwd}`, and `{maxTime}`.
+`file` and `stdin` prompt transport are supported; `arg` is refused at registration.
 
 ### Phase 2 — Acquire model knowledge
 Call the discovered list-models command and parse it into the profile's `models` — `{ id,
@@ -149,10 +150,11 @@ derive which roles the tool can staff: a producer needs `canProduce` (T3); think
 verifier / judge need only T1. If T1 fails, end at terminal `tool_incompatible` **with the
 evidence**, so the user learns *why*, not just "no."
 
-### Phase 5 — Bind globally
-Write the proven profile to `~/.moa/bindings/<tool>/profile.yml`, including the evidence block
-(test results, date, captured version). This file *is* the binding: at orchestration time you
-read it and run the tool with your own shell. Global location ⇒ every project sees it at once.
+### Phase 5 — Register globally
+Save the proven profile through `moa_binding_save`, including the evidence block (test results,
+date, captured version). The server validates it, persists it under
+`~/.moa/bindings/<tool>/profile.yml`, and makes it immediately visible through `moa_tools`.
+Global registration means every project can resolve it without restarting the MCP server.
 
 ### Phase 6 — Report + close the independence loop
 Show the user: the tool bound, the models now available **with their families**, the roles it
@@ -218,12 +220,13 @@ Next: /moa init  (or re-run your task to pick up the new models).
 ```
 
 ## Using a bound profile at orchestration time <a id="using-a-profile"></a>
-During a run (workflow or adaptive), the master discovers profiles in `~/.moa/bindings/*/`
-exactly as it discovers the host-native capability. To spawn a role×model subagent on a profiled
-tool: select the role's model, find the profile whose `models` includes it, write the role's
-prompt to a temp file, fill the `run.argv` template (`{model}`, `{promptFile}`, `{cwd}`), run it
-with your own shell under the profile's timeout, then read the result via `output.resultPath`.
-Verify producer output by diffing the cwd — never by trusting the worker's self-report.
+During a run (workflow or adaptive), call `moa_tools` when connected-tool details are needed, then
+resolve the role normally. For a current phase routed to a registered external tool, call
+`moa_spawn(runId, phase, prompt)`. The MCP server selects the registered profile, expands
+`{bin}`, `{model}`, `{promptFile}`, `{cwd}`, and `{maxTime}` as individual argv elements, transports
+the prompt by file or stdin, executes without a shell, enforces timeout/output limits, and returns
+the normalized result. Inspect that result and the actual workspace effects, then call
+`moa_step_report`; spawning never advances the run.
 
 ## Re-learning & staleness <a id="re-learning"></a>
 Re-running `learn-tool` on an already-bound tool re-probes and **overwrites** its profile
