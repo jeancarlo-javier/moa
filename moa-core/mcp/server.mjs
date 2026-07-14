@@ -375,8 +375,7 @@ export async function opTools() {
 
 // independence keys on the MODEL: collapse provider aliases + effort suffixes
 function independenceGroup(id) {
-  const base = String(id).split("/").pop().split(":")[0].toLowerCase()
-    .replace(/-[a-z0-9]+$/, "");
+  const base = String(id).split("/").pop().split(":")[0].toLowerCase();
   return base;
 }
 const shortName = (id) => String(id).split("/").pop().split(":")[0];

@@ -386,7 +386,7 @@ await ta("resolve: registry aliases use a registered external route", async () =
   const result = await opResolve({ hostModels: HOST });
   assert.equal(result.roles.worker.model, "vendor/fake-9");
   assert.equal(result.roles.worker.binding, "fakecli");
-  assert.equal(result.roles.worker.group, "fake");
+  assert.equal(result.roles.worker.group, "fake-9");
 });
 
 await ta("resolve: host-native exists only when the host reports the model", async () => {
@@ -534,6 +534,29 @@ pipelines: {}
   assert.equal(result.roles.producer.binding, "route-a");
   assert.equal(result.roles.verifier, undefined);
   assert.equal(result.diagnostics.find((item) => item.role === "verifier").state, "blocked_no_model");
+});
+await ta("resolve: sibling selectors remain independently verifiable", async () => {
+  const repo = path.join(TMP, "sibling-models");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+runtime: { subagents: native }
+models:
+  fake-9: { id: vendor/fake-9, family: fake }
+  fake-10: { id: vendor/fake-10, family: fake }
+roles:
+  producer: { use: [fake-9] }
+  verifier: { use: [fake-10], differentModelFrom: producer }
+pipelines: {}
+`);
+  opLoad({ cwd: repo });
+  const result = await opResolve({ hostModels: [
+    { id: "vendor/fake-9", family: "fake" },
+    { id: "vendor/fake-10", family: "fake" },
+  ] });
+  assert.equal(result.roles.producer.model, "vendor/fake-9");
+  assert.equal(result.roles.verifier.model, "vendor/fake-10");
+  assert.notEqual(result.roles.producer.group, result.roles.verifier.group);
 });
 await ta("resolve: adaptive-bare includes current external models", async () => {
   resetBindings();
