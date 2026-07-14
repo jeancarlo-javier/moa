@@ -50,13 +50,13 @@
 
     "models": {
       "type": "object",
-      "description": "Model registry: ONLY the models THIS project's roles actually use, declared once with their properties — init writes the union of its per-role picks, NOT the full set the host can serve (that dump is bloat the team pays for on every run). Replaces the old 'tiers' map. Optional and may be empty {} — roles that use 'auto' resolve against live host discovery. The key is the model's SHORT-NAME (e.g. 'gemini-3-pro', 'opus'); 'id' holds the full provider ref. Capability labels (strong, cheap, fast, smol, designer, vision, …) go in 'tags' — NEVER in the key. 'auto' is reserved as the role wildcard and must not be used as a key. Roles select models by listing their short-names in 'role.use' (the per-role list; 'models' here is always the registry MAP).",
+      "description": "Selected model preferences, keyed by project alias. Init writes only aliases used by roles, never the full host or learned-tool inventory. Configured aliases remain distinct candidates even when they share one canonical model ID. Roles select aliases through roles.<name>.use.",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "id": { "type": "string",
-            "description": "Concrete model ref the binding understands (e.g. 'google-antigravity/gemini-3-pro'). The registry key is this model's short-name; 'id' is the full ref. If omitted, the key itself is used as the ref. A ':<effort>' suffix on the ref is a baked default that 'effort' overrides." },
+          "id": { "type": "string", "pattern": "^[^\\s/]+/[^\\s]+$",
+            "description": "Exact canonical provider/model ID. If omitted, the alias itself must be canonical." },
           "effort": {
             "type": "array", "items": { "type": "string" }, "minItems": 1, "default": ["auto"],
             "description": "Reasoning/thinking effort — ALWAYS an array (one shape, never a bare scalar). A single-element array (e.g. ['medium'], or the default ['auto'] to let the binding choose) PINS one effort. A multi-element ascending array (e.g. ['low','medium','xhigh']) is an escalation LADDER: the master starts at rung 0 and climbs one rung per gate loop-back. Overrides any ':<effort>' suffix baked into 'id'/key; ignored by models without effort control." },
@@ -65,7 +65,7 @@
           "family": { "type": "string",
             "description": "Model family/lineage, used for the cross-family preference at gates and to collapse provider aliases of one model (independence itself keys on the model). If omitted, discovered via the binding's serves(). Pinning it makes gate grading deterministic and resolvable offline." },
           "binding": { "type": "string",
-            "description": "Optional: pin the binding that serves this model (host-native, or a learned tool profile in ~/.moa/bindings/), overriding routing preference." },
+            "description": "Optional exact route pin for this model alias: host-native or one learned tool name. Binding pins belong only on model entries." },
           "provider": { "type": "string",
             "description": "Optional provider label; usually derivable from the 'id'/key prefix." },
           "context": { "type": "integer", "minimum": 1,
@@ -138,10 +138,9 @@
         "properties": {
           "description": { "type": "string" },
           "use": { "type": "array", "items": { "type": "string" }, "minItems": 1,
-            "description": "Ordered model candidates for this role — each a short-name from the top-level 'models' registry, or the literal 'auto' to let the master pick the best fit. (Renamed from the old 'models' to avoid colliding with the registry map: 'models' is always the registry MAP, 'use' is always a role's LIST of refs into it.) Tried left to right; the first available wins. 'auto' anywhere is a wildcard the master resolves (and as a trailing entry, a fallback if the pinned names ahead of it are unavailable). The sole model selector. For CI/release, pin explicit short-names instead of 'auto'." },
+            "description": "Ordered model aliases, or the literal auto wildcard. This is the only role-level route selector; roles never pin learned tools directly." },
           "effort": { "type": "array", "items": { "type": "string" }, "minItems": 1,
             "description": "Optional per-role reasoning/thinking effort — ALWAYS an array, same shape and rules as models.<name>.effort. A single-element array pins (e.g. ['high']); a multi-element ascending array is an escalation ladder climbed one rung per gate loop-back. Overrides the model's 'effort' and any ':<effort>' suffix baked into its id/key; ignored by models without effort control." },
-          "binding": { "type": "string", "description": "Optional: pin a specific binding (host-native or a learned tool profile), overriding routing preference." },
           "tools": { "type": "string", "description": "Reference into toolPolicies (PARKED — advisory scoping only; enforcement is archived in the repo's bindings/)." },
           "skills": { "type": "array", "items": { "type": "string" }, "default": [] },
           "instructions": { "type": "string" },

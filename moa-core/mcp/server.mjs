@@ -25,8 +25,25 @@ const TEMPLATES = ["solo-research", "research-synth", "lite-build", "full-engine
 // --- config schema (zod mirror of schema/config.schema.json) -------------
 
 const zEffort = z.array(z.string()).min(1);
+const CANONICAL_MODEL_ID = /^[^\s/]+\/[^\s]+$/;
+
+const zDiscoveryOutput = z.discriminatedUnion("format", [
+  z.object({
+    format: z.literal("json"),
+    listPath: z.string().min(1),
+    idPath: z.string().min(1),
+  }).strict(),
+  z.object({ format: z.literal("lines") }).strict(),
+]);
+
+const zModelDiscovery = z.object({
+  argv: z.array(z.string()).min(1),
+  output: zDiscoveryOutput,
+  timeoutSeconds: z.number().int().positive().max(30).optional(),
+}).strict();
+
 const zModelEntry = z.object({
-  id: z.string().optional(),
+  id: z.string().regex(CANONICAL_MODEL_ID).optional(),
   effort: zEffort.optional(),
   tags: z.array(z.string()).optional(),
   family: z.string().optional(),
@@ -42,7 +59,6 @@ const zRole = z.object({
   description: z.string().optional(),
   use: z.array(z.string()).min(1),
   effort: zEffort.optional(),
-  binding: z.string().optional(),
   tools: z.string().optional(),
   skills: z.array(z.string()).optional(),
   instructions: z.string().optional(),
@@ -102,7 +118,10 @@ const zConfig = z.object({
   pipelines: z.record(z.string(), zPipeline).optional(),
 }).strict();
 
+const PLACEHOLDER = /\{[^{}]+\}/;
+
 const zProfile = z.object({
+
   tool: z.string().regex(/^[\w.-]+$/),
   bin: z.string(),
   version: z.string().optional(),
@@ -114,8 +133,7 @@ const zProfile = z.object({
     timeoutSeconds: z.number().int().positive().optional(),
   }),
   output: z.object({ format: z.enum(["text", "json", "jsonl"]).optional(), resultPath: z.string().optional() }).optional(),
-  models: z.array(z.object({ id: z.string(), family: z.string(), tags: z.array(z.string()).optional() })).min(1),
-  listModels: z.array(z.string()).optional(),
+  modelDiscovery: zModelDiscovery,
   capabilities: z.object({
     canProduce: z.boolean().optional(),
     canSelectModel: z.boolean().optional(),
@@ -125,12 +143,15 @@ const zProfile = z.object({
   evidence: z.object({
     probedOn: z.string(),
     tests: z.record(z.string(), z.string()),
-  }),
-});
+  }).strict()
+}).strict();
 
 function profileRejectionReason(profile) {
   if (profile.capabilities.promptSafe !== true ||
+      profile.capabilities.canSelectModel !== true ||
+      profile.evidence.tests.modelDiscovery !== "pass" ||
       profile.evidence.tests.T1 !== "pass" ||
+      profile.evidence.tests.T2 !== "pass" ||
       profile.evidence.tests.T4 !== "pass")
     return "unproven_profile";
   if ((profile.run.promptVia ?? "file") === "arg")
@@ -138,9 +159,16 @@ function profileRejectionReason(profile) {
   if ((profile.run.promptVia ?? "file") === "file" &&
       !profile.run.argv.some((arg) => arg.includes("{promptFile}")))
     return "invalid_profile";
+  if (!profile.run.modelPlaceholder ||
+      !profile.run.argv.some((arg) => arg.includes(profile.run.modelPlaceholder)))
+    return "invalid_profile";
+  if (profile.modelDiscovery.argv[0] !== "{bin}")
+    return "invalid_profile";
+  if (profile.modelDiscovery.argv.some((arg) =>
+      arg.replaceAll("{bin}", "").match(PLACEHOLDER)))
+    return "invalid_profile";
   return null;
 }
-
 // --- helpers --------------------------------------------------------------
 
 function parseYamlStrict(src, label) {
@@ -163,6 +191,12 @@ function crossCheck(cfg) {
         errs.push(`role '${rname}': use '${u}' is not in the models registry (and not 'auto')`);
     if (role.differentModelFrom && !roleNames.has(role.differentModelFrom))
       errs.push(`role '${rname}': differentModelFrom names unknown role '${role.differentModelFrom}'`);
+  }
+  for (const [mname, entry] of Object.entries(cfg.models ?? {})) {
+    if (mname === "auto") continue;
+    const id = entry.id ?? mname;
+    if (!CANONICAL_MODEL_ID.test(id))
+      errs.push(`models.${mname}: id '${id}' is not canonical (expected '<provider>/<model>')`);
   }
   if (modelNames.has("auto")) errs.push("models registry: 'auto' is reserved and cannot be a key");
   for (const [pname, pipe] of Object.entries(cfg.pipelines ?? {})) {
@@ -213,12 +247,74 @@ function toolRecord(profile, resolvedBin) {
     available: Boolean(resolvedBin),
     ...(resolvedBin ? {} : { reason: "executable_not_found" }),
     capabilities: profile.capabilities ?? {},
-    models: (profile.models ?? []).map((model) => ({
-      id: model.id,
-      family: model.family,
-      tags: model.tags ?? [],
-    })),
+    modelDiscovery: { registered: Boolean(profile.modelDiscovery) },
     usage: { tool: "moa_spawn", arguments: ["runId", "phase", "prompt"] },
+  };
+}
+
+function discoveryError(result) {
+  const code = {
+    spawn_failed: "model_discovery_failed",
+    nonzero_exit: "model_discovery_failed",
+    timeout: "model_discovery_timeout",
+    output_limit_exceeded: "model_discovery_overflow",
+  }[result.code] ?? "model_discovery_failed";
+  return errorResult(code, result.error, {
+    exitCode: result.exitCode,
+    durationMs: result.durationMs,
+  });
+}
+
+function parseDiscoveredModels(stdout, output) {
+  let ids;
+  try {
+    if (output.format === "json") {
+      const parsed = JSON.parse(stdout);
+      const list = valueAtPath(parsed, output.listPath);
+      if (!Array.isArray(list))
+        return errorResult("model_discovery_parse_failed", `model list path '${output.listPath}' is not an array`);
+      ids = list.map((item) => valueAtPath(item, output.idPath));
+    } else {
+      ids = stdout.split(/\r?\n/).map((line) => line.trim()).filter(Boolean);
+    }
+  } catch (error) {
+    return errorResult("model_discovery_parse_failed", `could not parse model inventory: ${error.message}`);
+  }
+  if (!ids.length)
+    return errorResult("model_inventory_empty", "model discovery returned no models");
+  if (ids.some((id) => typeof id !== "string" || !CANONICAL_MODEL_ID.test(id)))
+    return errorResult("model_discovery_parse_failed", "model discovery returned a noncanonical model id");
+  return { models: [...new Set(ids)].map((id) => ({ id })) };
+}
+
+async function discoverToolModels(profile, resolvedBin = resolveExecutable(profile.bin)) {
+  if (!profile.modelDiscovery)
+    return errorResult("model_discovery_unavailable", `tool '${profile.tool}' has no model discovery recipe`);
+  if (!resolvedBin)
+    return errorResult("model_discovery_failed", `tool '${profile.tool}' executable is unavailable`);
+  const argv = profile.modelDiscovery.argv.map((arg) => arg.replaceAll("{bin}", resolvedBin));
+  if (argv.some((arg) => PLACEHOLDER.test(arg)))
+    return errorResult("model_discovery_unavailable", "model discovery contains an unknown placeholder");
+  if (resolveExecutable(argv[0]) !== resolvedBin)
+    return errorResult("model_discovery_unavailable", "model discovery executable does not match profile.bin");
+
+  const execution = await runChild({
+    bin: resolvedBin,
+    args: argv.slice(1),
+    cwd: os.tmpdir(),
+    stdin: null,
+    timeoutSeconds: profile.modelDiscovery.timeoutSeconds ?? 10,
+  });
+  if (execution.error) return discoveryError(execution);
+  if (execution.exitCode !== 0)
+    return discoveryError({ ...execution, code: "nonzero_exit" });
+
+  const parsed = parseDiscoveredModels(execution.stdout, profile.modelDiscovery.output);
+  if (parsed.error) return parsed;
+  return {
+    tool: profile.tool,
+    checkedAt: new Date().toISOString(),
+    models: parsed.models,
   };
 }
 
@@ -260,86 +356,109 @@ function loadBindings() {
   return { bindings, tools, skipped };
 }
 
-export function opTools() {
-  const { tools, skipped } = loadBindings();
-  return { tools, skipped };
+export async function opTools() {
+  const { bindings, tools, skipped } = loadBindings();
+  const records = new Map(tools.map((tool) => [tool.tool, tool]));
+  await Promise.all(bindings.map(async (profile) => {
+    const result = await discoverToolModels(profile, profile.resolvedBin);
+    const record = records.get(profile.tool);
+    if (result.error) {
+      record.models = [];
+      record.modelDiscovery = { registered: true, status: "error", code: result.code, error: result.error };
+    } else {
+      record.models = result.models;
+      record.modelDiscovery = { registered: true, status: "ok", checkedAt: result.checkedAt };
+    }
+  }));
+  return { tools: [...records.values()], skipped };
 }
 
 // independence keys on the MODEL: collapse provider aliases + effort suffixes
 function independenceGroup(id) {
-  const base = String(id).split("/").pop().split(":")[0].toLowerCase();
+  const base = String(id).split("/").pop().split(":")[0].toLowerCase()
+    .replace(/-[a-z0-9]+$/, "");
   return base;
 }
 const shortName = (id) => String(id).split("/").pop().split(":")[0];
 
-function candidatePool(cfg, bindings, hostModels) {
+async function discoverBindingInventories(bindings) {
+  const results = await Promise.all(bindings.map(async (profile) => ({
+    profile,
+    discovery: await discoverToolModels(profile, profile.resolvedBin),
+  })));
+  return {
+    inventories: results.filter((item) => !item.discovery.error),
+    diagnostics: results.filter((item) => item.discovery.error).map((item) => ({
+      state: item.discovery.code,
+      tool: item.profile.tool,
+      error: item.discovery.error,
+    })),
+  };
+}
+
+function candidatePool(cfg, inventories, hostModels) {
+  const routesById = new Map();
+  const hostById = new Map();
+  const addRoute = (id, route) => {
+    const routes = routesById.get(id) ?? [];
+    if (!routes.some((item) => item.binding === route.binding && item.modelId === route.modelId))
+      routes.push(route);
+    routesById.set(id, routes);
+  };
+
+  for (const { profile, discovery } of inventories)
+    for (const model of discovery.models)
+      addRoute(model.id, { binding: profile.tool, modelId: model.id, source: `binding:${profile.tool}` });
+
+  for (const model of hostModels) {
+    hostById.set(model.id, model);
+    addRoute(model.id, { binding: "host-native", modelId: model.id, source: "host" });
+  }
+
+
   const pool = [];
-  const byGroup = new Map();
-  let priority = 0;
-
-  const ensure = (model) => {
-    const group = independenceGroup(model.id);
-    let candidate = byGroup.get(group);
-    if (!candidate) {
-      candidate = {
-        shortName: model.shortName ?? shortName(model.id),
-        id: model.id,
-        family: model.family,
-        tags: model.tags ?? [],
-        context: model.context,
-        cost: model.cost,
-        priority: model.priority ?? priority++,
-        effort: model.effort,
-        group,
-        registryBinding: model.registryBinding,
-        sources: [],
-        routes: [],
-      };
-      byGroup.set(group, candidate);
-      pool.push(candidate);
-    }
-    candidate.sources.push(model.source);
-    return candidate;
-  };
-
-  const addRoute = (candidate, route) => {
-    if (!candidate.routes.some((item) =>
-      item.binding === route.binding && item.modelId === route.modelId))
-      candidate.routes.push(route);
-  };
-
+  const configuredIds = new Set();
+  let declarationPriority = 0;
   for (const [name, entry] of Object.entries(cfg?.models ?? {})) {
     if (entry.enabled === false) continue;
-    ensure({
+    const id = entry.id ?? name;
+    configuredIds.add(id);
+    const host = hostById.get(id) ?? {};
+    const routes = routesById.get(id) ?? [];
+    pool.push({
       shortName: name,
-      id: entry.id ?? name,
-      family: entry.family,
-      tags: entry.tags,
-      context: entry.context,
+      id,
+      family: entry.family ?? host.family,
+      tags: entry.tags ?? host.tags ?? [],
+      context: entry.context ?? host.context,
       cost: entry.cost,
-      priority: entry.priority,
+      priority: entry.priority ?? declarationPriority++,
       effort: entry.effort,
+      group: independenceGroup(id),
       registryBinding: entry.binding,
-      source: "registry",
+      routes: [...routes],
+      sources: ["registry", ...new Set(routes.map((route) => route.source))],
     });
   }
 
-  for (const profile of bindings) {
-    for (const model of profile.models) {
-      const candidate = ensure({ ...model, source: `binding:${profile.tool}` });
-      addRoute(candidate, {
-        binding: profile.tool,
-        modelId: model.id,
-        source: `binding:${profile.tool}`,
-      });
-    }
+  for (const [id, routes] of routesById) {
+    if (configuredIds.has(id)) continue;
+    const host = hostById.get(id) ?? {};
+    pool.push({
+      shortName: shortName(id),
+      id,
+      family: host.family,
+      tags: host.tags ?? [],
+      context: host.context,
+      cost: undefined,
+      priority: declarationPriority++,
+      effort: undefined,
+      group: independenceGroup(id),
+      registryBinding: undefined,
+      sources: [...new Set(routes.map((route) => route.source))],
+      routes: [...routes],
+    });
   }
-
-  for (const model of hostModels ?? []) {
-    const candidate = ensure({ ...model, source: "host" });
-    addRoute(candidate, { binding: "host-native", modelId: model.id, source: "host" });
-  }
-
   return pool;
 }
 
@@ -419,7 +538,7 @@ function selectRoute(candidate, bindingPin, subagents = "auto") {
   return allowed.find((route) => route.binding === "host-native") ?? allowed[0] ?? null;
 }
 
-function autoPick(pool, { needTags, notGroups, role, subagents }) {
+function autoPick(pool, { needTags, notGroups, subagents }) {
   const candidates = pool
     .filter((model) => needTags.every((tag) => (model.tags ?? []).includes(tag)))
     .filter((model) => !notGroups.has(model.group));
@@ -427,20 +546,27 @@ function autoPick(pool, { needTags, notGroups, role, subagents }) {
   candidates.sort((a, b) =>
     (costRank[a.cost] ?? 1) - (costRank[b.cost] ?? 1) || a.priority - b.priority);
   for (const model of candidates) {
-    const bindingPin = role.binding ?? model.registryBinding;
+    const bindingPin = model.registryBinding;
     const route = selectRoute(model, bindingPin, subagents);
     if (route) return { model, route, sawModelWithoutRoute: false };
   }
   return { model: null, route: null, sawModelWithoutRoute: candidates.length > 0 };
 }
 
-export function opResolve({ hostModels = [], overrides = {} } = {}) {
+export async function opResolve({ hostModels = [], overrides = {} } = {}) {
   if (!state.loaded) return { error: "call moa_load first" };
-  const { config: cfg, bindings } = state.loaded;
-  const pool = candidatePool(cfg, bindings, hostModels);
+  const invalidHost = hostModels.find((model) => !CANONICAL_MODEL_ID.test(model.id));
+  if (invalidHost)
+    return errorResult("invalid_model_id", `host model '${invalidHost.id}' is not canonical`);
+
+  const { config: cfg } = state.loaded;
+  const { bindings } = loadBindings();
+  const discovered = await discoverBindingInventories(bindings);
+  const pool = candidatePool(cfg, discovered.inventories, hostModels);
+  const diagnostics = [...discovered.diagnostics];
   if (!cfg) {
     state.resolved = { pool, roles: {} };
-    return { pool: pool.map(poolRow), roles: {}, note: "no config — staff ad-hoc roles from this pool; pass explicit models in run_start steps" };
+    return { pool: pool.map(poolRow), roles: {}, diagnostics, note: "no config — staff ad-hoc roles from this pool; pass explicit models in run_start steps" };
   }
   const hardTags = cfg.master?.hardVerificationTags ?? ["strong"];
   // criticality: a role is hard-verifier if any pipeline step running it has gate: critical
@@ -454,7 +580,6 @@ export function opResolve({ hostModels = [], overrides = {} } = {}) {
   names.sort((a, b) =>
     (cfg.roles[a].differentModelFrom ? 1 : 0) - (cfg.roles[b].differentModelFrom ? 1 : 0));
   const roles = {};
-  const diagnostics = [];
   const subagents = cfg.runtime?.subagents ?? "auto";
   for (const rname of names) {
     const role = cfg.roles[rname];
@@ -470,18 +595,19 @@ export function opResolve({ hostModels = [], overrides = {} } = {}) {
     const useList = overrides[rname] ? [overrides[rname]] : role.use;
     for (const use of useList) {
       if (use === "auto") {
-        lastBindingPin = role.binding ?? null;
-        const selected = autoPick(pool, { needTags, notGroups, role, subagents });
+        lastBindingPin = null;
+        const selected = autoPick(pool, { needTags, notGroups, subagents });
         sawModelWithoutRoute ||= selected.sawModelWithoutRoute;
         if (selected.model) {
           ({ model: pick, route } = selected);
+          lastBindingPin = pick.registryBinding ?? null;
           reason = `auto: ${needTags.length ? `tags [${needTags}] ` : ""}lowest-cost/priority pick`;
         }
       } else {
         const model = pool.find((candidate) =>
           candidate.shortName === use || candidate.id === use);
         if (model && !notGroups.has(model.group)) {
-          lastBindingPin = role.binding ?? model.registryBinding ?? null;
+          lastBindingPin = model.registryBinding ?? null;
           const selectedRoute = selectRoute(model, lastBindingPin, subagents);
           if (selectedRoute) {
             pick = model;
@@ -541,11 +667,10 @@ const poolRow = (model) => ({
   family: model.family ?? null,
   tags: model.tags,
   routes: model.routes.map((route) => ({ binding: route.binding, modelId: route.modelId })),
-  source: model.sources.join("+"),
+
 });
 
 const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
-const PLACEHOLDER = /\{[^{}]+\}/;
 
 function errorResult(code, error, extra = {}) {
   return { error, code, ...extra };
@@ -661,7 +786,8 @@ function runChild({ bin, args, cwd, stdin, timeoutSeconds }) {
 
 function runDir(runId) {
   if (!state.loaded) throw new Error("call moa_load first");
-  return path.join(workDirOf(state.loaded), "runs", runId);
+  const wd = workDirOf(state.loaded);
+  return path.join(wd, "runs", runId);
 }
 function loadRun(runId) {
   const p = path.join(runDir(runId), "manifest.json");
@@ -898,10 +1024,12 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
       "tool_unavailable",
       `registered tool '${resolved.binding}' is unavailable`,
     );
-  if (!profile.models.some((model) => model.id === resolved.model))
+  const discovery = await discoverToolModels(profile, profile.resolvedBin);
+  if (discovery.error || discovery.code) return discovery;
+  if (!discovery.models.some((model) => model.id === resolved.model))
     return errorResult(
       "model_not_served",
-      `'${resolved.binding}' does not serve '${resolved.model}'`,
+      `registered tool '${resolved.binding}' no longer serves '${resolved.model}'`,
     );
 
   const dir = runDir(runId);
@@ -997,29 +1125,33 @@ export function opInit({ template, registry = {}, roles = {}, force = false, cwd
 // --- binding save (learn-tool persistence) ---------------------------------
 
 
-export function opBindingSave({ profile } = {}) {
-  const v = zProfile.safeParse(profile);
-  if (!v.success) return { error: "invalid profile: " + v.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") };
-  const p = v.data;
-  const rejection = profileRejectionReason(p);
-  if (rejection === "unproven_profile")
-    return { error: "refusing to bind an unproven profile — T1 (liveness) and T4 (prompt-injection safety) must both be 'pass' and promptSafe must be true" };
-  if (rejection === "unsafe_prompt_transport")
-    return { error: "promptVia 'arg' is shell-interpolation territory — use file or stdin" };
-  if (rejection === "invalid_profile")
-    return { error: "run.argv must reference {promptFile} when promptVia is 'file'" };
-  const dir = path.join(BINDINGS_DIR(), p.tool);
+export async function opBindingSave({ profile } = {}) {
+  const validated = zProfile.safeParse(profile);
+  if (!validated.success)
+    return errorResult("invalid_profile", "invalid profile: " + validated.error.issues.map((issue) =>
+      `${issue.path.join(".")}: ${issue.message}`).join("; "));
+  const saved = validated.data;
+  const rejection = profileRejectionReason(saved);
+  if (rejection) {
+    return errorResult(rejection, `refusing profile '${saved.tool}': ${rejection}`);
+  }
+
+  const resolvedBin = resolveExecutable(saved.bin);
+  if (!resolvedBin)
+    return errorResult("tool_unavailable", `tool '${saved.tool}' executable is unavailable`);
+  const discovery = await discoverToolModels(saved, resolvedBin);
+  if (discovery.error || discovery.code) return discovery;
+
+  const dir = path.join(BINDINGS_DIR(), saved.tool);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, "profile.yml");
-  fs.writeFileSync(file, YAML.stringify(p));
-  const families = [...new Set(p.models.map((m) => m.family))];
-  const discovered = opTools();
+  fs.writeFileSync(file, YAML.stringify(saved));
   return {
     bound: file,
-    models: p.models.length,
-    families,
-    tool: discovered.tools.find((tool) => tool.tool === p.tool),
-    note: `models from ${families.length} famil${families.length === 1 ? "y" : "ies"} now available to every project`,
+    models: discovery.models,
+    tool: { ...toolRecord(saved, resolvedBin), models: discovery.models,
+      modelDiscovery: { registered: true, status: "ok", checkedAt: discovery.checkedAt } },
+    note: `${discovery.models.length} models currently available through ${saved.tool}`,
   };
 }
 
@@ -1053,22 +1185,22 @@ async function startMcp() {
 
   server.tool(
     "moa_tools",
-    "Lists registered external agent tools that are currently executable, their models and capabilities, and the stable MCP call used to run them. Reloads profiles on every call, so newly learned tools appear without a server restart.",
+    "Executes registered live discovery (no caching) and returns the models each learned tool currently serves plus the stable MCP call used to run them. Newly learned tools appear on the next call without a server restart.",
     {},
-    async () => json(opTools())
+    async () => json(await opTools())
   );
 
   server.tool(
     "moa_resolve",
-    "SECOND CALL. Pass the host-native models you (the master) can spawn subagents on; the server merges them with the config registry + learned tools, resolves every role's model/effort/binding deterministically, checks independence constraints, and writes effective-config.json. Returns the per-role resolution + candidate pool + diagnostics.",
+    "SECOND CALL — and runnable independently. Independently runs live discovery across every learned tool, then merges with the host-native models you pass; resolves every role's model/effort/binding deterministically, checks independence constraints, and writes effective-config.json. Calling moa_tools first is optional. Returns the per-role resolution + candidate pool + diagnostics.",
     {
       hostModels: z.array(z.object({
-        id: z.string(), family: z.string().optional(),
+        id: z.string().regex(CANONICAL_MODEL_ID), family: z.string().optional(),
         tags: z.array(z.string()).optional(), context: z.number().int().optional(),
-      })).describe("models spawnable via the host's native subagent capability"),
+      })).describe("models spawnable via the host's native subagent capability; ids must be '<provider>/<model>'"),
       overrides: z.record(z.string(), z.string()).optional().describe("per-run role→model-short-name overrides (highest precedence)"),
     },
-    async (a) => json(opResolve(a))
+    async (a) => json(await opResolve(a))
   );
 
   server.tool(
@@ -1107,7 +1239,7 @@ async function startMcp() {
 
   server.tool(
     "moa_spawn",
-    "Executes the current run phase through its resolved registered external agent tool. Validates phase order and model support, transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result. Does not advance the run; inspect the result and call moa_step_report separately.",
+    "Executes the current run phase through its resolved registered external agent tool. Revalidates the bound model's current live availability before launch — drift between resolve-time and spawn-time is reported as 'model_not_served' instead of routing through a stale assumption. Transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result. Does not advance the run; inspect the result and call moa_step_report separately.",
     {
       runId: z.string(),
       phase: z.string().describe("must be the run's current non-master external phase"),
@@ -1122,9 +1254,10 @@ async function startMcp() {
     {
       template: z.enum(["solo-research", "research-synth", "lite-build", "full-engineering", "design"]),
       registry: z.record(z.string(), z.object({
-        id: z.string().optional(), family: z.string().optional(),
+        id: z.string().regex(CANONICAL_MODEL_ID).optional(), family: z.string().optional(),
         tags: z.array(z.string()).optional(), context: z.number().int().optional(),
         effort: z.array(z.string()).optional(),
+        binding: z.string().optional().describe("optional exact route pin: host-native or learned tool name"),
       })).optional().describe("models map — only models some role actually uses"),
       roles: z.record(z.string(), z.array(z.string())).optional().describe("role name → use list, e.g. {planner: ['opus','auto']}"),
       force: z.boolean().optional(),
@@ -1135,9 +1268,9 @@ async function startMcp() {
 
   server.tool(
     "moa_binding_save",
-    "Persist a learn-tool profile to ~/.moa/bindings/<tool>/profile.yml. Refuses in code any profile whose evidence lacks T1+T4 = pass or promptSafe: true — run the probe protocol (references/learn-tool.md) first and pass the proven result.",
+    "Validate, discover (live), and persist a learn-tool profile to ~/.moa/bindings/<tool>/profile.yml. Refuses in code any profile whose evidence lacks modelDiscovery+T1+T2+T4 = pass or promptSafe: true; runs the discovery recipe once before persistence to confirm the model inventory currently served by the tool. The saved profile contains only run/output/capability metadata — never the resolved model list.",
     { profile: z.any().describe("the full profile object per references/learn-tool.md") },
-    async (a) => json(opBindingSave(a))
+    async (a) => json(await opBindingSave(a))
   );
 
   await server.connect(new StdioServerTransport());

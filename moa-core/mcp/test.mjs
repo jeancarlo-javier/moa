@@ -4,6 +4,7 @@ import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import YAML from "yaml";
 
 const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "moa-test-"));
 process.env.MOA_HOME = path.join(TMP, "home");
@@ -13,38 +14,70 @@ fs.mkdirSync(REPO, { recursive: true });
 const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opInit, opBindingSave } =
   await import("./server.mjs");
 
+const CANONICAL_FAKE_MODEL = "vendor/fake-9";
 const HOST = [
-  { id: "claude-opus-4-8", family: "claude", tags: ["strong"] },
-  { id: "claude-sonnet-4-6", family: "claude", tags: ["strong", "cheap"] },
+  { id: "anthropic/claude-opus-4-8", family: "claude", tags: ["strong"] },
+  { id: "anthropic/claude-sonnet-4-6", family: "claude", tags: ["strong", "cheap"] },
   { id: "openai/gpt-5.5", family: "gpt", tags: ["strong"] },
   { id: "minimax/MiniMax-M3", family: "minimax", tags: ["strong", "cheap"] },
 ];
 
-const provenProfile = (overrides = {}) => ({
-  tool: "fakecli",
-  bin: process.execPath,
-  version: process.version,
-  run: {
-    argv: ["{bin}", "--version", "{promptFile}"],
-    promptVia: "file",
-    timeoutSeconds: 60,
-  },
-  output: { format: "text", resultPath: "stdout" },
-  models: [{ id: "vendor/fake-9", family: "fake", tags: ["strong", "cheap"] }],
-  capabilities: { promptSafe: true, canProduce: true, canSelectModel: true },
-  evidence: {
-    probedOn: "2026-07-14",
-    tests: { T1: "pass", T2: "pass", T3: "pass", T4: "pass" },
-  },
-  ...overrides,
-});
+const inventoryPath = (tool) => path.join(TMP, `${tool}-models.txt`);
 
+function writeInventory(tool, ids = [CANONICAL_FAKE_MODEL], format = "json") {
+  const file = inventoryPath(tool);
+  const content = format === "lines"
+    ? ids.join("\n") + "\n"
+    : JSON.stringify({ models: ids.map((id) => ({ id })) });
+  fs.writeFileSync(file, content);
+  return file;
+}
+
+const provenProfile = (overrides = {}) => {
+  const {
+    tool = "fakecli",
+    inventory = [CANONICAL_FAKE_MODEL],
+    discoveryFormat = "json",
+    ...profileOverrides
+  } = overrides;
+  const modelFile = writeInventory(tool, inventory, discoveryFormat);
+  return {
+    tool,
+    bin: process.execPath,
+    version: process.version,
+    run: {
+      argv: [
+        "{bin}", FAKE_WORKER, "--mode", "text",
+        "--prompt-file", "{promptFile}",
+        "--model", "{model}", "--cwd", "{cwd}", "--max-time", "{maxTime}",
+      ],
+      promptVia: "file",
+      modelPlaceholder: "{model}",
+      timeoutSeconds: 60,
+    },
+    output: { format: "text", resultPath: "stdout" },
+    modelDiscovery: {
+      argv: ["{bin}", FAKE_WORKER, "--models-file", modelFile],
+      output: discoveryFormat === "lines"
+        ? { format: "lines" }
+        : { format: "json", listPath: "models", idPath: "id" },
+      timeoutSeconds: 10,
+    },
+    capabilities: { promptSafe: true, canProduce: true, canSelectModel: true },
+    evidence: {
+      probedOn: "2026-07-14",
+      tests: { modelDiscovery: "pass", T1: "pass", T2: "pass", T3: "pass", T4: "pass" },
+    },
+    ...profileOverrides,
+  };
+};
 let n = 0;
 const t = (name, fn) => { fn(); console.log(`ok ${++n} - ${name}`); };
 const ta = async (name, fn) => {
   await fn();
   console.log(`ok ${++n} - ${name}`);
 };
+
 
 const FAKE_WORKER = path.join(TMP, "fake-worker.mjs");
 fs.writeFileSync(FAKE_WORKER, `
@@ -54,35 +87,37 @@ const value = (flag) => {
   const index = args.indexOf(flag);
   return index < 0 ? undefined : args[index + 1];
 };
-const mode = value("--mode") ?? "text";
-const promptFile = value("--prompt-file");
-const prompt = promptFile ? fs.readFileSync(promptFile, "utf8") : await new Promise((resolve) => {
-  let input = "";
-  process.stdin.setEncoding("utf8");
-  process.stdin.on("data", (chunk) => input += chunk);
-  process.stdin.on("end", () => resolve(input));
-});
-if (mode === "exit") process.exit(7);
-if (mode === "hang") setInterval(() => {}, 1000);
-else if (mode === "overflow") process.stdout.write("x".repeat(5 * 1024 * 1024));
-else if (mode === "badjson") process.stdout.write("{");
-else if (mode === "json") process.stdout.write(JSON.stringify({ response: { text: prompt } }));
-else if (mode === "jsonl") process.stdout.write(JSON.stringify({ event: "start" }) + "\\n" + JSON.stringify({ response: { text: prompt } }) + "\\n");
-else process.stdout.write(prompt);
+const modelsFile = value("--models-file");
+if (modelsFile) {
+  const mode = value("--mode") ?? "text";
+  if (mode === "exit") process.exit(7);
+  if (mode === "hang") setInterval(() => {}, 1000);
+  else if (mode === "overflow") process.stdout.write("x".repeat(5 * 1024 * 1024));
+  else if (mode === "badjson") process.stdout.write("{");
+  else process.stdout.write(fs.readFileSync(modelsFile, "utf8"));
+} else {
+  const mode = value("--mode") ?? "text";
+  const promptFile = value("--prompt-file");
+  const prompt = promptFile ? fs.readFileSync(promptFile, "utf8") : await new Promise((resolve) => {
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", (chunk) => input += chunk);
+    process.stdin.on("end", () => resolve(input));
+  });
+  if (mode === "exit") process.exit(7);
+  if (mode === "hang") setInterval(() => {}, 1000);
+  else if (mode === "overflow") process.stdout.write("x".repeat(5 * 1024 * 1024));
+  else if (mode === "badjson") process.stdout.write("{");
+  else if (mode === "json") process.stdout.write(JSON.stringify({ response: { text: prompt } }));
+  else if (mode === "jsonl") process.stdout.write(JSON.stringify({ event: "start" }) + "\\n" + JSON.stringify({ response: { text: prompt } }) + "\\n");
+  else process.stdout.write(prompt);
+}
 `);
-
-// --- load ------------------------------------------------------------------
-
-t("load: no config → adaptive-bare, never errors", () => {
-  const r = opLoad({ cwd: REPO });
-  assert.equal(r.dispatch, "adaptive-bare");
-  assert.equal(r.config, null);
-});
 
 const CONFIG = `
 schemaVersion: 1
 models:
-  opus: { id: claude-opus-4-8, family: claude, tags: [strong] }
+  opus: { id: anthropic/claude-opus-4-8, family: claude, tags: [strong] }
   gpt: { id: openai/gpt-5.5, family: gpt, tags: [strong], effort: [medium, xhigh] }
   mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong, cheap], cost: cheap }
 roles:
@@ -137,56 +172,165 @@ t("load: YAML anchors rejected (safe subset)", () => {
 
 // --- registered tool discovery ----------------------------------------------
 
-t("binding_save: rejects unproven profiles", () => {
+await ta("binding_save: rejects unproven profiles", async () => {
   const bad = provenProfile({
     capabilities: { promptSafe: false },
-    evidence: { probedOn: "2026-07-14", tests: { T1: "pass", T4: "fail" } },
+    evidence: { probedOn: "2026-07-14", tests: { modelDiscovery: "pass", T1: "pass", T2: "pass", T4: "fail" } },
   });
-  assert.match(opBindingSave({ profile: bad }).error, /unproven/);
+  assert.match((await opBindingSave({ profile: bad })).error, /unproven/);
 });
 
-t("tools: a proven save is immediately discoverable", () => {
-  const saved = opBindingSave({ profile: provenProfile() });
-  assert.ok(saved.bound.endsWith("profile.yml"));
-  assert.equal(saved.tool.tool, "fakecli");
-  assert.equal(saved.tool.available, true);
+await ta("binding_save: rejects obsolete and incomplete discovery profiles", async () => {
+  const obsolete = provenProfile();
+  obsolete.models = [{ id: CANONICAL_FAKE_MODEL, family: "fake" }];
+  assert.match((await opBindingSave({ profile: obsolete })).error, /invalid profile/);
 
-  const listed = opTools();
-  assert.equal(listed.tools.length, 1);
-  assert.deepEqual(listed.tools[0].usage, {
+  const oldList = provenProfile();
+  oldList.listModels = ["{bin}", "models"];
+  assert.match((await opBindingSave({ profile: oldList })).error, /invalid profile/);
+
+  for (const mutate of [
+    (p) => delete p.modelDiscovery,
+    (p) => delete p.run.modelPlaceholder,
+    (p) => p.run.argv.splice(p.run.argv.indexOf("{model}"), 1),
+    (p) => p.capabilities.canSelectModel = false,
+    (p) => p.evidence.tests.modelDiscovery = "fail",
+  ]) {
+    const profile = provenProfile({ tool: `invalid-${crypto.randomUUID()}` });
+    mutate(profile);
+    assert.ok((await opBindingSave({ profile })).error);
+  }
+});
+
+await ta("tools: reads JSON and line inventories live without persisting them", async () => {
+  await opBindingSave({ profile: provenProfile({ tool: "jsoncli" }) });
+  await opBindingSave({ profile: provenProfile({
+    tool: "linecli",
+    inventory: ["vendor/line-1", "vendor/line-2"],
+    discoveryFormat: "lines",
+  }) });
+
+  let listed = await opTools();
+  assert.deepEqual(
+    listed.tools.find((tool) => tool.tool === "jsoncli").models.map((model) => model.id),
+    [CANONICAL_FAKE_MODEL],
+  );
+  assert.deepEqual(
+    listed.tools.find((tool) => tool.tool === "linecli").models.map((model) => model.id),
+    ["vendor/line-1", "vendor/line-2"],
+  );
+
+  writeInventory("jsoncli", ["vendor/new-10"]);
+  listed = await opTools();
+  assert.deepEqual(
+    listed.tools.find((tool) => tool.tool === "jsoncli").models.map((model) => model.id),
+    ["vendor/new-10"],
+  );
+
+  const saved = fs.readFileSync(path.join(
+    process.env.MOA_HOME, ".moa", "bindings", "jsoncli", "profile.yml",
+  ), "utf8");
+  assert.ok(!saved.includes("vendor/fake-9"));
+  assert.ok(!saved.includes("vendor/new-10"));
+});
+
+await ta("tools: rejects malformed, empty, and noncanonical inventories", async () => {
+  for (const [tool, content, code] of [
+    ["bad-json", "{", "model_discovery_parse_failed"],
+    ["empty-models", JSON.stringify({ models: [] }), "model_inventory_empty"],
+    ["display-names", "Claude Opus 4.6 (Thinking)\n", "model_discovery_parse_failed"],
+    ["missing-path", JSON.stringify({ wrong: [] }), "model_discovery_parse_failed"],
+  ]) {
+    const format = tool === "display-names" ? "lines" : "json";
+    const profile = provenProfile({ tool, discoveryFormat: format });
+    fs.writeFileSync(inventoryPath(tool), content);
+    const result = await opBindingSave({ profile });
+    assert.equal(result.code, code, `${tool}: ${JSON.stringify(result)}`);
+  }
+});
+
+await ta("tools: reports discovery process boundaries", async () => {
+  for (const [tool, mode, code] of [
+    ["discover-exit", "exit", "model_discovery_failed"],
+    ["discover-hang", "hang", "model_discovery_timeout"],
+    ["discover-overflow", "overflow", "model_discovery_overflow"],
+  ]) {
+    const profile = provenProfile({ tool });
+    profile.modelDiscovery.argv.push("--mode", mode);
+    profile.modelDiscovery.timeoutSeconds = mode === "hang" ? 1 : 10;
+    const result = await opBindingSave({ profile });
+    assert.equal(result.code, code, `${tool}: ${JSON.stringify(result)}`);
+  }
+});
+
+t("load: binding belongs to models, never roles", () => {
+  const bad = path.join(TMP, "role-binding");
+  fs.mkdirSync(bad, { recursive: true });
+  fs.writeFileSync(path.join(bad, ".moa.yml"), `
+schemaVersion: 1
+models:
+  fake: { id: vendor/fake-9, binding: fakecli }
+roles:
+  worker: { use: [fake], binding: fakecli }
+pipelines: {}
+`);
+  assert.ok(opLoad({ cwd: bad }).errors.some((error) => error.includes("binding")));
+
+  const good = path.join(TMP, "model-binding");
+  fs.mkdirSync(good, { recursive: true });
+  fs.writeFileSync(path.join(good, ".moa.yml"), `
+schemaVersion: 1
+models:
+  fake: { id: vendor/fake-9, family: fake, binding: fakecli }
+roles:
+  worker: { use: [fake] }
+pipelines: {}
+`);
+  assert.equal(opLoad({ cwd: good }).errors, undefined);
+});
+await ta("tools: a proven save is immediately discoverable", async () => {
+  const tool = `clean-${crypto.randomUUID()}`;
+  const saved = await opBindingSave({ profile: provenProfile({ tool }) });
+  assert.ok(saved.bound.endsWith("profile.yml"));
+  assert.equal(saved.tool.tool, tool);
+  assert.equal(saved.tool.available, true);
+  assert.deepEqual(saved.tool.models.map((m) => m.id), [CANONICAL_FAKE_MODEL]);
+
+  const listed = await opTools();
+  const record = listed.tools.find((entry) => entry.tool === tool);
+  assert.ok(record, `tool ${tool} missing from listing`);
+  assert.deepEqual(record.usage, {
     tool: "moa_spawn",
     arguments: ["runId", "phase", "prompt"],
   });
-  assert.equal(listed.tools[0].models[0].id, "vendor/fake-9");
+  assert.deepEqual(record.models.map((m) => m.id), [CANONICAL_FAKE_MODEL]);
 });
 
-t("tools: unavailable executables are reported and excluded from load", () => {
-  opBindingSave({ profile: provenProfile({ tool: "missingcli", bin: path.join(TMP, "missing-bin") }) });
-  const listed = opTools();
-  const missing = listed.tools.find((tool) => tool.tool === "missingcli");
-  assert.equal(missing.available, false);
-  assert.equal(missing.reason, "executable_not_found");
-
-  const loaded = opLoad({ cwd: REPO });
-  assert.ok(!loaded.bindings.some((tool) => tool.tool === "missingcli"));
-});
-
-t("tools: manually unproven profiles are skipped", () => {
-  const profile = provenProfile({
-    tool: "unprovencli",
-    capabilities: { promptSafe: false },
+await ta("tools: unavailable executables are rejected at save", async () => {
+  const result = await opBindingSave({
+    profile: provenProfile({ tool: "missingcli", bin: path.join(TMP, "missing-bin") }),
   });
-  const dir = path.join(process.env.MOA_HOME, ".moa", "bindings", profile.tool);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "profile.yml"), JSON.stringify(profile));
-
-  const listed = opTools();
-  assert.ok(!listed.tools.some((tool) => tool.tool === profile.tool));
-  assert.ok(listed.skipped.some((item) =>
-    item.tool === profile.tool && item.reason === "unproven_profile"));
+  assert.equal(result.code, "tool_unavailable");
 });
 
-t("tools: promptVia arg profiles are skipped", () => {
+await ta("tools: load skips profiles whose binary was removed", async () => {
+  const profile = provenProfile({ tool: "stalecli" });
+  // give this profile its own private binary so we can delete it safely
+  const stub = path.join(TMP, "fakeworker-stale");
+  // private stub that proxies discovery through FAKE_WORKER so we can delete the binary after registration
+  fs.writeFileSync(stub, `#!/bin/sh\nexec "${process.execPath}" "${FAKE_WORKER}" "$@"\n`);
+  fs.chmodSync(stub, 0o755);
+  profile.bin = stub;
+  await opBindingSave({ profile });
+  fs.unlinkSync(stub);
+  const loaded = opLoad({ cwd: REPO });
+  assert.ok(!loaded.bindings.some((tool) => tool.tool === profile.tool));
+  const listed = await opTools();
+  const stale = listed.tools.find((tool) => tool.tool === profile.tool);
+  assert.equal(stale.available, false);
+  assert.equal(stale.reason, "executable_not_found");
+});
+await ta("tools: promptVia arg profiles are rejected", async () => {
   const profile = provenProfile({
     tool: "argcli",
     run: {
@@ -195,25 +339,26 @@ t("tools: promptVia arg profiles are skipped", () => {
       timeoutSeconds: 60,
     },
   });
-  const dir = path.join(process.env.MOA_HOME, ".moa", "bindings", profile.tool);
-  fs.mkdirSync(dir, { recursive: true });
-  fs.writeFileSync(path.join(dir, "profile.yml"), JSON.stringify(profile));
-
-  const listed = opTools();
-  assert.ok(!listed.tools.some((tool) => tool.tool === profile.tool));
-  assert.ok(listed.skipped.some((item) =>
-    item.tool === profile.tool && item.reason === "unsafe_prompt_transport"));
+  const result = await opBindingSave({ profile });
+  assert.equal(result.code, "unsafe_prompt_transport");
 });
 
-t("tools: executable directories are unavailable", () => {
-  const saved = opBindingSave({
+await ta("tools: executable directories fail discovery", async () => {
+  const result = await opBindingSave({
     profile: provenProfile({ tool: "directorycli", bin: TMP }),
   });
-  assert.equal(saved.tool.available, false);
-  assert.equal(saved.tool.reason, "executable_not_found");
+  assert.equal(result.code, "tool_unavailable");
 });
+function resetBindings() {
+  const dir = path.join(process.env.MOA_HOME, ".moa", "bindings");
+  if (fs.existsSync(dir)) {
+    for (const entry of fs.readdirSync(dir))
+      fs.rmSync(path.join(dir, entry), { recursive: true, force: true });
+  }
+}
 
-function writeRouteRepo(name, subagents = "auto", roleBinding = null) {
+
+function writeRouteRepo(name, subagents = "auto", modelBinding = null) {
   const repo = path.join(TMP, name);
   fs.mkdirSync(repo, { recursive: true });
   fs.writeFileSync(path.join(repo, ".moa.yml"), `
@@ -221,84 +366,72 @@ schemaVersion: 1
 runtime:
   subagents: ${subagents}
 models:
-  fake: { id: fake-9, family: fake, tags: [strong] }
-roles:
+  fake:
+    id: vendor/fake-9
+    family: fake
+    tags: [strong]
+${modelBinding ? `    binding: ${modelBinding}\n` : ""}roles:
   worker:
     use: [fake]
-${roleBinding ? `    binding: ${roleBinding}\n` : ""}pipelines: {}
+pipelines: {}
 `);
   return repo;
 }
-
-// --- resolve -----------------------------------------------------------------
-
-t("resolve: registry aliases use a registered external route", () => {
-  const repo = writeRouteRepo("route-external");
+await ta("resolve: registry aliases use a registered external route", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "fakecli" }) });
+  const repo = writeRouteRepo("route-external", "auto", "fakecli");
   opLoad({ cwd: repo });
-  const result = opResolve({ hostModels: HOST });
+  const result = await opResolve({ hostModels: HOST });
   assert.equal(result.roles.worker.model, "vendor/fake-9");
   assert.equal(result.roles.worker.binding, "fakecli");
-  assert.equal(result.roles.worker.group, "fake-9");
+  assert.equal(result.roles.worker.group, "fake");
 });
 
-t("resolve: host-native exists only when the host reports the model", () => {
+await ta("resolve: host-native exists only when the host reports the model", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "fakecli" }) });
   const repo = writeRouteRepo("route-native");
   opLoad({ cwd: repo });
-  const result = opResolve({
-    hostModels: [...HOST, { id: "host/fake-9", family: "fake", tags: ["strong"] }],
+  const result = await opResolve({
+    hostModels: [...HOST, { id: "vendor/fake-9", family: "fake", tags: ["strong"] }],
   });
-  assert.equal(result.roles.worker.model, "host/fake-9");
+  assert.equal(result.roles.worker.model, "vendor/fake-9");
   assert.equal(result.roles.worker.binding, "host-native");
 });
-
-t("resolve: runtime.subagents filters routes", () => {
+await ta("resolve: runtime.subagents filters routes", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "fakecli" }) });
   const nativeRepo = writeRouteRepo("route-native-only", "native");
   opLoad({ cwd: nativeRepo });
-  assert.equal(opResolve({ hostModels: HOST }).diagnostics[0].state, "blocked_no_binding");
+  assert.equal((await opResolve({ hostModels: HOST })).diagnostics[0].state, "blocked_no_binding");
 
   const externalRepo = writeRouteRepo("route-external-only", "external");
   opLoad({ cwd: externalRepo });
-  assert.equal(opResolve({
-    hostModels: [...HOST, { id: "host/fake-9", family: "fake" }],
-  }).roles.worker.binding, "fakecli");
+  assert.equal((await opResolve({
+    hostModels: [...HOST, { id: "vendor/fake-9", family: "fake" }],
+  })).roles.worker.binding, "fakecli");
 
   const blockedRepo = writeRouteRepo("route-blocked", "blocked");
   opLoad({ cwd: blockedRepo });
-  assert.equal(opResolve({
-    hostModels: [...HOST, { id: "host/fake-9", family: "fake" }],
-  }).diagnostics[0].state, "blocked_no_binding");
+  assert.equal((await opResolve({
+    hostModels: [...HOST, { id: "vendor/fake-9", family: "fake" }],
+  })).diagnostics[0].state, "blocked_no_binding");
 });
-
-t("resolve: an unavailable binding pin is diagnosed", () => {
+await ta("resolve: a model binding pin to a missing tool is diagnosed", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "fakecli" }) });
   const repo = writeRouteRepo("route-bad-pin", "auto", "missingcli");
   opLoad({ cwd: repo });
-  const result = opResolve({ hostModels: HOST });
+  const result = await opResolve({ hostModels: HOST });
   assert.equal(result.diagnostics[0].state, "blocked_no_binding");
   assert.match(result.diagnostics[0].hint, /missingcli/);
 });
 
-t("resolve: an auto role binding pin is named in diagnostics", () => {
-  const repo = path.join(TMP, "route-auto-bad-pin");
-  fs.mkdirSync(repo, { recursive: true });
-  fs.writeFileSync(path.join(repo, ".moa.yml"), `
-schemaVersion: 1
-roles:
-  worker:
-    use: [auto]
-    binding: missingcli
-pipelines: {}
-`);
-  opLoad({ cwd: repo });
-  const result = opResolve({ hostModels: HOST });
-  assert.equal(result.diagnostics[0].state, "blocked_no_binding");
-  assert.match(result.diagnostics[0].hint, /missingcli/);
-});
-
-
-t("resolve: pinned + auto + differentModelFrom honored", () => {
+await ta("resolve: pinned + auto + differentModelFrom honored", async () => {
   opLoad({ cwd: REPO });
-  const r = opResolve({ hostModels: HOST });
-  assert.equal(r.roles.planner.model, "claude-opus-4-8");
+  const r = await opResolve({ hostModels: HOST });
+  assert.equal(r.roles.planner.model, "anthropic/claude-opus-4-8");
   assert.equal(r.roles.coder.model, "minimax/MiniMax-M3");
   assert.equal(r.roles.verifier.model, "openai/gpt-5.5");
   assert.notEqual(r.roles.verifier.group, r.roles.coder.group);
@@ -306,23 +439,13 @@ t("resolve: pinned + auto + differentModelFrom honored", () => {
   assert.ok(fs.existsSync(path.join(REPO, ".moa", "effective-config.json")));
 });
 
-t("resolve: requires load first (state discipline)", () => {
-  // fresh import shares module state; simulate by checking error path via a bare load
-  const r = opResolve.call(null, { hostModels: HOST });
+await ta("resolve: requires load first (state discipline)", async () => {
+  const r = await opResolve({ hostModels: HOST });
   assert.ok(!r.error); // loaded above — just confirms happy path is stable
 });
 
-t("resolve: unresolvable role → blocked_no_model diagnostic", () => {
+await ta("resolve: unresolvable role → blocked_no_model diagnostic", async () => {
   const solo = path.join(TMP, "solo"); fs.mkdirSync(solo, { recursive: true });
-  fs.writeFileSync(path.join(solo, ".moa.yml"), `
-schemaVersion: 1
-models:
-  ghost: { id: nowhere/ghost-1, family: ghost, tags: [strong] }
-roles:
-  a: { use: [missing-name] }
-pipelines: {}
-`);
-  // 'missing-name' fails crossCheck; use a registry name that resolves but pool-filter can't break
   fs.writeFileSync(path.join(solo, ".moa.yml"), `
 schemaVersion: 1
 models:
@@ -333,7 +456,7 @@ roles:
 pipelines: {}
 `);
   opLoad({ cwd: solo });
-  const r = opResolve({
+  const r = await opResolve({
     hostModels: [{ id: "nowhere/ghost-1", family: "ghost", tags: ["strong"] }],
   });
   assert.equal(r.roles.a.model, "nowhere/ghost-1");
@@ -341,49 +464,130 @@ pipelines: {}
   assert.equal(r.diagnostics[0].role, "b");
 });
 
+await ta("resolve: invalid host model id is rejected before discover runs", async () => {
+  opLoad({ cwd: REPO });
+  const result = await opResolve({
+    hostModels: [...HOST, { id: "not canonical", family: "x" }],
+  });
+  assert.equal(result.code, "invalid_model_id");
+});
+
+await ta("resolve: role-level binding rejected at load", async () => {
+  const repo = path.join(TMP, "role-binding-reject");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models:
+  fake: { id: vendor/fake-9, family: fake }
+roles:
+  worker: { use: [fake], binding: fakecli }
+pipelines: {}
+`);
+  const r = opLoad({ cwd: repo });
+  assert.ok(r.errors && r.errors.some((error) => error.includes("binding")));
+});
+
+await ta("resolve: queries tools directly and observes additions and removals", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "fakecli" }) });
+  const repo = writeRouteRepo("live-resolve", "external", "fakecli");
+  opLoad({ cwd: repo });
+  let result = await opResolve({ hostModels: HOST });
+  assert.equal(result.roles.worker.model, CANONICAL_FAKE_MODEL);
+
+  writeInventory("fakecli", ["vendor/other-9"]);
+  result = await opResolve({ hostModels: HOST });
+  assert.equal(result.roles.worker, undefined);
+  assert.equal(result.diagnostics.find((item) => item.role === "worker").state, "blocked_no_binding");
+});
+await ta("resolve: exact ids never borrow same-group routes", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({
+    tool: "exactcli",
+    inventory: ["vendor/fake-10"],
+  }) });
+  const repo = writeRouteRepo("exact-routes", "external", "exactcli");
+  opLoad({ cwd: repo });
+  const result = await opResolve({ hostModels: [] });
+  assert.equal(result.roles.worker, undefined);
+  assert.equal(result.diagnostics.find((item) => item.role === "worker").state, "blocked_no_binding");
+});
+await ta("resolve: duplicate aliases keep separate bindings but one identity", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "route-a" }) });
+  await opBindingSave({ profile: provenProfile({ tool: "route-b" }) });
+  const repo = path.join(TMP, "duplicate-aliases");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models:
+  fake-a: { id: vendor/fake-9, family: fake, binding: route-a }
+  fake-b: { id: vendor/fake-9, family: fake, binding: route-b }
+roles:
+  producer: { use: [fake-a] }
+  verifier: { use: [fake-b], differentModelFrom: producer }
+pipelines: {}
+`);
+  opLoad({ cwd: repo });
+  const result = await opResolve({ hostModels: [] });
+  assert.equal(result.roles.producer.binding, "route-a");
+  assert.equal(result.roles.verifier, undefined);
+  assert.equal(result.diagnostics.find((item) => item.role === "verifier").state, "blocked_no_model");
+});
+await ta("resolve: adaptive-bare includes current external models", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "fakecli" }) });
+  const bare = path.join(TMP, "adaptive-live");
+  fs.mkdirSync(bare, { recursive: true });
+  opLoad({ cwd: bare });
+  const result = await opResolve({ hostModels: [] });
+  assert.ok(result.pool.some((model) =>
+    model.id === CANONICAL_FAKE_MODEL && model.routes.some((route) => route.binding === "fakecli")));
+});
+
+
 // --- run state machine --------------------------------------------------------
 
-function freshRun() {
+async function freshRun() {
   opLoad({ cwd: REPO });
-  opResolve({ hostModels: HOST });
-  return opRunStart({ task: "test task", pipeline: "build", masterModel: "claude-fable-5", masterFamily: "claude" });
+  await opResolve({ hostModels: HOST });
+  return opRunStart({ task: "test task", pipeline: "build", masterModel: "host/master", masterFamily: "host" });
 }
 
-t("run_start: frame + first step from data", () => {
-  const r = freshRun();
+await ta("run_start: frame + first step from data", async () => {
+  const r = await freshRun();
   assert.ok(r.runId);
   assert.ok(r.frame.config.includes(".moa.yml"));
   assert.equal(r.next.phase, "plan");
-  assert.equal(r.next.model, "claude-opus-4-8");
+  assert.equal(r.next.model, "anthropic/claude-opus-4-8");
 });
 
-t("step_report: wrong phase rejected with expected step", () => {
-  const { runId } = freshRun();
+await ta("step_report: wrong phase rejected with expected step", async () => {
+  const { runId } = await freshRun();
   const r = opStepReport({ runId, phase: "execute", summary: "nope" });
   assert.ok(r.error.includes("expected report for phase 'plan'"));
 });
 
-t("step_report: gate without verdict rejected", () => {
-  const { runId } = freshRun();
+await ta("step_report: gate without verdict rejected", async () => {
+  const { runId } = await freshRun();
   opStepReport({ runId, phase: "plan", summary: "planned" });
   const r = opStepReport({ runId, phase: "review-plan", summary: "looks fine" });
   assert.ok(r.error.includes("verdict"));
 });
 
-t("gate REVISE loops back and climbs the effort ladder", () => {
-  const { runId } = freshRun();
+await ta("gate REVISE loops back and climbs the effort ladder", async () => {
+  const { runId } = await freshRun();
   opStepReport({ runId, phase: "plan", summary: "planned" });
   const r = opStepReport({ runId, phase: "review-plan", verdict: "REVISE", summary: "missing edge case" });
   assert.equal(r.looped, true);
   assert.equal(r.next.phase, "plan");
-  // gate re-reached: reviewer's ladder [medium,xhigh] climbs on next pass
   opStepReport({ runId, phase: "plan", summary: "replanned" });
-  const gate = opStepReport({ runId, phase: "plan", summary: "dup" }); // wrong on purpose: current is review-plan
+  const gate = opStepReport({ runId, phase: "plan", summary: "dup" });
   assert.ok(gate.error);
 });
 
-t("maxGateLoops exceeded → terminal with blocker", () => {
-  const { runId } = freshRun();
+await ta("maxGateLoops exceeded → terminal with blocker", async () => {
+  const { runId } = await freshRun();
   let r;
   for (let i = 0; i < 4; i++) {
     opStepReport({ runId, phase: "plan", summary: "planned" });
@@ -394,8 +598,8 @@ t("maxGateLoops exceeded → terminal with blocker", () => {
   assert.ok(r.blocker.includes("review-plan"));
 });
 
-t("independence: gate step reports grade vs actual producer", () => {
-  const { runId } = freshRun();
+await ta("independence: gate step reports grade vs actual producer", async () => {
+  const { runId } = await freshRun();
   opStepReport({ runId, phase: "plan", summary: "planned" });
   opStepReport({ runId, phase: "review-plan", verdict: "APPROVE", summary: "ok" });
   const r = opStepReport({ runId, phase: "execute", summary: "coded", changedFiles: ["a.js"], producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" });
@@ -404,8 +608,8 @@ t("independence: gate step reports grade vs actual producer", () => {
   assert.equal(r.next.independence.pass, true);
 });
 
-t("full run to done; unverified label when critical gate not passed", () => {
-  const { runId } = freshRun();
+await ta("full run to done; unverified label when critical gate not passed", async () => {
+  const { runId } = await freshRun();
   opStepReport({ runId, phase: "plan", summary: "planned" });
   opStepReport({ runId, phase: "review-plan", verdict: "APPROVE", summary: "ok" });
   opStepReport({ runId, phase: "execute", summary: "coded", changedFiles: ["a.js"], producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" });
@@ -414,24 +618,24 @@ t("full run to done; unverified label when critical gate not passed", () => {
   assert.deepEqual(done.gatesPassed, ["review-plan", "validate"]);
 });
 
-t("gate BLOCKED → blocked_verifier_disagreement", () => {
-  const { runId } = freshRun();
+await ta("gate BLOCKED → blocked_verifier_disagreement", async () => {
+  const { runId } = await freshRun();
   opStepReport({ runId, phase: "plan", summary: "planned" });
   const r = opStepReport({ runId, phase: "review-plan", verdict: "BLOCKED", summary: "cannot judge" });
   assert.equal(r.terminal, "blocked_verifier_disagreement");
 });
 
-t("finished run refuses further reports", () => {
-  const { runId } = freshRun();
+await ta("finished run refuses further reports", async () => {
+  const { runId } = await freshRun();
   opStepReport({ runId, phase: "plan", summary: "p" });
   opStepReport({ runId, phase: "review-plan", verdict: "BLOCKED", summary: "b" });
   const r = opStepReport({ runId, phase: "plan", summary: "again" });
   assert.ok(r.error.includes("blocked_verifier_disagreement"));
 });
 
-t("ad-hoc steps validated against resolved roles", () => {
+await ta("ad-hoc steps validated against resolved roles", async () => {
   opLoad({ cwd: REPO });
-  opResolve({ hostModels: HOST });
+  await opResolve({ hostModels: HOST });
   const r = opRunStart({ task: "x", steps: [{ phase: "p", role: "nope" }] });
   assert.ok(r.error.includes("unresolved role"));
   const ok = opRunStart({ task: "x", steps: [
@@ -460,17 +664,20 @@ function runnableProfile({
         "--model", "{model}", "--cwd", "{cwd}", "--max-time", "{maxTime}",
       ],
       promptVia,
+      modelPlaceholder: "{model}",
       timeoutSeconds,
     },
     output: output ?? { format: "text", resultPath: "stdout" },
   });
 }
 
-function startExternalRun(profile = runnableProfile()) {
-  opBindingSave({ profile });
+async function startExternalRun(profile = runnableProfile()) {
+  const saved = await opBindingSave({ profile });
+  assert.equal(saved.error, undefined, JSON.stringify(saved));
   const repo = writeRouteRepo(`spawn-${crypto.randomUUID()}`, "external", profile.tool);
-  opLoad({ cwd: repo });
-  opResolve({ hostModels: HOST });
+  assert.equal(opLoad({ cwd: repo }).errors, undefined);
+  const resolved = await opResolve({ hostModels: HOST });
+  assert.ok(resolved.roles.worker, JSON.stringify(resolved));
   return {
     repo,
     run: opRunStart({
@@ -483,19 +690,19 @@ function startExternalRun(profile = runnableProfile()) {
 }
 
 await ta("spawn: executes the current external phase and preserves prompt bytes", async () => {
-  const { run } = startExternalRun();
+  const { run } = await startExternalRun();
   const sideEffect = path.join(TMP, "must-not-exist");
   const prompt = `literal $(touch ${sideEffect}) and \`touch ${sideEffect}\``;
   const result = await opSpawn({ runId: run.runId, phase: "work", prompt });
   assert.equal(result.exitCode, 0);
   assert.equal(result.result, prompt);
   assert.equal(result.tool, "fakecli");
-  assert.equal(result.model, "vendor/fake-9");
+  assert.equal(result.model, CANONICAL_FAKE_MODEL);
   assert.equal(fs.existsSync(sideEffect), false);
 });
 
 await ta("spawn: does not advance the run", async () => {
-  const { run } = startExternalRun();
+  const { run } = await startExternalRun();
   await opSpawn({ runId: run.runId, phase: "work", prompt: "hello" });
   const report = opStepReport({
     runId: run.runId,
@@ -512,7 +719,7 @@ await ta("spawn: rejects unknown, finished, and non-current runs", async () => {
     prompt: "hello",
   })).code, "unknown_run");
 
-  const { run } = startExternalRun();
+  const { run } = await startExternalRun();
   assert.equal((await opSpawn({
     runId: run.runId,
     phase: "later",
@@ -528,7 +735,7 @@ await ta("spawn: rejects unknown, finished, and non-current runs", async () => {
 
 await ta("spawn: native and master phases remain host-owned", async () => {
   opLoad({ cwd: REPO });
-  opResolve({ hostModels: HOST });
+  await opResolve({ hostModels: HOST });
   const nativeRun = opRunStart({
     task: "native",
     steps: [{ phase: "plan", role: "planner" }],
@@ -558,7 +765,7 @@ schemaVersion: 1
 runtime:
   subagents: external
 models:
-  ghost: { id: ghost-1, family: ghost }
+  ghost: { id: nowhere/ghost-1, family: ghost, binding: fakecli }
 roles:
   worker: { use: [ghost] }
 pipelines:
@@ -567,16 +774,16 @@ pipelines:
       - { phase: work, role: worker }
 `);
   opLoad({ cwd: repo });
-  const resolved = opResolve({ hostModels: HOST });
+  const resolved = await opResolve({ hostModels: HOST });
   assert.equal(resolved.diagnostics[0].state, "blocked_no_binding");
   const run = opRunStart({ task: "blocked role", pipeline: "broken" });
   const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "hello" });
   assert.equal(result.code, "role_unresolved");
 });
 
-await ta("spawn: reports unavailable tools and model drift", async () => {
-  let profile = runnableProfile({ tool: "fake-gone" });
-  let run = startExternalRun(profile).run;
+await ta("spawn: reports unavailable tools", async () => {
+  const profile = runnableProfile({ tool: "fake-gone" });
+  const { run } = await startExternalRun(profile);
   fs.rmSync(path.join(
     process.env.MOA_HOME,
     ".moa",
@@ -588,21 +795,30 @@ await ta("spawn: reports unavailable tools and model drift", async () => {
     phase: "work",
     prompt: "hello",
   })).code, "tool_unavailable");
+});
 
-  profile = runnableProfile({ tool: "fake-model-drift" });
-  run = startExternalRun(profile).run;
-  const drifted = runnableProfile({ tool: profile.tool });
-  drifted.models = [{
-    id: "vendor/other-9",
-    family: "fake",
-    tags: ["strong"],
-  }];
-  opBindingSave({ profile: drifted });
-  assert.equal((await opSpawn({
-    runId: run.runId,
-    phase: "work",
-    prompt: "hello",
-  })).code, "model_not_served");
+await ta("spawn: reports live model drift without rerouting", async () => {
+  const profile = runnableProfile({ tool: "fake-model-drift" });
+  const { repo, run } = await startExternalRun(profile);
+  writeInventory(profile.tool, ["vendor/other-9"]);
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "hello" });
+  assert.equal(result.code, "model_not_served");
+
+  const manifest = JSON.parse(fs.readFileSync(path.join(
+    repo, ".moa", "runs", run.runId, "manifest.json",
+  ), "utf8"));
+  assert.equal(manifest.resolved.worker.model, CANONICAL_FAKE_MODEL);
+});
+
+await ta("spawn: malformed live inventory returns parse error and run stays on original phase", async () => {
+  const profile = runnableProfile({ tool: "fake-bad-inventory" });
+  const { repo, run } = await startExternalRun(profile);
+  fs.writeFileSync(inventoryPath(profile.tool), "{");
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "hello" });
+  assert.equal(result.code, "model_discovery_parse_failed");
+  // opStepReport still expects the original phase
+  const report = opStepReport({ runId: run.runId, phase: "work", summary: "irrelevant" });
+  assert.ok(!report.error, report.error);
 });
 
 await ta("spawn: extracts JSON and JSONL result paths", async () => {
@@ -612,7 +828,7 @@ await ta("spawn: extracts JSON and JSONL result paths", async () => {
       mode: format,
       output: { format, resultPath: "response.text" },
     });
-    const { run } = startExternalRun(profile);
+    const { run } = await startExternalRun(profile);
     const result = await opSpawn({ runId: run.runId, phase: "work", prompt: format });
     assert.equal(result.result, format);
   }
@@ -620,7 +836,7 @@ await ta("spawn: extracts JSON and JSONL result paths", async () => {
 
 await ta("spawn: supports stdin prompt transport", async () => {
   const profile = runnableProfile({ tool: "fake-stdin", promptVia: "stdin" });
-  const { run } = startExternalRun(profile);
+  const { run } = await startExternalRun(profile);
   const result = await opSpawn({
     runId: run.runId,
     phase: "work",
@@ -632,7 +848,7 @@ await ta("spawn: supports stdin prompt transport", async () => {
 await ta("spawn: rejects unknown placeholders", async () => {
   const profile = runnableProfile({ tool: "fake-placeholder" });
   profile.run.argv.push("{unknown}");
-  const { run } = startExternalRun(profile);
+  const { run } = await startExternalRun(profile);
   const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
   assert.equal(result.code, "unknown_placeholder");
 });
@@ -643,7 +859,7 @@ await ta("spawn: reports malformed and missing declared output", async () => {
     mode: "badjson",
     output: { format: "json", resultPath: "response.text" },
   });
-  let run = startExternalRun(malformed).run;
+  let run = (await startExternalRun(malformed)).run;
   assert.equal((await opSpawn({
     runId: run.runId,
     phase: "work",
@@ -655,7 +871,7 @@ await ta("spawn: reports malformed and missing declared output", async () => {
     mode: "json",
     output: { format: "json", resultPath: "response.missing" },
   });
-  run = startExternalRun(missing).run;
+  run = (await startExternalRun(missing)).run;
   assert.equal((await opSpawn({
     runId: run.runId,
     phase: "work",
@@ -674,36 +890,52 @@ await ta("spawn: reports nonzero exit, timeout, and output overflow", async () =
       mode,
       timeoutSeconds: mode === "hang" ? 1 : 2,
     });
-    const { run } = startExternalRun(profile);
+    const { run } = await startExternalRun(profile);
     const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
     assert.equal(result.code, code);
   }
 });
 
-// --- init ----------------------------------------------------------------------
-
-t("init: guards existing config; force overwrites; splice validates", () => {
+await ta("init: guards existing config; force overwrites; splice validates", async () => {
   const irepo = path.join(TMP, "irepo"); fs.mkdirSync(irepo, { recursive: true });
-  const r1 = opInit({ template: "lite-build", cwd: irepo,
-    registry: { opus: { id: "claude-opus-4-8", family: "claude", tags: ["strong"] } },
+  const r1 = await opInit({ template: "lite-build", cwd: irepo,
+    registry: { opus: { id: "anthropic/claude-opus-4-8", family: "claude", tags: ["strong"] } },
     roles: { planner: ["opus", "auto"] } });
   assert.ok(r1.written.endsWith(".moa.yml"));
   assert.equal(r1.spliced, true);
   const written = fs.readFileSync(r1.written, "utf8");
-  assert.ok(written.includes("claude-opus-4-8"));
+  assert.ok(written.includes("anthropic/claude-opus-4-8"));
   assert.ok(written.includes("#"), "template comments survive");
 
-  const r2 = opInit({ template: "lite-build", cwd: irepo });
+  const r2 = await opInit({ template: "lite-build", cwd: irepo });
   assert.ok(r2.error.includes("already exists"));
-  const r3 = opInit({ template: "lite-build", cwd: irepo, force: true });
+  const r3 = await opInit({ template: "lite-build", cwd: irepo, force: true });
   assert.ok(r3.written);
 
   const loaded = opLoad({ cwd: irepo });
   assert.ok(!loaded.errors, JSON.stringify(loaded.errors));
 });
 
-t("init: unknown template rejected", () => {
-  assert.ok(opInit({ template: "nope", cwd: TMP }).error.includes("unknown template"));
+await ta("init: preserves a model binding through load", async () => {
+  const irepo = path.join(TMP, "init-binding");
+  fs.mkdirSync(irepo, { recursive: true });
+  const result = await opInit({
+    template: "lite-build",
+    cwd: irepo,
+    registry: { fake: { id: "vendor/fake-9", family: "fake", binding: "fakecli" } },
+    roles: { planner: ["fake", "auto"] },
+  });
+  assert.equal(result.spliced, true);
+
+  const loaded = opLoad({ cwd: irepo });
+  assert.ok(!loaded.errors, JSON.stringify(loaded.errors));
+  const fake = loaded.models.fake;
+  assert.equal(fake.id, "vendor/fake-9");
+  assert.equal(fake.binding, "fakecli");
+});
+await ta("init: unknown template rejected", async () => {
+  const r = await opInit({ template: "nope", cwd: TMP });
+  assert.ok(r.error.includes("unknown template"));
 });
 
 console.log(`\n${n} checks passed`);
