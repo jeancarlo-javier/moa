@@ -1,5 +1,6 @@
 // moa MCP — self-check. Run: node test.mjs
 import assert from "node:assert/strict";
+import crypto from "node:crypto";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +10,7 @@ process.env.MOA_HOME = path.join(TMP, "home");
 const REPO = path.join(TMP, "repo");
 fs.mkdirSync(REPO, { recursive: true });
 
-const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opSpawnPrep, opInit, opBindingSave } =
+const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opInit, opBindingSave } =
   await import("./server.mjs");
 
 const HOST = [
@@ -40,6 +41,35 @@ const provenProfile = (overrides = {}) => ({
 
 let n = 0;
 const t = (name, fn) => { fn(); console.log(`ok ${++n} - ${name}`); };
+const ta = async (name, fn) => {
+  await fn();
+  console.log(`ok ${++n} - ${name}`);
+};
+
+const FAKE_WORKER = path.join(TMP, "fake-worker.mjs");
+fs.writeFileSync(FAKE_WORKER, `
+import fs from "node:fs";
+const args = process.argv.slice(2);
+const value = (flag) => {
+  const index = args.indexOf(flag);
+  return index < 0 ? undefined : args[index + 1];
+};
+const mode = value("--mode") ?? "text";
+const promptFile = value("--prompt-file");
+const prompt = promptFile ? fs.readFileSync(promptFile, "utf8") : await new Promise((resolve) => {
+  let input = "";
+  process.stdin.setEncoding("utf8");
+  process.stdin.on("data", (chunk) => input += chunk);
+  process.stdin.on("end", () => resolve(input));
+});
+if (mode === "exit") process.exit(7);
+if (mode === "hang") setInterval(() => {}, 1000);
+else if (mode === "overflow") process.stdout.write("x".repeat(5 * 1024 * 1024));
+else if (mode === "badjson") process.stdout.write("{");
+else if (mode === "json") process.stdout.write(JSON.stringify({ response: { text: prompt } }));
+else if (mode === "jsonl") process.stdout.write(JSON.stringify({ event: "start" }) + "\\n" + JSON.stringify({ response: { text: prompt } }) + "\\n");
+else process.stdout.write(prompt);
+`);
 
 // --- load ------------------------------------------------------------------
 
@@ -386,15 +416,188 @@ t("ad-hoc steps validated against resolved roles", () => {
   assert.equal(ok.next.phase, "produce");
 });
 
-// --- spawn_prep ----------------------------------------------------------------
+// --- external spawn ----------------------------------------------------------
 
+function runnableProfile({
+  tool = "fakecli",
+  mode = "text",
+  promptVia = "file",
+  timeoutSeconds = 2,
+  output,
+} = {}) {
+  const promptArgs = promptVia === "file" ? ["--prompt-file", "{promptFile}"] : [];
+  return provenProfile({
+    tool,
+    run: {
+      argv: [
+        "{bin}", FAKE_WORKER, "--mode", mode,
+        ...promptArgs,
+        "--model", "{model}", "--cwd", "{cwd}", "--max-time", "{maxTime}",
+      ],
+      promptVia,
+      timeoutSeconds,
+    },
+    output: output ?? { format: "text", resultPath: "stdout" },
+  });
+}
 
-t("spawn_prep: native binding is refused", () => {
+function startExternalRun(profile = runnableProfile()) {
+  opBindingSave({ profile });
+  const repo = writeRouteRepo(`spawn-${crypto.randomUUID()}`, "external", profile.tool);
+  opLoad({ cwd: repo });
+  opResolve({ hostModels: HOST });
+  return {
+    repo,
+    run: opRunStart({
+      task: "external spawn test",
+      steps: [{ phase: "work", role: "worker" }],
+      masterModel: "host/master",
+      masterFamily: "host",
+    }),
+  };
+}
+
+await ta("spawn: executes the current external phase and preserves prompt bytes", async () => {
+  const { run } = startExternalRun();
+  const sideEffect = path.join(TMP, "must-not-exist");
+  const prompt = `literal $(touch ${sideEffect}) and \`touch ${sideEffect}\``;
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt });
+  assert.equal(result.exitCode, 0);
+  assert.equal(result.result, prompt);
+  assert.equal(result.tool, "fakecli");
+  assert.equal(result.model, "vendor/fake-9");
+  assert.equal(fs.existsSync(sideEffect), false);
+});
+
+await ta("spawn: does not advance the run", async () => {
+  const { run } = startExternalRun();
+  await opSpawn({ runId: run.runId, phase: "work", prompt: "hello" });
+  const report = opStepReport({
+    runId: run.runId,
+    phase: "wrong",
+    summary: "must still expect work",
+  });
+  assert.match(report.error, /expected report for phase 'work'/);
+});
+
+await ta("spawn: rejects unknown, finished, and non-current runs", async () => {
+  assert.equal((await opSpawn({
+    runId: "run-missing",
+    phase: "work",
+    prompt: "hello",
+  })).code, "unknown_run");
+
+  const { run } = startExternalRun();
+  assert.equal((await opSpawn({
+    runId: run.runId,
+    phase: "later",
+    prompt: "hello",
+  })).code, "wrong_phase");
+  opStepReport({ runId: run.runId, phase: "work", summary: "complete" });
+  assert.equal((await opSpawn({
+    runId: run.runId,
+    phase: "work",
+    prompt: "hello",
+  })).code, "run_finished");
+});
+
+await ta("spawn: native and master phases remain host-owned", async () => {
   opLoad({ cwd: REPO });
   opResolve({ hostModels: HOST });
-  const run = opRunStart({ task: "n", steps: [{ phase: "p", role: "planner" }] });
-  const r = opSpawnPrep({ runId: run.runId, phase: "p", prompt: "x" });
-  assert.ok(r.error.includes("native"));
+  const nativeRun = opRunStart({
+    task: "native",
+    steps: [{ phase: "plan", role: "planner" }],
+  });
+  assert.equal((await opSpawn({
+    runId: nativeRun.runId,
+    phase: "plan",
+    prompt: "hello",
+  })).code, "native_spawn_required");
+
+  const masterRun = opRunStart({
+    task: "master",
+    steps: [{ phase: "frame", role: "master" }],
+  });
+  assert.equal((await opSpawn({
+    runId: masterRun.runId,
+    phase: "frame",
+    prompt: "hello",
+  })).code, "master_phase");
+});
+
+await ta("spawn: extracts JSON and JSONL result paths", async () => {
+  for (const format of ["json", "jsonl"]) {
+    const profile = runnableProfile({
+      tool: `fake-${format}`,
+      mode: format,
+      output: { format, resultPath: "response.text" },
+    });
+    const { run } = startExternalRun(profile);
+    const result = await opSpawn({ runId: run.runId, phase: "work", prompt: format });
+    assert.equal(result.result, format);
+  }
+});
+
+await ta("spawn: supports stdin prompt transport", async () => {
+  const profile = runnableProfile({ tool: "fake-stdin", promptVia: "stdin" });
+  const { run } = startExternalRun(profile);
+  const result = await opSpawn({
+    runId: run.runId,
+    phase: "work",
+    prompt: "stdin-prompt",
+  });
+  assert.equal(result.result, "stdin-prompt");
+});
+
+await ta("spawn: rejects unknown placeholders", async () => {
+  const profile = runnableProfile({ tool: "fake-placeholder" });
+  profile.run.argv.push("{unknown}");
+  const { run } = startExternalRun(profile);
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  assert.equal(result.code, "unknown_placeholder");
+});
+
+await ta("spawn: reports malformed and missing declared output", async () => {
+  const malformed = runnableProfile({
+    tool: "fake-bad-json",
+    mode: "badjson",
+    output: { format: "json", resultPath: "response.text" },
+  });
+  let run = startExternalRun(malformed).run;
+  assert.equal((await opSpawn({
+    runId: run.runId,
+    phase: "work",
+    prompt: "x",
+  })).code, "output_parse_failed");
+
+  const missing = runnableProfile({
+    tool: "fake-missing-result",
+    mode: "json",
+    output: { format: "json", resultPath: "response.missing" },
+  });
+  run = startExternalRun(missing).run;
+  assert.equal((await opSpawn({
+    runId: run.runId,
+    phase: "work",
+    prompt: "x",
+  })).code, "output_parse_failed");
+});
+
+await ta("spawn: reports nonzero exit, timeout, and output overflow", async () => {
+  for (const [tool, mode, code] of [
+    ["fake-exit", "exit", "nonzero_exit"],
+    ["fake-hang", "hang", "timeout"],
+    ["fake-overflow", "overflow", "output_limit_exceeded"],
+  ]) {
+    const profile = runnableProfile({
+      tool,
+      mode,
+      timeoutSeconds: mode === "hang" ? 1 : 2,
+    });
+    const { run } = startExternalRun(profile);
+    const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+    assert.equal(result.code, code);
+  }
 });
 
 // --- init ----------------------------------------------------------------------

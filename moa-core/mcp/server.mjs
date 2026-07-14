@@ -12,6 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
+import { spawn } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import { z } from "zod";
@@ -541,6 +542,119 @@ const poolRow = (model) => ({
   source: model.sources.join("+"),
 });
 
+const MAX_OUTPUT_BYTES = 4 * 1024 * 1024;
+const PLACEHOLDER = /\{[^{}]+\}/;
+
+function errorResult(code, error, extra = {}) {
+  return { error, code, ...extra };
+}
+
+function valueAtPath(value, resultPath) {
+  return resultPath.split(".").reduce((current, key) => current?.[key], value);
+}
+
+function normalizeResult(value) {
+  return typeof value === "string" ? value : JSON.stringify(value);
+}
+
+function extractResult(stdout, output = {}) {
+  const format = output.format ?? "text";
+  const resultPath = output.resultPath ?? "stdout";
+  if (resultPath === "stdout") return stdout;
+  try {
+    if (format === "json") {
+      const value = valueAtPath(JSON.parse(stdout), resultPath);
+      if (value === undefined)
+        return errorResult("output_parse_failed", `result path '${resultPath}' was not found`);
+      return normalizeResult(value);
+    }
+    if (format === "jsonl") {
+      const records = stdout.split("\n").filter(Boolean).map((line) => JSON.parse(line));
+      for (let index = records.length - 1; index >= 0; index--) {
+        const value = valueAtPath(records[index], resultPath);
+        if (value !== undefined) return normalizeResult(value);
+      }
+      return errorResult("output_parse_failed", `result path '${resultPath}' was not found`);
+    }
+    return errorResult(
+      "output_parse_failed",
+      "text output supports only resultPath 'stdout'",
+    );
+  } catch (error) {
+    return errorResult("output_parse_failed", error.message);
+  }
+}
+
+function runChild({ bin, args, cwd, stdin, timeoutSeconds }) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let timer;
+    const child = spawn(bin, args, {
+      cwd,
+      shell: false,
+      stdio: [stdin === null ? "ignore" : "pipe", "pipe", "pipe"],
+    });
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let bytes = 0;
+    let forcedCode = null;
+    let settled = false;
+
+    const stop = (code) => {
+      if (forcedCode) return;
+      forcedCode = code;
+      child.kill("SIGTERM");
+      setTimeout(() => child.kill("SIGKILL"), 1000).unref();
+    };
+    const collect = (chunks) => (chunk) => {
+      bytes += chunk.length;
+      if (bytes > MAX_OUTPUT_BYTES) {
+        stop("output_limit_exceeded");
+        return;
+      }
+      chunks.push(chunk);
+    };
+
+    child.stdout.on("data", collect(stdoutChunks));
+    child.stderr.on("data", collect(stderrChunks));
+    child.on("error", (error) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(errorResult("spawn_failed", error.message, {
+        durationMs: Date.now() - started,
+      }));
+    });
+    child.on("close", (exitCode, signal) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (forcedCode) {
+        resolve(errorResult(
+          forcedCode,
+          forcedCode === "timeout"
+            ? "external tool timed out"
+            : "external tool exceeded output limit",
+          { exitCode, signal, stderr, durationMs: Date.now() - started },
+        ));
+        return;
+      }
+      resolve({
+        exitCode,
+        signal,
+        stdout,
+        stderr,
+        durationMs: Date.now() - started,
+      });
+    });
+
+    timer = setTimeout(() => stop("timeout"), timeoutSeconds * 1000);
+    if (stdin !== null) child.stdin.end(stdin);
+  });
+}
+
 // --- run state machine ----------------------------------------------------
 
 function runDir(runId) {
@@ -600,7 +714,7 @@ function describeStep(manifest, i) {
     out.binding = r.binding;
     out.spawn = r.binding === "host-native"
       ? { kind: "native", note: "use your host's subagent capability" }
-      : { kind: "profile", tool: r.binding, note: "call moa_spawn_prep with the prompt to get safe argv" };
+      : { kind: "profile", tool: r.binding, note: "call moa_spawn with the role prompt" };
     out.instructions = manifest.roleInstructions?.[s.role] ?? null;
   }
   if (gate !== "none") {
@@ -648,6 +762,7 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } 
   const runId = "run-" + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "").replace(/^(\d{8})/, "$1-") + "-" + crypto.randomBytes(2).toString("hex");
   const manifest = {
     runId, task, pipeline: name,
+    projectDir: state.loaded.projectDir,
     mode: cfg?.master?.mode ?? "auto",
     dispatch,
     maxGateLoops: cfg?.runtime?.defaults?.maxGateLoops ?? 2,
@@ -753,31 +868,84 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
   return { next };
 }
 
-export function opSpawnPrep({ runId, phase, prompt } = {}) {
+export async function opSpawn({ runId, phase, prompt } = {}) {
   const manifest = loadRun(runId);
-  if (!manifest) return { error: `unknown runId '${runId}'` };
-  const step = manifest.steps.find((s) => s.phase === phase);
-  if (!step) return { error: `unknown phase '${phase}'` };
-  const r = manifest.resolved[step.role];
-  if (!r) return { error: `phase '${phase}' has no resolved role` };
-  if (r.binding === "host-native") return { error: "native spawn — use your host's subagent capability directly; spawn_prep is for learned-tool bindings" };
+  if (!manifest) return errorResult("unknown_run", `unknown runId '${runId}'`);
+  if (manifest.status !== "running")
+    return errorResult("run_finished", `run is '${manifest.status}'`);
+
+  const step = manifest.steps[manifest.current];
+  if (phase !== step.phase)
+    return errorResult("wrong_phase", `current phase is '${step.phase}', not '${phase}'`);
+  if (step.role === "master")
+    return errorResult("master_phase", `phase '${phase}' belongs to the master`);
+
+  const resolved = manifest.resolved[step.role];
+  if (resolved.binding === "host-native")
+    return errorResult("native_spawn_required", "use the host's native subagent capability");
+
   const { bindings } = loadBindings();
-  const profile = bindings.find((b) => b.tool === r.binding);
-  if (!profile) return { error: `binding profile '${r.binding}' not found in ~/.moa/bindings — re-run /moa learn-tool` };
-  const d = runDir(runId);
-  fs.mkdirSync(d, { recursive: true });
-  const promptFile = path.join(d, `prompt-${phase}-${Date.now()}.md`);
+  const profile = bindings.find((item) => item.tool === resolved.binding);
+  if (!profile)
+    return errorResult(
+      "tool_unavailable",
+      `registered tool '${resolved.binding}' is unavailable`,
+    );
+  if (!profile.models.some((model) => model.id === resolved.model))
+    return errorResult(
+      "model_not_served",
+      `'${resolved.binding}' does not serve '${resolved.model}'`,
+    );
+
+  const dir = runDir(runId);
+  fs.mkdirSync(dir, { recursive: true });
+  const promptFile = path.join(dir, `prompt-${phase}-${Date.now()}.md`);
   fs.writeFileSync(promptFile, prompt);
-  const cwd = path.dirname(state.loaded?.configPath ?? process.cwd());
-  const argv = profile.run.argv.map((a) =>
-    String(a).replaceAll("{model}", r.model).replaceAll("{promptFile}", promptFile).replaceAll("{cwd}", cwd));
+  const timeoutSeconds = profile.run.timeoutSeconds ?? 1800;
+  const values = {
+    "{bin}": profile.resolvedBin,
+    "{model}": resolved.model,
+    "{promptFile}": promptFile,
+    "{cwd}": manifest.projectDir,
+    "{maxTime}": String(timeoutSeconds),
+  };
+  const argv = profile.run.argv.map((arg) => {
+    let expanded = String(arg);
+    for (const [placeholder, value] of Object.entries(values))
+      expanded = expanded.replaceAll(placeholder, value);
+    return expanded;
+  });
+  const unknown = argv.find((arg) => PLACEHOLDER.test(arg));
+  if (unknown)
+    return errorResult("unknown_placeholder", `unexpanded placeholder in '${unknown}'`);
+  if (resolveExecutable(argv[0]) !== profile.resolvedBin)
+    return errorResult("spawn_failed", "run.argv[0] does not resolve to profile.bin");
+
+  const execution = await runChild({
+    bin: profile.resolvedBin,
+    args: argv.slice(1),
+    cwd: manifest.projectDir,
+    stdin: profile.run.promptVia === "stdin" ? prompt : null,
+    timeoutSeconds,
+  });
+  if (execution.error) return execution;
+  if (execution.exitCode !== 0)
+    return errorResult(
+      "nonzero_exit",
+      `external tool exited with ${execution.exitCode}`,
+      execution,
+    );
+
+  const result = extractResult(execution.stdout, profile.output);
+  if (result?.error) return result;
   return {
-    argv,
-    promptVia: profile.run.promptVia ?? "file",
-    promptFile,
-    timeoutSeconds: profile.run.timeoutSeconds ?? 1800,
-    output: profile.output ?? { format: "text", resultPath: "stdout" },
-    note: "run with your shell; prompt travels by file — never inline it into the command",
+    tool: profile.tool,
+    model: resolved.model,
+    family: resolved.family,
+    phase,
+    exitCode: execution.exitCode,
+    durationMs: execution.durationMs,
+    result,
   };
 }
 
