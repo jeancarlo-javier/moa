@@ -957,6 +957,11 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } 
     steps: chosen, current: 0,
     resolved: state.resolved.roles,
     roleInstructions: Object.fromEntries(Object.entries(cfg?.roles ?? {}).map(([n, r]) => [n, r.instructions ?? null])),
+    enforcementMode: cfg?.runtime?.requireEnforcement ?? "best-effort",
+    roleToolPolicies: Object.fromEntries(Object.entries(cfg?.roles ?? {}).map(([n, r]) => [n, {
+      name: r.tools ?? null,
+      policy: r.tools ? structuredClone(cfg.toolPolicies?.[r.tools] ?? null) : null,
+    }])),
     masterModel: masterModel ?? null, masterFamily: masterFamily ?? null,
     phases: [], loops: {}, usage: [], status: "running",
     createdAt: new Date().toISOString(),
@@ -1055,6 +1060,56 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
   return { next };
 }
 
+function advisoryDims(policy) {
+  const dims = {};
+  for (const key of ["network", "filesystem", "secrets", "bash"])
+    if (policy[key] !== undefined) dims[key] = policy[key];
+  return Object.keys(dims).length ? dims : null;
+}
+
+// Compiles a role's frozen canonical tool policy into the launcher-specific
+// {toolArgs} argv the selected profile's proven adapter declares. Returns
+// either a compiled { args, evidence } pair or an errorResult-shaped
+// { error, code: "tool_policy_unsupported", ... } for strict/sandbox fail-closed;
+// best-effort degrades to { args: [], evidence: { state: "degraded", ... } } instead.
+function compileToolPolicy({ role, policyName, policy, profile, enforcement }) {
+  if (!policy) return { args: [], evidence: { state: "not_requested" } };
+  const unenforced = advisoryDims(policy);
+  const base = { policy: policyName, binding: profile.tool, ...(unenforced ? { unenforced } : {}) };
+  const fail = (reason, extra = {}) =>
+    enforcement === "best-effort"
+      ? { args: [], evidence: { state: "degraded", ...base, reason } }
+      : errorResult(
+          "tool_policy_unsupported",
+          `role '${role}': tool policy '${policyName}' unsupported (${reason})`,
+          { role, ...base, reason, ...extra },
+        );
+
+  if (!Object.hasOwn(policy, "allow")) return fail("deny_only_unsupported");
+
+  const denied = new Set(policy.deny ?? []);
+  const allowed = [...new Set(policy.allow)].filter((name) => !denied.has(name));
+
+  if (!allowed.length) {
+    const args = profile.toolControl?.disableAll?.argv;
+    return args
+      ? { args, evidence: { state: "enforced", ...base, mode: "disable_all" } }
+      : fail("disable_all_unsupported");
+  }
+
+  const adapter = profile.toolControl?.allowList;
+  if (!adapter) return fail("allow_list_unsupported");
+
+  const native = allowed.map((name) => adapter.names[name]);
+  const missing = allowed.find((name, index) => !native[index]);
+  if (missing) return fail("unmapped_tool", { tool: missing });
+
+  const args = adapter.joined
+    ? adapter.joined.argv.map((arg) => arg.replaceAll("{tools}", native.join(adapter.joined.separator)))
+    : native.flatMap((tool) => adapter.repeated.argv.map((arg) => arg.replaceAll("{tool}", tool)));
+  return { args, evidence: { state: "enforced", ...base, mode: "allow_list" } };
+}
+
 export async function opSpawn({ runId, phase, prompt } = {}) {
   const manifest = loadRun(runId);
   if (!manifest) return errorResult("unknown_run", `unknown runId '${runId}'`);
@@ -1073,8 +1128,14 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
       "role_unresolved",
       `phase '${phase}' has no resolved role '${step.role}'`,
     );
-  if (resolved.binding === "host-native")
-    return errorResult("native_spawn_required", "use the host's native subagent capability");
+  if (resolved.binding === "host-native") {
+    const requestedPolicy = manifest.roleToolPolicies?.[step.role] ?? { name: null, policy: null };
+    return errorResult("native_spawn_required", "use the host's native subagent capability", {
+      requestedPolicy,
+      enforcementMode: manifest.enforcementMode ?? "best-effort",
+      enforcement: { state: "host_owned" },
+    });
+  }
 
   const { bindings } = loadBindings();
   const profile = bindings.find((item) => item.tool === resolved.binding);
@@ -1091,6 +1152,21 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
       `registered tool '${resolved.binding}' no longer serves '${resolved.model}'`,
     );
 
+  const roleToolPolicy = manifest.roleToolPolicies?.[step.role] ?? { name: null, policy: null };
+  const compiled = compileToolPolicy({
+    role: step.role,
+    policyName: roleToolPolicy.name,
+    policy: roleToolPolicy.policy,
+    profile,
+    enforcement: manifest.enforcementMode ?? "best-effort",
+  });
+  if (compiled.error) return compiled;
+  if (compiled.evidence.state === "degraded") {
+    manifest.enforcement ??= [];
+    manifest.enforcement.push({ phase, role: step.role, ...compiled.evidence });
+    saveRun(manifest);
+  }
+
   const dir = runDir(runId);
   fs.mkdirSync(dir, { recursive: true });
   const promptFile = path.join(dir, `prompt-${phase}-${Date.now()}.md`);
@@ -1103,12 +1179,14 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
     "{cwd}": manifest.projectDir,
     "{maxTime}": String(timeoutSeconds),
   };
-  const argv = profile.run.argv.map((arg) => {
+  const argv = [];
+  for (const arg of profile.run.argv) {
+    if (arg === "{toolArgs}") { argv.push(...compiled.args); continue; }
     let expanded = String(arg);
     for (const [placeholder, value] of Object.entries(values))
       expanded = expanded.replaceAll(placeholder, value);
-    return expanded;
-  });
+    argv.push(expanded);
+  }
   const unknown = argv.find((arg) => PLACEHOLDER.test(arg));
   if (unknown)
     return errorResult("unknown_placeholder", `unexpanded placeholder in '${unknown}'`);
@@ -1140,6 +1218,7 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
     exitCode: execution.exitCode,
     durationMs: execution.durationMs,
     result,
+    enforcement: compiled.evidence,
   };
 }
 

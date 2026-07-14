@@ -110,6 +110,7 @@ if (modelsFile) {
   else if (mode === "badjson") process.stdout.write("{");
   else if (mode === "json") process.stdout.write(JSON.stringify({ response: { text: prompt } }));
   else if (mode === "jsonl") process.stdout.write(JSON.stringify({ event: "start" }) + "\\n" + JSON.stringify({ response: { text: prompt } }) + "\\n");
+  else if (mode === "args") process.stdout.write(JSON.stringify({ response: { text: JSON.stringify(args) } }));
   else process.stdout.write(prompt);
 }
 `);
@@ -523,22 +524,23 @@ function resetBindings() {
 }
 
 
-function writeRouteRepo(name, subagents = "auto", modelBinding = null) {
+function writeRouteRepo(name, subagents = "auto", modelBinding = null, toolOpts = null) {
   const repo = path.join(TMP, name);
   fs.mkdirSync(repo, { recursive: true });
+  const { enforcement, policyName, policy } = toolOpts ?? {};
   fs.writeFileSync(path.join(repo, ".moa.yml"), `
 schemaVersion: 1
 runtime:
   subagents: ${subagents}
-models:
+${enforcement ? `  requireEnforcement: ${enforcement}\n` : ""}models:
   fake:
     id: vendor/fake-9
     family: fake
     tags: [strong]
-${modelBinding ? `    binding: ${modelBinding}\n` : ""}roles:
+${modelBinding ? `    binding: ${modelBinding}\n` : ""}${policyName ? `toolPolicies:\n  ${policyName}: ${JSON.stringify(policy)}\n` : ""}roles:
   worker:
     use: [fake]
-pipelines: {}
+${policyName ? `    tools: ${policyName}\n` : ""}pipelines: {}
 `);
   return repo;
 }
@@ -846,6 +848,7 @@ function runnableProfile({
   promptVia = "file",
   timeoutSeconds = 2,
   output,
+  toolControl,
 } = {}) {
   const promptArgs = promptVia === "file" ? ["--prompt-file", "{promptFile}"] : [];
   return provenProfile({
@@ -853,6 +856,7 @@ function runnableProfile({
     run: {
       argv: [
         "{bin}", FAKE_WORKER, "--mode", mode,
+        ...(toolControl ? ["{toolArgs}"] : []),
         ...promptArgs,
         "--model", "{model}", "--cwd", "{cwd}", "--max-time", "{maxTime}",
       ],
@@ -861,13 +865,14 @@ function runnableProfile({
       timeoutSeconds,
     },
     output: output ?? { format: "text", resultPath: "stdout" },
+    ...(toolControl ? { toolControl } : {}),
   });
 }
 
-async function startExternalRun(profile = runnableProfile()) {
+async function startExternalRun(profile = runnableProfile(), toolOpts = null) {
   const saved = await opBindingSave({ profile });
   assert.equal(saved.error, undefined, JSON.stringify(saved));
-  const repo = writeRouteRepo(`spawn-${crypto.randomUUID()}`, "external", profile.tool);
+  const repo = writeRouteRepo(`spawn-${crypto.randomUUID()}`, "external", profile.tool, toolOpts);
   assert.equal(opLoad({ cwd: repo }).errors, undefined);
   const resolved = await opResolve({ hostModels: HOST });
   assert.ok(resolved.roles.worker, JSON.stringify(resolved));
@@ -1087,6 +1092,282 @@ await ta("spawn: reports nonzero exit, timeout, and output overflow", async () =
     const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
     assert.equal(result.code, code);
   }
+});
+
+// --- role tool-policy enforcement ---------------------------------------
+
+const JOINED_TOOL_CONTROL = {
+  disableAll: { argv: ["--fake-no-tools"] },
+  allowList: {
+    names: { read: "native-read", search: "native-search" },
+    joined: { argv: ["--fake-tools", "{tools}"], separator: "," },
+  },
+};
+const REPEATED_TOOL_CONTROL = {
+  disableAll: { argv: ["--fake-no-tools"] },
+  allowList: {
+    names: { read: "Read", search: "Grep" },
+    repeated: { argv: ["--allowed-tool", "{tool}"] },
+  },
+};
+const argsProfile = (overrides = {}) => runnableProfile({
+  mode: "args",
+  output: { format: "json", resultPath: "response.text" },
+  ...overrides,
+});
+
+await ta("spawn: empty allow compiles to the disable-all adapter's exact argv", async () => {
+  const profile = argsProfile({ tool: `policy-disable-${crypto.randomUUID()}`, toolControl: JOINED_TOOL_CONTROL });
+  const { run } = await startExternalRun(profile, { policyName: "p", policy: { allow: [] } });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  assert.equal(result.code, undefined, JSON.stringify(result));
+  const argv = JSON.parse(result.result);
+  assert.equal(argv[2], "--fake-no-tools");
+  assert.equal(argv[3], "--prompt-file");
+  assert.deepEqual(result.enforcement, { state: "enforced", policy: "p", binding: profile.tool, mode: "disable_all" });
+});
+
+await ta("spawn: allow-list joins ordered, de-duplicated, deny-subtracted tool names", async () => {
+  const profile = argsProfile({ tool: `policy-joined-${crypto.randomUUID()}`, toolControl: JOINED_TOOL_CONTROL });
+  const { run } = await startExternalRun(profile, {
+    policyName: "p", policy: { allow: ["read", "search", "read"] },
+  });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  const argv = JSON.parse(result.result);
+  assert.equal(argv[2], "--fake-tools");
+  assert.equal(argv[3], "native-read,native-search");
+  assert.equal(argv[4], "--prompt-file");
+  assert.deepEqual(result.enforcement, { state: "enforced", policy: "p", binding: profile.tool, mode: "allow_list" });
+
+  const denyProfile = argsProfile({ tool: `policy-deny-${crypto.randomUUID()}`, toolControl: JOINED_TOOL_CONTROL });
+  const { run: denyRun } = await startExternalRun(denyProfile, {
+    policyName: "p", policy: { allow: ["read", "search"], deny: ["search"] },
+  });
+  const denyResult = await opSpawn({ runId: denyRun.runId, phase: "work", prompt: "x" });
+  const denyArgv = JSON.parse(denyResult.result);
+  assert.equal(denyArgv[2], "--fake-tools");
+  assert.equal(denyArgv[3], "native-read");
+});
+
+await ta("spawn: allow-list repeats the exact per-tool argv fragment", async () => {
+  const profile = argsProfile({ tool: `policy-repeated-${crypto.randomUUID()}`, toolControl: REPEATED_TOOL_CONTROL });
+  const { run } = await startExternalRun(profile, {
+    policyName: "p", policy: { allow: ["read", "search"] },
+  });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  const argv = JSON.parse(result.result);
+  assert.deepEqual(argv.slice(2, 6), ["--allowed-tool", "Read", "--allowed-tool", "Grep"]);
+  assert.equal(argv[6], "--prompt-file");
+});
+
+await ta("spawn: two roles share one binding but receive different compiled tool args", async () => {
+  const tool = `policy-shared-${crypto.randomUUID()}`;
+  const profile = argsProfile({ tool, toolControl: JOINED_TOOL_CONTROL });
+  await opBindingSave({ profile });
+  const repo = path.join(TMP, `policy-shared-repo-${crypto.randomUUID()}`);
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+runtime:
+  subagents: external
+models:
+  fake:
+    id: vendor/fake-9
+    family: fake
+    tags: [strong]
+    binding: ${tool}
+toolPolicies:
+  readOnly: { allow: [read] }
+  readSearch: { allow: [read, search] }
+roles:
+  alpha:
+    use: [fake]
+    tools: readOnly
+  beta:
+    use: [fake]
+    tools: readSearch
+pipelines: {}
+`);
+  assert.equal(opLoad({ cwd: repo }).errors, undefined);
+  const resolved = await opResolve({ hostModels: HOST });
+  assert.equal(resolved.roles.alpha.model, resolved.roles.beta.model);
+  assert.equal(resolved.roles.alpha.binding, resolved.roles.beta.binding);
+  const run = opRunStart({
+    task: "shared binding",
+    steps: [{ phase: "a", role: "alpha" }, { phase: "b", role: "beta" }],
+    masterModel: "host/master",
+    masterFamily: "host",
+  });
+  const resultA = await opSpawn({ runId: run.runId, phase: "a", prompt: "x" });
+  const argvA = JSON.parse(resultA.result);
+  assert.equal(argvA[2], "--fake-tools");
+  assert.equal(argvA[3], "native-read");
+
+  opStepReport({ runId: run.runId, phase: "a", summary: "done" });
+  const resultB = await opSpawn({ runId: run.runId, phase: "b", prompt: "x" });
+  const argvB = JSON.parse(resultB.result);
+  assert.equal(argvB[2], "--fake-tools");
+  assert.equal(argvB[3], "native-read,native-search");
+});
+
+await ta("spawn: no requested policy expands {toolArgs} to zero elements and runs unchanged", async () => {
+  const profile = argsProfile({ tool: `policy-none-${crypto.randomUUID()}`, toolControl: JOINED_TOOL_CONTROL });
+  const { run } = await startExternalRun(profile);
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  const argv = JSON.parse(result.result);
+  assert.equal(argv[0], "--mode");
+  assert.equal(argv[1], "args");
+  assert.equal(argv[2], "--prompt-file");
+  assert.deepEqual(result.enforcement, { state: "not_requested" });
+});
+
+await ta("spawn: strict enforcement blocks before running the worker when no adapter exists", async () => {
+  const profile = runnableProfile({ tool: `policy-strict-missing-${crypto.randomUUID()}` });
+  const { run } = await startExternalRun(profile, {
+    enforcement: "strict", policyName: "p", policy: { allow: [] },
+  });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  assert.equal(result.code, "tool_policy_unsupported");
+  assert.equal(result.reason, "disable_all_unsupported");
+  assert.equal(result.role, "worker");
+  assert.equal(result.policy, "p");
+  assert.equal(result.binding, profile.tool);
+  assert.equal(result.exitCode, undefined);
+});
+
+await ta("spawn: strict enforcement blocks on a missing allow-list adapter", async () => {
+  const profile = runnableProfile({
+    tool: `policy-strict-nolist-${crypto.randomUUID()}`,
+    toolControl: { disableAll: { argv: ["--none"] } },
+  });
+  const { run } = await startExternalRun(profile, {
+    enforcement: "strict", policyName: "p", policy: { allow: ["read"] },
+  });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  assert.equal(result.code, "tool_policy_unsupported");
+  assert.equal(result.reason, "allow_list_unsupported");
+});
+
+await ta("spawn: strict enforcement blocks on an unmapped tool name", async () => {
+  const profile = runnableProfile({
+    tool: `policy-strict-unmapped-${crypto.randomUUID()}`,
+    toolControl: JOINED_TOOL_CONTROL,
+  });
+  const { run } = await startExternalRun(profile, {
+    enforcement: "strict", policyName: "p", policy: { allow: ["write"] },
+  });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  assert.equal(result.code, "tool_policy_unsupported");
+  assert.equal(result.reason, "unmapped_tool");
+  assert.equal(result.tool, "write");
+});
+
+await ta("spawn: sandbox enforcement fails closed like strict", async () => {
+  const profile = runnableProfile({ tool: `policy-sandbox-${crypto.randomUUID()}` });
+  const { run } = await startExternalRun(profile, {
+    enforcement: "sandbox", policyName: "p", policy: { allow: [] },
+  });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  assert.equal(result.code, "tool_policy_unsupported");
+  assert.equal(result.reason, "disable_all_unsupported");
+  assert.equal(result.exitCode, undefined);
+});
+
+await ta("spawn: best-effort degrades and launches without tool args, recording the manifest entry", async () => {
+  const profile = runnableProfile({ tool: `policy-degrade-${crypto.randomUUID()}` });
+  const { repo, run } = await startExternalRun(profile, { policyName: "p", policy: { allow: [] } });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "degrade-check" });
+  assert.equal(result.code, undefined, JSON.stringify(result));
+  assert.equal(result.result, "degrade-check");
+  assert.equal(result.enforcement.state, "degraded");
+  assert.equal(result.enforcement.reason, "disable_all_unsupported");
+
+  const manifest = JSON.parse(fs.readFileSync(
+    path.join(repo, ".moa", "runs", run.runId, "manifest.json"), "utf8",
+  ));
+  assert.ok(
+    manifest.enforcement?.some((e) => e.reason === "disable_all_unsupported"),
+    JSON.stringify(manifest.enforcement),
+  );
+});
+
+await ta("spawn: deny-only policies are unsupported — strict fails, best-effort degrades", async () => {
+  const strictProfile = runnableProfile({
+    tool: `policy-denyonly-strict-${crypto.randomUUID()}`,
+    toolControl: JOINED_TOOL_CONTROL,
+  });
+  const { run: strictRun } = await startExternalRun(strictProfile, {
+    enforcement: "strict", policyName: "p", policy: { deny: ["read"] },
+  });
+  const strictResult = await opSpawn({ runId: strictRun.runId, phase: "work", prompt: "x" });
+  assert.equal(strictResult.code, "tool_policy_unsupported");
+  assert.equal(strictResult.reason, "deny_only_unsupported");
+
+  const bestProfile = runnableProfile({ tool: `policy-denyonly-best-${crypto.randomUUID()}` });
+  const { run: bestRun } = await startExternalRun(bestProfile, {
+    policyName: "p", policy: { deny: ["read"] },
+  });
+  const bestResult = await opSpawn({ runId: bestRun.runId, phase: "work", prompt: "ok" });
+  assert.equal(bestResult.result, "ok");
+  assert.equal(bestResult.enforcement.state, "degraded");
+  assert.equal(bestResult.enforcement.reason, "deny_only_unsupported");
+});
+
+await ta("spawn: freezes the role's tool policy in the manifest despite later .moa.yml mutation", async () => {
+  const profile = argsProfile({ tool: `policy-frozen-${crypto.randomUUID()}`, toolControl: JOINED_TOOL_CONTROL });
+  const { repo, run } = await startExternalRun(profile, {
+    policyName: "p", policy: { allow: ["read", "search"] },
+  });
+  const manifestPath = path.join(repo, ".moa", "runs", run.runId, "manifest.json");
+  const manifest = JSON.parse(fs.readFileSync(manifestPath, "utf8"));
+  assert.equal(manifest.enforcementMode, "best-effort");
+  assert.deepEqual(manifest.roleToolPolicies.worker, { name: "p", policy: { allow: ["read", "search"] } });
+
+  const mutated = fs.readFileSync(path.join(repo, ".moa.yml"), "utf8")
+    .replace('{"allow":["read","search"]}', '{"allow":[]}');
+  fs.writeFileSync(path.join(repo, ".moa.yml"), mutated);
+
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  const argv = JSON.parse(result.result);
+  assert.equal(argv[2], "--fake-tools");
+  assert.equal(argv[3], "native-read,native-search");
+});
+
+await ta("spawn: host-native routes expose the frozen policy request without claiming enforcement", async () => {
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  const nativeRun = opRunStart({
+    task: "native-policy",
+    steps: [{ phase: "plan", role: "planner" }],
+  });
+  const result = await opSpawn({ runId: nativeRun.runId, phase: "plan", prompt: "hello" });
+  assert.equal(result.code, "native_spawn_required");
+  assert.deepEqual(result.requestedPolicy, { name: "repo_read_only", policy: { allow: ["read", "search"] } });
+  assert.equal(result.enforcementMode, "best-effort");
+  assert.deepEqual(result.enforcement, { state: "host_owned" });
+});
+
+await ta("spawn: advisory policy dimensions are reported as unenforced, never as enforced", async () => {
+  const profile = argsProfile({ tool: `policy-advisory-${crypto.randomUUID()}`, toolControl: JOINED_TOOL_CONTROL });
+  const { run } = await startExternalRun(profile, {
+    policyName: "p",
+    policy: { allow: ["read"], network: "web_only", filesystem: "read_only" },
+  });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "x" });
+  assert.equal(result.enforcement.state, "enforced");
+  assert.deepEqual(result.enforcement.unenforced, { network: "web_only", filesystem: "read_only" });
+});
+
+await ta("spawn: prompt bytes remain exact through a policy-controlled spawn", async () => {
+  const profile = runnableProfile({
+    tool: `policy-bytes-${crypto.randomUUID()}`,
+    toolControl: JOINED_TOOL_CONTROL,
+  });
+  const { run } = await startExternalRun(profile, { policyName: "p", policy: { allow: ["read"] } });
+  const prompt = `exact $(touch ${path.join(TMP, "must-not-exist-2")}) and \`echo hi\``;
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt });
+  assert.equal(result.result, prompt);
+  assert.equal(result.enforcement.state, "enforced");
 });
 
 await ta("init: guards existing config; force overwrites; splice validates", async () => {
