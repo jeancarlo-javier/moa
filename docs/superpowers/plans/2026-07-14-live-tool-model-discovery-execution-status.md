@@ -4,7 +4,7 @@
 **Worktree:** `/Users/jeancarlojavier/pr26/moa--feat-mcp`
 **Branch:** `feat/mcp`
 **Baseline commit:** `cbb0e7085881e584eb00328679061bd8bf9a27be`
-**Status:** In progress — Tasks 1–2 implemented; Opus 4.8 whole-branch review and Task 3 installed-CLI acceptance remain.
+**Status:** In progress — Tasks 1–3 implemented and accepted; external Opus 4.8 whole-branch review remains.
 
 ## Source of truth
 
@@ -89,7 +89,7 @@ Prepared artifacts:
 - Intended result: `.omp-work/results/opus-4-8-final-review.md`
 - Intended log: `.omp-work/logs/opus-4-8-final-review.log`
 
-The first helper invocation exceeded the context-mode MCP transport's 30-second request timeout. It is not yet established whether the underlying review completed or was terminated. Next session/action must first inspect the result and log paths; if no valid result exists, rerun the same helper through a long-lived/background shell command.
+The first helper invocation exceeded the context-mode MCP transport's 30-second request timeout and produced no result. The same review was relaunched as long-lived background job `bg_1`; check the result path before taking further action.
 
 Required review output:
 
@@ -98,7 +98,7 @@ Required review output:
 3. Coverage of every plan/design acceptance criterion, process safety, exact routing, persistence, docs/templates/version, debug artifacts, and overengineering.
 4. On APPROVE, residual risks and verification gaps.
 
-## Remaining work
+## Current review and remaining work
 
 ### Finish Opus 4.8 review
 
@@ -107,20 +107,27 @@ Required review output:
 3. If verdict is REVISE, fix only concrete findings, rerun `cd moa-core/mcp && npm test`, commit, and request one Opus re-review.
 4. Record verdict and evidence here.
 
-### Task 3 — Installed-CLI dogfood and final acceptance
+### Task 3 — Installed-CLI dogfood and final acceptance — complete
 
-Not started. Required isolated acceptance:
+All probes used isolated temporary directories and an isolated `MOA_HOME`; the user's real `~/.moa/bindings` was never modified. Temporary state was removed after evidence capture.
 
-1. Rerun deterministic suite from a clean process.
-2. Use a temporary `MOA_HOME`; never touch the user's real `~/.moa/bindings`.
-3. OMP: validate JSON discovery (`models` / `selector`), T1/T2/T4, live inventory, external classification, and no persisted inventory.
-4. OpenCode: validate one-canonical-ID-per-line discovery and exact bound resolution.
-5. Agy: confirm designed rejection for display-name inventory.
-6. Codex: confirm designed rejection for no programmatic model-list command.
-7. Verify model-only binding and native-only filtering end to end.
-8. Remove only temporary Task 3 state.
-9. Record deterministic check count, discovered counts and sample proven IDs, rejection reasons, native-only result, and no-persistence confirmation here.
-10. Any code change caused by dogfood requires a focused red/green test, full deterministic suite, and its own conventional commit.
+- Clean deterministic suite: **54 checks passed**, exit 0.
+- OMP inventory: **74/74 canonical IDs**; sample `anthropic/claude-opus-4-8`.
+- OMP T2/T4: exact returned selector `minimax-code/MiniMax-M2.7-highspeed` produced the prompt-file nonce, exit 0.
+- Isolated `moa_binding_save` accepted the OMP profile and persisted only its invocation/parser recipe and evidence.
+- OpenCode inventory: **7/7 canonical IDs**; sample and T2-proven selector `opencode/big-pickle`.
+- OpenCode T2/T4: exact returned selector produced the stdin nonce, exit 0.
+- Isolated `moa_binding_save` accepted the OpenCode line-discovery profile.
+- Agy returned eight display-name lines and zero canonical IDs; registration failed with `model_discovery_parse_failed`, and no profile was written.
+- Codex root help exposes no `models` subcommand; no profile was written.
+- A configured `anthropic/claude-opus-4-8` with `binding: omp` resolved through OMP even when the same ID was host-native.
+- A missing exact ID pinned to OMP produced `blocked_no_binding`.
+- `runtime.subagents: native` resolved the same live host model only through `host-native`.
+- `moa_tools` did not label learned-tool inventory entries as host-native.
+- `roles.<name>.binding` failed schema validation.
+- Saved binding YAML contained neither a model inventory nor `listModels`.
+- `effective-config.json` contained resolved roles only, not the candidate pool or discovery inventory.
+- Compact machine-readable evidence: `.omp-work/results/installed-dogfood.json`.
 
 ### Final gates
 
