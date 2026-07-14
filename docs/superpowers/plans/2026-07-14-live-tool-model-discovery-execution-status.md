@@ -4,7 +4,7 @@
 **Worktree:** `/Users/jeancarlojavier/pr26/moa--feat-mcp`
 **Branch:** `feat/mcp`
 **Baseline commit:** `cbb0e7085881e584eb00328679061bd8bf9a27be`
-**Status:** Complete and verified — MOA terminal `done`; branch and worktree preserved pending the user's integration choice.
+**Status:** Complete and verified — MOA terminal `done`; user chose to keep `feat/mcp` and its worktree for the next session.
 
 ## Source of truth
 
@@ -142,7 +142,7 @@ All probes used isolated temporary directories and an isolated `MOA_HOME`; the u
 - [x] Worktree hygiene passed: clean status; `.omp-work` and `.omp-subagents.json` untracked/ignored; isolated dogfood state removed.
 - [x] External independent review: `anthropic/claude-opus-4-8:xhigh` **APPROVE**.
 - [x] MOA terminal `done`: `frame`, `implement`, `review`, `validate`, and `finalize` reported.
-- [ ] Use the development-branch finishing workflow; do not merge without the user's choice.
+- [x] Development-branch workflow complete: user selected **Keep branch as-is**; no merge, push, or cleanup performed.
 
 ## Current deterministic evidence
 
