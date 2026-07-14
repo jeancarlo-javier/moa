@@ -4,7 +4,7 @@
 **Worktree:** `/Users/jeancarlojavier/pr26/moa--feat-mcp`
 **Branch:** `feat/mcp`
 **Baseline commit:** `cbb0e7085881e584eb00328679061bd8bf9a27be`
-**Status:** In progress — Tasks 1–3 implemented and accepted; external Opus 4.8 whole-branch review remains.
+**Status:** In progress — Tasks 1–3 are complete; the Opus 4.8 blocking finding is fixed and one re-review remains.
 
 ## Source of truth
 
@@ -80,32 +80,35 @@ Verification:
 
 ## Current external Opus 4.8 review
 
-Prepared artifacts:
+Review artifacts:
 
-- Branch patch: `.omp-work/review/live-discovery.patch`
-- Patch size: 122,450 bytes
-- Requested model: `anthropic/claude-opus-4-8:xhigh`
-- OMP live inventory confirmed the exact selector and support for `xhigh` reasoning.
-- Intended result: `.omp-work/results/opus-4-8-final-review.md`
-- Intended log: `.omp-work/logs/opus-4-8-final-review.log`
+- Model: `anthropic/claude-opus-4-8:xhigh`
+- Result: `.omp-work/results/opus-4-8-final-review.md`
+- Log: `.omp-work/logs/opus-4-8-final-review.log`
+- Initial verdict: **REVISE**
 
-The first helper invocation exceeded the context-mode MCP transport's 30-second request timeout and produced no result. The same review was relaunched as long-lived background job `bg_1`; check the result path before taking further action.
+Blocking finding:
 
-Required review output:
+- `independenceGroup` stripped every trailing `-<alnum>` segment, collapsing distinct sibling selectors such as `vendor/fake-9` and `vendor/fake-10`. This could incorrectly block `differentModelFrom` and downgrade valid verification.
 
-1. First line exactly `APPROVE` or `REVISE`.
-2. Numbered findings with severity and `file:line`.
-3. Coverage of every plan/design acceptance criterion, process safety, exact routing, persistence, docs/templates/version, debug artifacts, and overengineering.
-4. On APPROVE, residual risks and verification gaps.
+Resolution:
+
+- Added a failing regression proving sibling selectors remain independently verifiable.
+- Removed the suffix-stripping heuristic; provider aliases and `:effort` still collapse, but distinct selectors do not.
+- Updated the former cosmetic group assertion from `fake` to `fake-9`.
+- Commit: `f9d98be fix(mcp): preserve sibling model independence`.
+- Post-fix focused suite: **55 checks passed**, exit 0.
+
+Opus also reported low-priority duplicate test coverage, sync `opInit` awaited by callers, and redundant `discovery.error || discovery.code` disjuncts. They are nonblocking and intentionally left unchanged to avoid unrelated cleanup.
 
 ## Current review and remaining work
 
 ### Finish Opus 4.8 review
 
-1. Check `.omp-work/results/opus-4-8-final-review.md`.
-2. If missing/invalid, inspect only the tail of `.omp-work/logs/opus-4-8-final-review.log` and rerun with `anthropic/claude-opus-4-8:xhigh`.
-3. If verdict is REVISE, fix only concrete findings, rerun `cd moa-core/mcp && npm test`, commit, and request one Opus re-review.
-4. Record verdict and evidence here.
+1. Regenerate the branch review patch through `f9d98be`.
+2. Request one read-only re-review from `anthropic/claude-opus-4-8:xhigh`, focused on the independence fix and regression.
+3. If approved, record the final verdict here and complete the final gates.
+4. If revised, fix only a new blocking correctness or contract finding.
 
 ### Task 3 — Installed-CLI dogfood and final acceptance — complete
 
@@ -142,7 +145,7 @@ All probes used isolated temporary directories and an isolated `MOA_HOME`; the u
 
 ```text
 node test.mjs
-54 checks passed
+55 checks passed
 exit 0
 ```
 
