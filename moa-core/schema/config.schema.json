@@ -105,13 +105,13 @@
 
     "toolPolicies": {
       "type": "object",
-      "description": "PARKED (currently advisory, not enforced — graded enforcement is archived in the repo's bindings/). Named least-privilege bundles. Kept so existing configs validate and so the master can still scope tools best-effort. When enforcement is re-implemented, a binding translates these canonical tool names to runtime controls.",
+      "description": "Named least-privilege bundles, keyed by policy name. When this map is declared, every roles.<name>.tools reference must resolve to a key here (checked at load). Policy content (network/filesystem/secrets/bash) stays advisory best-effort scoping until a binding's learned-tool profile declares a toolControl adapter that translates allow/deny into that tool's runtime flags at spawn time.",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
         "properties": {
-          "allow": { "type": "array", "items": { "type": "string" } },
-          "deny": { "type": "array", "items": { "type": "string" } },
+          "allow": { "type": "array", "items": { "type": "string", "minLength": 1 } },
+          "deny": { "type": "array", "items": { "type": "string", "minLength": 1 } },
           "network": { "enum": ["none", "web_only", "off_sandbox"] },
           "filesystem": { "enum": ["none", "scratch_only", "read_only", "worktree_write", "worktree_copy"] },
           "secrets": { "enum": ["scrubbed", "available"], "default": "scrubbed" },
@@ -141,7 +141,7 @@
             "description": "Ordered model aliases, or the literal auto wildcard. This is the only role-level route selector; roles never pin learned tools directly." },
           "effort": { "type": "array", "items": { "type": "string" }, "minItems": 1,
             "description": "Optional per-role reasoning/thinking effort — ALWAYS an array, same shape and rules as models.<name>.effort. A single-element array pins (e.g. ['high']); a multi-element ascending array is an escalation ladder climbed one rung per gate loop-back. Overrides the model's 'effort' and any ':<effort>' suffix baked into its id/key; ignored by models without effort control." },
-          "tools": { "type": "string", "description": "Reference into toolPolicies (PARKED — advisory scoping only; enforcement is archived in the repo's bindings/)." },
+          "tools": { "type": "string", "description": "Reference into toolPolicies. When toolPolicies is declared, this must name a key there (checked at load); policy content stays advisory best-effort scoping until a binding's toolControl adapter enforces it at spawn time." },
           "skills": { "type": "array", "items": { "type": "string" }, "default": [] },
           "instructions": { "type": "string" },
           "instructionsFile": { "type": "string" },

@@ -120,6 +120,8 @@ models:
   opus: { id: anthropic/claude-opus-4-8, family: claude, tags: [strong] }
   gpt: { id: openai/gpt-5.5, family: gpt, tags: [strong], effort: [medium, xhigh] }
   mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong, cheap], cost: cheap }
+toolPolicies:
+  repo_read_only: { allow: [read, search] }
 roles:
   planner: { use: [opus, auto], tools: repo_read_only }
   coder: { use: [mini] }
@@ -164,6 +166,30 @@ pipelines:
   assert.ok(r.errors.length >= 3, JSON.stringify(r.errors));
 });
 
+t("load: role tools reference must resolve to a declared toolPolicies entry", () => {
+  const bad = path.join(TMP, "tools-undeclared"); fs.mkdirSync(bad, { recursive: true });
+  fs.writeFileSync(path.join(bad, ".moa.yml"), `
+schemaVersion: 1
+toolPolicies:
+  none: { allow: [] }
+roles:
+  worker: { use: [auto], tools: missing }
+`);
+  const r = opLoad({ cwd: bad });
+  assert.ok(r.errors.includes("role 'worker': tools names unknown policy 'missing'"), JSON.stringify(r.errors));
+
+  const good = path.join(TMP, "tools-declared"); fs.mkdirSync(good, { recursive: true });
+  fs.writeFileSync(path.join(good, ".moa.yml"), `
+schemaVersion: 1
+toolPolicies:
+  none: { allow: [] }
+roles:
+  worker: { use: [auto], tools: none }
+`);
+  const ok = opLoad({ cwd: good });
+  assert.equal(ok.errors, undefined, JSON.stringify(ok.errors));
+});
+
 t("load: YAML anchors rejected (safe subset)", () => {
   const bad = path.join(TMP, "anchors"); fs.mkdirSync(bad, { recursive: true });
   fs.writeFileSync(path.join(bad, ".moa.yml"), "schemaVersion: 1\nx: &a 1\ny: *a\n");
@@ -201,6 +227,144 @@ await ta("binding_save: rejects obsolete and incomplete discovery profiles", asy
     mutate(profile);
     assert.ok((await opBindingSave({ profile })).error);
   }
+});
+
+await ta("binding_save: rejects invalid tool-control adapters", async () => {
+  for (const mutate of [
+    // legacy run.isolationFlags is no longer part of the accepted profile contract
+    (p) => { p.run.isolationFlags = ["--legacy"]; },
+    // toolControl declared but run.argv has no {toolArgs} marker at all
+    (p) => { p.toolControl = { disableAll: { argv: ["--none"] } }; },
+    // {toolArgs} embedded in a larger literal, not an exact element
+    (p) => {
+      p.run.argv.push("prefix-{toolArgs}");
+      p.toolControl = { disableAll: { argv: ["--none"] } };
+    },
+    // {toolArgs} present but no toolControl adapter declared
+    (p) => { p.run.argv.push("{toolArgs}"); },
+    // disableAll.argv carries a placeholder, which is never allowed
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { disableAll: { argv: ["{model}"] } };
+    },
+    // both joined and repeated renderers declared
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { read: "read" },
+        joined: { argv: ["--tools", "{tools}"], separator: "," },
+        repeated: { argv: ["--tool", "{tool}"] },
+      } };
+    },
+    // neither joined nor repeated renderer declared
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: { names: { read: "read" } } };
+    },
+    // joined renderer missing its {tools} placeholder
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { read: "read" },
+        joined: { argv: ["--tools"], separator: "," },
+      } };
+    },
+    // joined renderer with a duplicated {tools} placeholder
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { read: "read" },
+        joined: { argv: ["--tools", "{tools}", "{tools}"], separator: "," },
+      } };
+    },
+    // joined renderer with an unknown placeholder instead of {tools}
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { read: "read" },
+        joined: { argv: ["--tools", "{model}"], separator: "," },
+      } };
+    },
+    // repeated renderer missing its {tool} placeholder
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { read: "read" },
+        repeated: { argv: ["--tool"] },
+      } };
+    },
+    // repeated renderer with a duplicated {tool} placeholder
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { read: "read" },
+        repeated: { argv: ["--tool", "{tool}", "{tool}"] },
+      } };
+    },
+    // repeated renderer with an unknown placeholder instead of {tool}
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { read: "read" },
+        repeated: { argv: ["--tool", "{bin}"] },
+      } };
+    },
+    // empty canonical tool name in allowList.names
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { "": "read" },
+        repeated: { argv: ["--tool", "{tool}"] },
+      } };
+    },
+    // empty native tool name in allowList.names
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { read: "" },
+        repeated: { argv: ["--tool", "{tool}"] },
+      } };
+    },
+    // empty separator on the joined renderer
+    (p) => {
+      p.run.argv.push("{toolArgs}");
+      p.toolControl = { allowList: {
+        names: { read: "read" },
+        joined: { argv: ["--tools", "{tools}"], separator: "" },
+      } };
+    },
+  ]) {
+    const profile = provenProfile({ tool: `toolcontrol-${crypto.randomUUID()}` });
+    mutate(profile);
+    const result = await opBindingSave({ profile });
+    assert.ok(result.error, JSON.stringify({ profile, result }));
+  }
+});
+
+await ta("binding_save: accepts joined and repeated tool-control adapters", async () => {
+  const joined = provenProfile({ tool: "joinedcli" });
+  joined.run.argv.push("{toolArgs}");
+  joined.toolControl = {
+    disableAll: { argv: ["--fake-no-tools"] },
+    allowList: {
+      names: { read: "native-read", search: "native-search" },
+      joined: { argv: ["--fake-tools", "{tools}"], separator: "," },
+    },
+  };
+  const joinedResult = await opBindingSave({ profile: joined });
+  assert.equal(joinedResult.error, undefined, JSON.stringify(joinedResult));
+
+  const repeated = provenProfile({ tool: "repeatedcli" });
+  repeated.run.argv.push("{toolArgs}");
+  repeated.toolControl = {
+    disableAll: { argv: ["--fake-no-tools"] },
+    allowList: {
+      names: { read: "Read", search: "Grep" },
+      repeated: { argv: ["--allowed-tool", "{tool}"] },
+    },
+  };
+  const repeatedResult = await opBindingSave({ profile: repeated });
+  assert.equal(repeatedResult.error, undefined, JSON.stringify(repeatedResult));
 });
 
 await ta("tools: reads JSON and line inventories live without persisting them", async () => {

@@ -55,6 +55,21 @@ const zModelEntry = z.object({
   enabled: z.boolean().optional(),
 }).strict();
 
+const zBashPolicy = z.object({
+  mode: z.enum(["argv_allowlist"]).optional(),
+  allow: z.array(z.array(z.string())).optional(),
+  noShellMetachars: z.boolean().optional(),
+}).strict();
+
+const zToolPolicy = z.object({
+  allow: z.array(z.string().min(1)).optional(),
+  deny: z.array(z.string().min(1)).optional(),
+  network: z.enum(["none", "web_only", "off_sandbox"]).optional(),
+  filesystem: z.enum(["none", "scratch_only", "read_only", "worktree_write", "worktree_copy"]).optional(),
+  secrets: z.enum(["scrubbed", "available"]).optional(),
+  bash: zBashPolicy.optional(),
+}).strict();
+
 const zRole = z.object({
   description: z.string().optional(),
   use: z.array(z.string()).min(1),
@@ -113,12 +128,24 @@ const zConfig = z.object({
     hardVerificationTags: z.array(z.string()).optional(),
     instructions: z.string().optional(),
   }).strict().optional(),
-  toolPolicies: z.record(z.string(), z.any()).optional(),
+  toolPolicies: z.record(z.string(), zToolPolicy).optional(),
   roles: z.record(z.string(), zRole).optional(),
   pipelines: z.record(z.string(), zPipeline).optional(),
 }).strict();
 
 const PLACEHOLDER = /\{[^{}]+\}/;
+
+const zToolControl = z.object({
+  disableAll: z.object({ argv: z.array(z.string()).min(1) }).strict().optional(),
+  allowList: z.object({
+    names: z.record(z.string().min(1), z.string().min(1)),
+    joined: z.object({
+      argv: z.array(z.string()).min(1),
+      separator: z.string().min(1),
+    }).strict().optional(),
+    repeated: z.object({ argv: z.array(z.string()).min(1) }).strict().optional(),
+  }).strict().optional(),
+}).strict();
 
 const zProfile = z.object({
 
@@ -129,9 +156,8 @@ const zProfile = z.object({
     argv: z.array(z.string()).min(1),
     promptVia: z.enum(["file", "stdin", "arg"]).optional(),
     modelPlaceholder: z.string().optional(),
-    isolationFlags: z.array(z.string()).optional(),
     timeoutSeconds: z.number().int().positive().optional(),
-  }),
+  }).strict(),
   output: z.object({ format: z.enum(["text", "json", "jsonl"]).optional(), resultPath: z.string().optional() }).optional(),
   modelDiscovery: zModelDiscovery,
   capabilities: z.object({
@@ -143,7 +169,8 @@ const zProfile = z.object({
   evidence: z.object({
     probedOn: z.string(),
     tests: z.record(z.string(), z.string()),
-  }).strict()
+  }).strict(),
+  toolControl: zToolControl.optional(),
 }).strict();
 
 function profileRejectionReason(profile) {
@@ -167,6 +194,32 @@ function profileRejectionReason(profile) {
   if (profile.modelDiscovery.argv.some((arg) =>
       arg.replaceAll("{bin}", "").match(PLACEHOLDER)))
     return "invalid_profile";
+  if (profile.run.argv.some((arg) => arg !== "{toolArgs}" && arg.includes("{toolArgs}")))
+    return "invalid_profile";
+  const toolArgsCount = profile.run.argv.filter((arg) => arg === "{toolArgs}").length;
+  if (profile.toolControl ? toolArgsCount !== 1 : toolArgsCount !== 0)
+    return "invalid_profile";
+  if (profile.toolControl) {
+    const placeholdersOf = (argv) => argv.flatMap((arg) => arg.match(/\{[^{}]+\}/g) ?? []);
+    const { disableAll, allowList } = profile.toolControl;
+    if (disableAll && placeholdersOf(disableAll.argv).length)
+      return "invalid_profile";
+    if (allowList) {
+      const { joined, repeated } = allowList;
+      if (!joined === !repeated)
+        return "invalid_profile";
+      if (joined) {
+        const found = placeholdersOf(joined.argv);
+        if (found.length !== 1 || found[0] !== "{tools}")
+          return "invalid_profile";
+      }
+      if (repeated) {
+        const found = placeholdersOf(repeated.argv);
+        if (found.length !== 1 || found[0] !== "{tool}")
+          return "invalid_profile";
+      }
+    }
+  }
   return null;
 }
 // --- helpers --------------------------------------------------------------
@@ -185,12 +238,15 @@ function crossCheck(cfg) {
   const errs = [];
   const modelNames = new Set(Object.keys(cfg.models ?? {}));
   const roleNames = new Set(Object.keys(cfg.roles ?? {}));
+  const toolPolicyNames = cfg.toolPolicies ? new Set(Object.keys(cfg.toolPolicies)) : null;
   for (const [rname, role] of Object.entries(cfg.roles ?? {})) {
     for (const u of role.use)
       if (u !== "auto" && !modelNames.has(u))
         errs.push(`role '${rname}': use '${u}' is not in the models registry (and not 'auto')`);
     if (role.differentModelFrom && !roleNames.has(role.differentModelFrom))
       errs.push(`role '${rname}': differentModelFrom names unknown role '${role.differentModelFrom}'`);
+    if (role.tools && toolPolicyNames && !toolPolicyNames.has(role.tools))
+      errs.push(`role '${rname}': tools names unknown policy '${role.tools}'`);
   }
   for (const [mname, entry] of Object.entries(cfg.models ?? {})) {
     if (mname === "auto") continue;
