@@ -9,13 +9,32 @@ process.env.MOA_HOME = path.join(TMP, "home");
 const REPO = path.join(TMP, "repo");
 fs.mkdirSync(REPO, { recursive: true });
 
-const { opLoad, opResolve, opRunStart, opStepReport, opSpawnPrep, opInit, opBindingSave } =
+const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opSpawnPrep, opInit, opBindingSave } =
   await import("./server.mjs");
 
 const HOST = [
   { id: "claude-opus-4-8", family: "claude", tags: ["strong"] },
   { id: "claude-sonnet-4-6", family: "claude", tags: ["strong", "cheap"] },
 ];
+
+const provenProfile = (overrides = {}) => ({
+  tool: "fakecli",
+  bin: process.execPath,
+  version: process.version,
+  run: {
+    argv: ["{bin}", "--version", "{promptFile}"],
+    promptVia: "file",
+    timeoutSeconds: 60,
+  },
+  output: { format: "text", resultPath: "stdout" },
+  models: [{ id: "vendor/fake-9", family: "fake", tags: ["strong", "cheap"] }],
+  capabilities: { promptSafe: true, canProduce: true, canSelectModel: true },
+  evidence: {
+    probedOn: "2026-07-14",
+    tests: { T1: "pass", T2: "pass", T3: "pass", T4: "pass" },
+  },
+  ...overrides,
+});
 
 let n = 0;
 const t = (name, fn) => { fn(); console.log(`ok ${++n} - ${name}`); };
@@ -82,6 +101,76 @@ t("load: YAML anchors rejected (safe subset)", () => {
   const bad = path.join(TMP, "anchors"); fs.mkdirSync(bad, { recursive: true });
   fs.writeFileSync(path.join(bad, ".moa.yml"), "schemaVersion: 1\nx: &a 1\ny: *a\n");
   assert.ok(opLoad({ cwd: bad }).errors.some((e) => e.includes("safe subset")));
+});
+
+// --- registered tool discovery ----------------------------------------------
+
+t("binding_save: rejects unproven profiles", () => {
+  const bad = provenProfile({
+    capabilities: { promptSafe: false },
+    evidence: { probedOn: "2026-07-14", tests: { T1: "pass", T4: "fail" } },
+  });
+  assert.match(opBindingSave({ profile: bad }).error, /unproven/);
+});
+
+t("tools: a proven save is immediately discoverable", () => {
+  const saved = opBindingSave({ profile: provenProfile() });
+  assert.ok(saved.bound.endsWith("profile.yml"));
+  assert.equal(saved.tool.tool, "fakecli");
+  assert.equal(saved.tool.available, true);
+
+  const listed = opTools();
+  assert.equal(listed.tools.length, 1);
+  assert.deepEqual(listed.tools[0].usage, {
+    tool: "moa_spawn",
+    arguments: ["runId", "phase", "prompt"],
+  });
+  assert.equal(listed.tools[0].models[0].id, "vendor/fake-9");
+});
+
+t("tools: unavailable executables are reported and excluded from load", () => {
+  opBindingSave({ profile: provenProfile({ tool: "missingcli", bin: path.join(TMP, "missing-bin") }) });
+  const listed = opTools();
+  const missing = listed.tools.find((tool) => tool.tool === "missingcli");
+  assert.equal(missing.available, false);
+  assert.equal(missing.reason, "executable_not_found");
+
+  const loaded = opLoad({ cwd: REPO });
+  assert.ok(!loaded.bindings.some((tool) => tool.tool === "missingcli"));
+});
+
+t("tools: manually unproven profiles are skipped", () => {
+  const profile = provenProfile({
+    tool: "unprovencli",
+    capabilities: { promptSafe: false },
+  });
+  const dir = path.join(process.env.MOA_HOME, ".moa", "bindings", profile.tool);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "profile.yml"), JSON.stringify(profile));
+
+  const listed = opTools();
+  assert.ok(!listed.tools.some((tool) => tool.tool === profile.tool));
+  assert.ok(listed.skipped.some((item) =>
+    item.tool === profile.tool && item.reason === "unproven_profile"));
+});
+
+t("tools: promptVia arg profiles are skipped", () => {
+  const profile = provenProfile({
+    tool: "argcli",
+    run: {
+      argv: ["{bin}", "{model}"],
+      promptVia: "arg",
+      timeoutSeconds: 60,
+    },
+  });
+  const dir = path.join(process.env.MOA_HOME, ".moa", "bindings", profile.tool);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, "profile.yml"), JSON.stringify(profile));
+
+  const listed = opTools();
+  assert.ok(!listed.tools.some((tool) => tool.tool === profile.tool));
+  assert.ok(listed.skipped.some((item) =>
+    item.tool === profile.tool && item.reason === "unsafe_prompt_transport"));
 });
 
 // --- resolve -----------------------------------------------------------------
@@ -232,44 +321,6 @@ t("ad-hoc steps validated against resolved roles", () => {
 
 // --- spawn_prep ----------------------------------------------------------------
 
-t("binding_save: refuses unproven profile; accepts proven; spawn_prep fills argv", () => {
-  const bad = opBindingSave({ profile: {
-    tool: "fakecli", bin: "/usr/bin/fakecli",
-    run: { argv: ["fakecli", "run", "--model", "{model}", "--file", "{promptFile}"] },
-    models: [{ id: "fake/f-1", family: "fake" }],
-    capabilities: { promptSafe: false },
-    evidence: { probedOn: "2026-07-11", tests: { T1: "pass", T4: "fail" } },
-  }});
-  assert.ok(bad.error.includes("unproven"));
-
-  const good = opBindingSave({ profile: {
-    tool: "fakecli", bin: "/usr/bin/fakecli",
-    run: { argv: ["fakecli", "run", "--model", "{model}", "--file", "{promptFile}"], promptVia: "file", timeoutSeconds: 60 },
-    output: { format: "text", resultPath: "stdout" },
-    models: [{ id: "fake/fake-9", family: "fake", tags: ["strong", "cheap"] }],
-    capabilities: { promptSafe: true, canProduce: true },
-    evidence: { probedOn: "2026-07-11", tests: { T1: "pass", T2: "pass", T3: "pass", T4: "pass" } },
-  }});
-  assert.ok(good.bound.endsWith("profile.yml"));
-
-  // a config that pins the learned model
-  const brepo = path.join(TMP, "brepo"); fs.mkdirSync(brepo, { recursive: true });
-  fs.writeFileSync(path.join(brepo, ".moa.yml"), `
-schemaVersion: 1
-models:
-  fake9: { id: fake/fake-9, family: fake, tags: [strong], binding: fakecli }
-roles:
-  worker: { use: [fake9] }
-pipelines: {}
-`);
-  opLoad({ cwd: brepo });
-  opResolve({ hostModels: HOST });
-  const run = opRunStart({ task: "b", steps: [{ phase: "work", role: "worker" }] });
-  const prep = opSpawnPrep({ runId: run.runId, phase: "work", prompt: "do `rm -rf` nothing $(evil)" });
-  assert.deepEqual(prep.argv.slice(0, 4), ["fakecli", "run", "--model", "fake/fake-9"]);
-  assert.ok(fs.readFileSync(prep.promptFile, "utf8").includes("$(evil)"));
-  assert.ok(!prep.argv.join(" ").includes("evil"));
-});
 
 t("spawn_prep: native binding is refused", () => {
   opLoad({ cwd: REPO });

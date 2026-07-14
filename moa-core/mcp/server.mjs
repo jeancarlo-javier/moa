@@ -101,6 +101,45 @@ const zConfig = z.object({
   pipelines: z.record(z.string(), zPipeline).optional(),
 }).strict();
 
+const zProfile = z.object({
+  tool: z.string().regex(/^[\w.-]+$/),
+  bin: z.string(),
+  version: z.string().optional(),
+  run: z.object({
+    argv: z.array(z.string()).min(1),
+    promptVia: z.enum(["file", "stdin", "arg"]).optional(),
+    modelPlaceholder: z.string().optional(),
+    isolationFlags: z.array(z.string()).optional(),
+    timeoutSeconds: z.number().int().positive().optional(),
+  }),
+  output: z.object({ format: z.enum(["text", "json", "jsonl"]).optional(), resultPath: z.string().optional() }).optional(),
+  models: z.array(z.object({ id: z.string(), family: z.string(), tags: z.array(z.string()).optional() })).min(1),
+  listModels: z.array(z.string()).optional(),
+  capabilities: z.object({
+    canProduce: z.boolean().optional(),
+    canSelectModel: z.boolean().optional(),
+    promptSafe: z.boolean(),
+    toolRestriction: z.string().optional(),
+  }),
+  evidence: z.object({
+    probedOn: z.string(),
+    tests: z.record(z.string(), z.string()),
+  }),
+});
+
+function profileRejectionReason(profile) {
+  if (profile.capabilities.promptSafe !== true ||
+      profile.evidence.tests.T1 !== "pass" ||
+      profile.evidence.tests.T4 !== "pass")
+    return "unproven_profile";
+  if ((profile.run.promptVia ?? "file") === "arg")
+    return "unsafe_prompt_transport";
+  if ((profile.run.promptVia ?? "file") === "file" &&
+      !profile.run.argv.some((arg) => arg.includes("{promptFile}")))
+    return "invalid_profile";
+  return null;
+}
+
 // --- helpers --------------------------------------------------------------
 
 function parseYamlStrict(src, label) {
@@ -151,21 +190,77 @@ function findConfig(cwd) {
   }
 }
 
+function resolveExecutable(bin, envPath = process.env.PATH ?? "") {
+  const hasSeparator = bin.includes(path.sep) || (path.sep === "\\" && bin.includes("/"));
+  const candidates = hasSeparator
+    ? [path.resolve(bin)]
+    : envPath.split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, bin));
+  for (const candidate of candidates) {
+    try {
+      fs.accessSync(candidate, fs.constants.X_OK);
+      return fs.realpathSync(candidate);
+    } catch {}
+  }
+  return null;
+}
+
+function toolRecord(profile, resolvedBin) {
+  return {
+    tool: profile.tool,
+    version: profile.version ?? null,
+    available: Boolean(resolvedBin),
+    ...(resolvedBin ? {} : { reason: "executable_not_found" }),
+    capabilities: profile.capabilities ?? {},
+    models: (profile.models ?? []).map((model) => ({
+      id: model.id,
+      family: model.family,
+      tags: model.tags ?? [],
+    })),
+    usage: { tool: "moa_spawn", arguments: ["runId", "phase", "prompt"] },
+  };
+}
+
 function loadBindings() {
   const bindings = [];
+  const tools = [];
   const skipped = [];
   let dirs = [];
-  try { dirs = fs.readdirSync(BINDINGS_DIR()); } catch { return { bindings, skipped }; }
-  for (const d of dirs) {
-    const p = path.join(BINDINGS_DIR(), d, "profile.yml");
+  try { dirs = fs.readdirSync(BINDINGS_DIR()); }
+  catch { return { bindings, tools, skipped }; }
+
+  for (const dir of dirs.sort()) {
+    const file = path.join(BINDINGS_DIR(), dir, "profile.yml");
     try {
-      const parsed = parseYamlStrict(fs.readFileSync(p, "utf8"), d);
-      if (parsed.errors || !parsed.value?.run?.argv || !Array.isArray(parsed.value?.models))
-        skipped.push(d);
-      else bindings.push(parsed.value);
-    } catch { if (fs.existsSync(path.join(BINDINGS_DIR(), d))) skipped.push(d); }
+      const parsed = parseYamlStrict(fs.readFileSync(file, "utf8"), dir);
+      if (parsed.errors) {
+        skipped.push({ tool: dir, reason: "invalid_yaml" });
+        continue;
+      }
+      const validated = zProfile.safeParse(parsed.value);
+      if (!validated.success) {
+        skipped.push({ tool: dir, reason: "invalid_profile" });
+        continue;
+      }
+      const profile = validated.data;
+      const rejection = profileRejectionReason(profile);
+      if (rejection) {
+        skipped.push({ tool: dir, reason: rejection });
+        continue;
+      }
+      const resolvedBin = resolveExecutable(profile.bin);
+      const record = toolRecord(profile, resolvedBin);
+      tools.push(record);
+      if (resolvedBin) bindings.push({ ...profile, resolvedBin });
+    } catch {
+      skipped.push({ tool: dir, reason: "unreadable_profile" });
+    }
   }
-  return { bindings, skipped };
+  return { bindings, tools, skipped };
+}
+
+export function opTools() {
+  const { tools, skipped } = loadBindings();
+  return { tools, skipped };
 }
 
 // independence keys on the MODEL: collapse provider aliases + effort suffixes
@@ -210,23 +305,31 @@ const state = { loaded: null, resolved: null };
 
 function workDirOf(loaded) {
   const wd = loaded.config?.runtime?.workDir ?? ".moa";
-  return path.join(path.dirname(loaded.configPath ?? process.cwd()), wd);
+  return path.join(loaded.projectDir, wd);
 }
 
 // --- operations -----------------------------------------------------------
 
 export function opLoad({ cwd = process.cwd() } = {}) {
   const configPath = findConfig(cwd);
-  const { bindings, skipped } = loadBindings();
-  const bindingSummary = bindings.map((b) => ({
-    tool: b.tool, bin: b.bin, models: (b.models ?? []).map((m) => ({ id: m.id, family: m.family, tags: m.tags ?? [] })),
-    capabilities: b.capabilities ?? {},
-  }));
+  const { bindings, tools, skipped } = loadBindings();
   if (!configPath) {
-    state.loaded = { config: null, configPath: null, dispatch: "adaptive-bare", bindings };
+    const projectDir = path.resolve(cwd);
+    state.loaded = {
+      config: null,
+      configPath: null,
+      projectDir,
+      dispatch: "adaptive-bare",
+      bindings,
+    };
+    state.resolved = null;
     return {
-      config: null, configPath: null, dispatch: "adaptive-bare", mode: "auto",
-      bindings: bindingSummary, skippedBindings: skipped,
+      config: null,
+      configPath: null,
+      dispatch: "adaptive-bare",
+      mode: "auto",
+      bindings: tools.filter((tool) => tool.available),
+      skippedBindings: skipped,
       note: "no .moa.yml from cwd to root — adaptive mode, write nothing; offer /moa init after substantial work",
     };
   }
@@ -239,7 +342,8 @@ export function opLoad({ cwd = process.cwd() } = {}) {
   if (errs.length) return { configPath, errors: errs };
   const cfg = v.data;
   const dispatch = cfg.pipelines?.default ? "workflow" : "adaptive-config";
-  state.loaded = { config: cfg, configPath, dispatch, bindings };
+  const projectDir = path.dirname(configPath);
+  state.loaded = { config: cfg, configPath, projectDir, dispatch, bindings };
   state.resolved = null;
   return {
     configPath, dispatch, mode: cfg.master?.mode ?? "auto",
@@ -255,7 +359,8 @@ export function opLoad({ cwd = process.cwd() } = {}) {
     }])),
     defaults: cfg.runtime?.defaults ?? {},
     subagents: cfg.runtime?.subagents ?? "auto",
-    bindings: bindingSummary, skippedBindings: skipped,
+    bindings: tools.filter((tool) => tool.available),
+    skippedBindings: skipped,
   };
 }
 
@@ -613,48 +718,31 @@ export function opInit({ template, registry = {}, roles = {}, force = false, cwd
 
 // --- binding save (learn-tool persistence) ---------------------------------
 
-const zProfile = z.object({
-  tool: z.string().regex(/^[\w.-]+$/),
-  bin: z.string(),
-  version: z.string().optional(),
-  run: z.object({
-    argv: z.array(z.string()).min(1),
-    promptVia: z.enum(["file", "stdin", "arg"]).optional(),
-    modelPlaceholder: z.string().optional(),
-    isolationFlags: z.array(z.string()).optional(),
-    timeoutSeconds: z.number().int().positive().optional(),
-  }),
-  output: z.object({ format: z.enum(["text", "json", "jsonl"]).optional(), resultPath: z.string().optional() }).optional(),
-  models: z.array(z.object({ id: z.string(), family: z.string(), tags: z.array(z.string()).optional() })).min(1),
-  listModels: z.array(z.string()).optional(),
-  capabilities: z.object({
-    canProduce: z.boolean().optional(),
-    canSelectModel: z.boolean().optional(),
-    promptSafe: z.boolean(),
-    toolRestriction: z.string().optional(),
-  }),
-  evidence: z.object({
-    probedOn: z.string(),
-    tests: z.record(z.string(), z.string()),
-  }),
-});
 
 export function opBindingSave({ profile } = {}) {
   const v = zProfile.safeParse(profile);
   if (!v.success) return { error: "invalid profile: " + v.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`).join("; ") };
   const p = v.data;
-  if (p.capabilities.promptSafe !== true || p.evidence.tests.T1 !== "pass" || p.evidence.tests.T4 !== "pass")
+  const rejection = profileRejectionReason(p);
+  if (rejection === "unproven_profile")
     return { error: "refusing to bind an unproven profile — T1 (liveness) and T4 (prompt-injection safety) must both be 'pass' and promptSafe must be true" };
-  if ((p.run.promptVia ?? "file") === "arg")
+  if (rejection === "unsafe_prompt_transport")
     return { error: "promptVia 'arg' is shell-interpolation territory — use file or stdin" };
-  if (!p.run.argv.some((a) => a.includes("{promptFile}")) && (p.run.promptVia ?? "file") === "file")
+  if (rejection === "invalid_profile")
     return { error: "run.argv must reference {promptFile} when promptVia is 'file'" };
   const dir = path.join(BINDINGS_DIR(), p.tool);
   fs.mkdirSync(dir, { recursive: true });
   const file = path.join(dir, "profile.yml");
   fs.writeFileSync(file, YAML.stringify(p));
   const families = [...new Set(p.models.map((m) => m.family))];
-  return { bound: file, models: p.models.length, families, note: `models from ${families.length} famil${families.length === 1 ? "y" : "ies"} now available to every project` };
+  const discovered = opTools();
+  return {
+    bound: file,
+    models: p.models.length,
+    families,
+    tool: discovered.tools.find((tool) => tool.tool === p.tool),
+    note: `models from ${families.length} famil${families.length === 1 ? "y" : "ies"} now available to every project`,
+  };
 }
 
 // --- CLI mode (debugging) --------------------------------------------------
