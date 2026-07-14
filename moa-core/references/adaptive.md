@@ -7,10 +7,14 @@ changes only four things:
 
 - **(a) capability source** — *config present* (a `.moa.yml` with no `default`): capability is
   config-pinned (its `models` registry, declared `roles`, named pipelines). *Config absent* (no
-  `.moa.yml`): capability is discovered at runtime from the host's model pool, with no registry.
+  `.moa.yml`): capability is discovered at runtime from the union of the host's live
+  `hostModels` and the *current* live learned-tool routes returned by `moa_tools` — not from a
+  stored inventory cache.
 - **(b) state** — *config present* materializes `effective-config.json` and uses a run-store, so a
-  reviewer sees what actually ran. *Config absent* writes **nothing** orchestration-related — never
-  `.moa.yml`, `effective-config.json`, or a run-store; only the task's work product lands on disk.
+  reviewer sees what actually ran. *Config absent* writes **nothing** orchestration-related —
+  adaptive-bare discovery NEVER creates `.moa.yml`, a profile inventory cache, or
+  `effective-config.json`; it only queries `moa_tools` (live) for the current external inventory
+  and the host's models for the host-native set. The task's work product alone lands on disk.
 - **(c) Frame** — *config present*: the Frame is a **hard requirement / proof-of-read** (emit it
   before any action, even a trivial inline answer; its `config:` line quotes path, `schemaVersion`,
   and declared role names — values you cannot echo without reading the file).
@@ -36,7 +40,8 @@ instantiation; see the canonical role enumeration in *The config-absent fork* be
 So **never refuse or narrow a task because it is not framed as code**, and never claim "moa only
 writes code against a repo" — that confuses moa's most common *instantiation* with its *purpose*.
 Don't ask "where is the code"; ask: **what is the unit of work, who produces it, and who can
-independently check it.** Then staff those roles from the host's model pool and conduct. (A "battle
+independently check it.** Then staff those roles from the live union of the host's models and
+the current learned-tool routes (configless, see below) and conduct. (A "battle
 model A vs B" task: the units are the two contestants' runs — one producer each — and the check is an
 independent judge, a different model than both. A textbook run, not an off-menu request.) Your roles
 are capabilities, not job titles.
@@ -62,9 +67,13 @@ this fork trades enforced determinism for zero-setup usefulness, and labels ever
 grade it actually reached.
 
 ## The config-absent fork: resolve capability at runtime (no registry)
-1. **Discover** what the host can do: which models it can spawn subagents on, and whether it can
-   restrict a subagent's tools. If it cannot spawn subagents at all, you are the sole agent —
-   note it; it sets the verification floor below.
+1. **Discover** what the host can do AND what live learned tools serve right now: the host's
+   `hostModels` (which only the host knows) merged with the *current* external routes
+   `moa_tools` returns from each bound tool's `modelDiscovery` recipe. If the host cannot spawn
+   subagents and no learned tool serves models, you are the sole agent — note it; it sets the
+   verification floor below. Family and tags come from the discovery payload as reported; an
+   unknown family or an empty tag set from a tool never claims cross-family verification —
+   name the grade from the families you actually see.
 2. **Staff ad-hoc roles by capability, not by domain.** Per task, conjure the *capability* roles
    the work needs — typically a read-only *decomposer* (breaks the task down, plans the units), one
    or more *producers* (each makes one unit of the actual deliverable), and an independent

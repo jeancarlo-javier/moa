@@ -8,12 +8,9 @@ template:
   base: design
   projectType: auto
 
-# Model registry — filled by init with ONLY the models the roles below use (the union of init's
-# per-role picks), not the full list the host can serve. Keys are model short-names (e.g. gpt-5.5);
-# capability labels go in `tags`. Tag a vision/design-strong model `designer` so init routes the
-# consult/review roles to it. Roles ship `use: [auto]` as a placeholder — init pins the latest
-# capable model per role (one primary + a trailing `auto`); a remaining `auto` is resolved by the
-# master at run time.
+# Init writes ONLY aliases selected by roles, never the full live inventory.
+# Each entry uses a canonical provider/model id. Optional `binding` pins that model to
+# `host-native` or one learned tool; roles select aliases through `use` and never pin tools.
 models: {}
 
 master:

@@ -1177,26 +1177,26 @@ if (isMain) await startMcp();
 async function startMcp() {
   const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
   const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
-  const server = new McpServer({ name: "moa", version: "0.7.0" });
+  const server = new McpServer({ name: "moa", version: "0.8.0" });
   const json = (r) => ({ content: [{ type: "text", text: JSON.stringify(r) }], isError: !!r?.error });
 
   server.tool(
     "moa_load",
-    "FIRST CALL of every moa run. Locates .moa.yml (cwd→root), parses + validates it, reads learned tool profiles (~/.moa/bindings). Returns the normalized config, dispatch mode (workflow|adaptive-config|adaptive-bare), roles, pipelines, and connected tools. Replaces reading the config by hand.",
+    "FIRST CALL of every moa run. Locates .moa.yml (cwd→root), parses + validates it, reads learned tool profiles (~/.moa/bindings) as metadata only. Returns the normalized config, dispatch mode (workflow|adaptive-config|adaptive-bare), roles, pipelines, and connected tools. Replaces reading the config by hand. Never runs an inventory subprocess — model inventory is fetched live through moa_tools / moa_resolve / moa_spawn.",
     { cwd: z.string().optional().describe("directory to search from; defaults to the server's cwd") },
     async (a) => json(opLoad(a))
   );
 
   server.tool(
     "moa_tools",
-    "Executes registered live discovery (no caching) and returns the models each learned tool currently serves plus the stable MCP call used to run them. Newly learned tools appear on the next call without a server restart.",
+    "Runs every registered modelDiscovery recipe live (no caching, no persistence) and returns the models each learned tool currently serves plus the stable MCP call used to run them. External only — never reports host-native models as external. Newly learned tools appear on the next call without a server restart.",
     {},
     async () => json(await opTools())
   );
 
   server.tool(
     "moa_resolve",
-    "SECOND CALL — and runnable independently. Independently runs live discovery across every learned tool, then merges with the host-native models you pass; resolves every role's model/effort/binding deterministically, checks independence constraints, and writes effective-config.json. Calling moa_tools first is optional. Returns the per-role resolution + candidate pool + diagnostics.",
+    "SECOND CALL — and runnable independently. Re-runs live discovery across every learned tool, then intersects those live external routes with the models aliases in .moa.yml and the hostModels you pass; pins every role's model/effort/binding (model-level only — roles.<name>.binding is rejected) with a recorded reason, checks independence constraints, and writes effective-config.json. Calling moa_tools first is optional. Returns the per-role resolution + candidate pool + diagnostics.",
     {
       hostModels: z.array(z.object({
         id: z.string().regex(CANONICAL_MODEL_ID), family: z.string().optional(),
@@ -1243,7 +1243,7 @@ async function startMcp() {
 
   server.tool(
     "moa_spawn",
-    "Executes the current run phase through its resolved registered external agent tool. Revalidates the bound model's current live availability before launch — drift between resolve-time and spawn-time is reported as 'model_not_served' instead of routing through a stale assumption. Transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result. Does not advance the run; inspect the result and call moa_step_report separately.",
+    "Executes the current run phase through its resolved registered external agent tool. Before launch, re-runs the bound tool's modelDiscovery against its CURRENT inventory and refuses to launch when the frozen model is no longer served (model_not_served, instead of routing through a stale assumption). Transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result. Does not advance the run; inspect the result and call moa_step_report separately.",
     {
       runId: z.string(),
       phase: z.string().describe("must be the run's current non-master external phase"),

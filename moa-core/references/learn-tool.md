@@ -64,11 +64,16 @@ run:                               # the recipe to launch ONE non-interactive su
 output:
   format: text                     # text | json | jsonl
   resultPath: <how to extract the assistant's final text>   # e.g. "stdout" or a JSON path
-models:                            # the serves() equivalent — learned from the list command
-  - id: <full model ref>
-    family: <model lineage>        # REQUIRED — cross-family preference + alias collapsing; infer + confirm
-    tags: [<strong|cheap|fast|vision|...>]
-listModels: [<bin>, <list-subcmd>, "--json"]   # how to re-enumerate models later
+modelDiscovery:                   # the live-inventory recipe (REQUIRED) — what the server
+                                   # runs to re-enumerate the tool's current model list.
+                                   # args expand `{bin}` only; the server validates canonical ids
+                                   # from the output before the profile is accepted.
+  argv: ["{bin}", models, --json]
+  output:
+    format: json
+    listPath: models              # path inside the parsed JSON to the array of model records
+    idPath: selector              # path inside each record to the canonical model id
+  timeoutSeconds: 10
 capabilities:                      # OBSERVED facts (see "Capability notes"), not a contract
   canProduce: true                 # passed the file-mutation round-trip (T3)
   canSelectModel: true             # the model flag works (T2)
@@ -77,7 +82,15 @@ capabilities:                      # OBSERVED facts (see "Capability notes"), no
 evidence:                          # what proved each claim, + date — so a reviewer can trust it
   probedOn: <absolute date>
   tests: { T1: pass, T2: pass, T3: pass, T4: pass, T5: <result|skipped> }
-```
+# A second example for a CLI that prints one canonical id per line:
+#
+# modelDiscovery:
+#   argv: ["{bin}", models]
+#   output:
+#     format: lines
+#   timeoutSeconds: 10
+# The saved profile contains only the run/output/capability metadata above — it never
+# stores a list of model ids; inventory is fetched live every time the tool is queried.
 
 ## The learning protocol <a id="the-learning-protocol"></a>
 
@@ -106,16 +119,26 @@ side-effect-free. From the help text, extract the *shape* and draft an invocatio
 - **effort/thinking** controls, if any.
 - the **output shape** (text / JSON / JSONL) and where the assistant's final text lives.
 - optional niceties: a **cwd** flag, a **no-session / no-extensions** flag, a **timeout** flag.
+
 The executable template may use `{bin}`, `{model}`, `{promptFile}`, `{cwd}`, and `{maxTime}`.
-`file` and `stdin` prompt transport are supported; `arg` is refused at registration.
-
-### Phase 2 — Acquire model knowledge
-Call the discovered list-models command and parse it into the profile's `models` — `{ id,
-family, tags }` per model. **Family is required** (it powers the cross-family preference and
-collapses provider aliases of one model; independence itself keys on the model); when
-the CLI doesn't report lineage, infer it and have the user confirm. No list command → ask the
-user which models, or probe one known id.
-
+### Phase 2 — Acquire the live model discovery recipe
+You do NOT capture a list of models here — that would freeze a snapshot of the tool and turn
+re-binding into a chore. What you capture is the **recipe** that the server will run whenever it
+needs the tool's current inventory. The recipe lives in the profile's `modelDiscovery` block.
+Run the discovered list-models command to confirm the recipe is real and the output is parseable,
+but write the recipe, not the parsed list:
+- the **argv template** — uses `{bin}` only; every other arg is a literal the tool accepts. The
+  server expands `{bin}` and refuses any other placeholder.
+- the **output shape** — `format: json` with a `listPath` (array) and an `idPath` (each
+  record's id) — or `format: lines` when the tool prints one canonical id per line.
+- a sensible `timeoutSeconds` (10s is fine for a list).
+The profile itself never stores a model list; the server validates the recipe by running it
+during `moa_binding_save` and rejects it if the output cannot be parsed, the array is empty,
+or any id fails the canonical shape (see the rules below). After binding, `moa_tools` and
+`moa_resolve` re-run the recipe live every call — there is no cached inventory.
+If the CLI has no programmatic list command, ask the user which models to expose and probe one
+known id; without a real recipe the tool is not bindable as a model server (it can still
+surface as a read-only launcher after the user accepts the smaller role set).
 ### Phase 3 — Trial launch (the live tests — the crux)
 Run real subagents through the *draft* profile, cheapest model, in a scratch dir. Generate a
 fresh random **nonce** per test and require it in the result — this is what stops a false
@@ -125,8 +148,9 @@ fresh random **nonce** per test and require it in the result — this is what st
   `<nonce>`."* Confirm the captured output contains the nonce. One test proves three things: you
   can invoke it, it runs the prompt, and you can read its answer. **T1 fail ⇒ not bindable** —
   stop, surface the captured stderr.
-- **T2 — model selection (required if a model flag exists).** Repeat T1 with an explicit model.
-  Confirms the selector works *and* that a listed model is actually real.
+- **T2 — model selection (required).** Repeat T1 with an explicit model id — and the model id
+  MUST be one of the ids the `modelDiscovery` recipe just returned, copied verbatim. Confirms
+  the selector works against a model the tool genuinely serves *right now*.
 - **T3 — producer round-trip (required for producer use).** In the scratch dir, prompt: *"Create
   a file `moa_probe_<nonce>.txt` containing only `<nonce>`."* Then check the file exists with the
   right contents. This proves the tool can do real workspace-mutating work **and** that you can
@@ -152,16 +176,43 @@ evidence**, so the user learns *why*, not just "no."
 
 ### Phase 5 — Register globally
 Save the proven profile through `moa_binding_save`, including the evidence block (test results,
-date, captured version). The server validates it, persists it under
-`~/.moa/bindings/<tool>/profile.yml`, and makes it immediately visible through `moa_tools`.
-Global registration means every project can resolve it without restarting the MCP server.
+date, captured version). The server re-runs `modelDiscovery` to confirm the recipe still
+parses, persists the profile under `~/.moa/bindings/<tool>/profile.yml`, and makes it
+immediately visible through `moa_tools`. Global registration means every project can resolve
+it without restarting the MCP server — and because the profile never stores a model list,
+adding or removing a model tomorrow is a discovery event, not a re-bind.
+
+## The ten learning rules (all required for a clean bind)
+Every successful `learn-tool` workflow satisfies these in order. The server enforces the ones
+that are mechanically checkable; the rest are master judgment the user audits:
+1. **Start with the root `--help`.** Inspect the help, then drill into the run/list subcommand
+   help. Do not write a recipe from a single page of docs.
+2. **Require a programmatic model-list operation.** No list command ⇒ not bindable as a model
+   server (offer the smaller read-only role set or stop).
+3. **Require canonical IDs.** Every id the recipe emits must match `^[^\s/]+/[^\s]+$`
+   (`<provider>/<model>`) — display-name inventories are rejected.
+4. **Reject display-name inventories.** Claude, "Claude Opus 4.6 (Thinking)", gpt-5.5,
+   `MiniMax-M3` alone — anything that is not a strict `<provider>/<model>` fails discovery.
+5. **Use an exact returned id for T2.** Copy the id from the discovery output verbatim; do not
+   normalize, capitalize, or guess variants. T2 with a non-listed id ⇒ the evidence is invalid.
+6. **Require safe prompt transport (T4).** File or stdin only — argv is refused at registration.
+7. **Submit through `moa_binding_save` for independent server execution.** The master writes
+   the profile; the server runs the discovery recipe and the rejections — never self-validate.
+8. **Persist no list output.** The profile carries `modelDiscovery`, never a stored list of
+   `models`/`listModels`. Re-discovery is the only way to learn the current inventory.
+9. **Call `moa_tools` after binding to observe the current inventory.** That confirms the bind
+   end-to-end before you offer the user the new models.
+10. **Re-learn only on invocation/parser drift, not on model-catalog drift.** The tool adding or
+    removing a model is a discovery event the next `moa_tools` call will surface; only flag
+    changes to the run argv, the output shape, or the binary/version require a re-bind.
 
 ### Phase 6 — Report + close the independence loop
-Show the user: the tool bound, the models now available **with their families**, the roles it
-can serve, the capability/safety notes, and any role it *can't* serve and why. Then the key
-move: if this bind introduced a **new model family**, say so — *"cross-family verification (the
-preferred grade) is now available."* If only the host family still exists, repeat the offer. Point
-them at `/moa init` (or a re-resolve) so the new models actually get used.
+Show the user: the tool bound, the models now available **with their families** (queried live
+through `moa_tools` after the bind), the roles it can serve, the capability/safety notes, and
+any role it *can't* serve and why. Then the key move: if this bind introduced a **new model
+family**, say so — *"cross-family verification (the preferred grade) is now available."* If
+only the host family still exists, repeat the offer. Point them at `/moa init` (or a
+  re-resolve) so the new models actually get used.
 
 ## Suitability: what makes a CLI bindable <a id="suitability"></a>
 A CLI is *suitable for moa* when it can be driven as a **non-interactive, scriptable subagent**:
@@ -230,10 +281,21 @@ the normalized result. Inspect that result and the actual workspace effects, the
 
 ## Re-learning & staleness <a id="re-learning"></a>
 Re-running `learn-tool` on an already-bound tool re-probes and **overwrites** its profile
-(idempotent). If a run finds the tool's live `--version` differs from the profile's `evidence`,
-treat the profile as **stale**: warn, and offer a re-learn before relying on it — a CLI that
-changed flags can silently break the recipe, and you'd rather catch that at bind time than
-mid-orchestration.
+(idempotent). What triggers a re-bind is **invocation/parser drift**, not model-catalog drift:
+
+- **Binary/version drift** — the tool's `--version` differs from `evidence.probedOn`'s captured
+  version. The recipe or output shape may have changed; warn, offer a re-learn before relying
+  on it. A CLI that changed flags can silently break the recipe, and you'd rather catch that
+  at bind time than mid-orchestration.
+- **Run-argv drift** — the tool renamed or removed the run subcommand, the model flag, or the
+  prompt channel. Same remedy: re-probe and re-bind.
+- **Output-shape drift** — the recipe still runs but the JSON/line shape changed (renamed
+  field, new wrapper). Re-probe, re-write the `modelDiscovery` block, re-bind.
+
+**Model-catalog drift is NOT a re-bind trigger.** Adding, removing, renaming, or retagging a
+model the tool serves is what `moa_tools` discovers live on the next call — the profile
+stores the recipe, not the list. The next `moa_resolve` or `moa_spawn` sees the change
+automatically; you do not re-bind to track a catalog change.
 
 ## Terminal states <a id="terminal-states"></a>
 - `bound` — profile written and proven (T1 ∧ T4, plus whatever else passed).

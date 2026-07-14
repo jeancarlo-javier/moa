@@ -77,28 +77,36 @@ Both say the same thing; the second hides nothing that matters and never sends t
      are never auto-proposed — they are reachable only via an explicit arg.
 
 4. **Discover the candidate model set — a working set in memory, NOT the registry** (fail-soft —
-   never block a write). Gather every reachable model from, in order:
-   0. **Host-native capability** — you can always enumerate your own host's models.
-   1. **Learned tool profiles** — `~/.moa/bindings/*/profile.yml`, each written by `learn-tool`
-      and carrying its `models` list (`{ id, family, tags }`).
+   never block a write). Get the live inventory through the MCP server, not by reading profile
+   files by hand:
+   0. **Call `moa_tools`** — the server runs the registered `modelDiscovery` recipe for every
+      bound tool and returns the *current* inventory each tool serves now, plus the host-native
+      routes the server has been told about. This is the **only** read of external inventory you
+      need: there is no stored `models`/`listModels` field on a profile to consult, and you do
+      **not** parse `~/.moa/bindings/*/profile.yml` yourself.
+   1. **Add your host-native models** to the same candidate set — the host always has models
+      only it knows about, so append whatever the host can spawn subagents on; `moa_resolve`
+      will intersect them with the discovered external routes.
 
-   Hold each candidate as `{ short-name, id, family, context, tags }` — short-name is the last
-   `/`-segment of the ref, minus any `:<effort>` suffix (keep the provider prefix only to break a
-   collision). Seed `tags` from what the source reports: top-tier → `strong` · volume/cheap →
-   `cheap` · fast/triage → `fast`; add `vision` to a vision-capable model. Capability labels live in
-   `tags`, never in the key.
+   Hold each candidate as `{ short-name, id, family, context, tags, source }` — `source` labels
+   the inventory (`host-native:<vendor>` vs `learned:<tool-name>`) so you can separate host and
+   learned inventories in step 5. short-name is the last `/`-segment of the ref, minus any
+   `:<effort>` suffix (keep the provider prefix only to break a collision). Seed `tags` from what
+   the source reports: top-tier → `strong` · volume/cheap → `cheap` · fast/triage → `fast`;
+   add `vision` to a vision-capable model. Capability labels live in `tags`, never in the key.
 
    **This set is your candidate pool, not the file.** Do NOT emit one registry entry per discovered
    model — that full dump (often 50–70 models) is exactly the bloat to avoid; it costs the team
    tokens on every run and buries the few models that matter. The written `models` registry is
    assembled in step 7 from **only the models the roles actually pick** (step 5).
 
-   If a previously-connected tool is now unreachable (a stale, missing, or unparseable profile —
-   e.g. a moved folder or a broken link), **quietly skip it.** Do not stop, and do not surface the
+   If a learned tool's `moa_tools` row came back with a non-`ok` discovery status (stale,
+   unparseable, or the binary is gone) — **quietly skip it.** Do not stop, and do not surface the
    raw failure to the user as a question (no "binding broken", no "symlink", no "registry"). At
    most, mention it in plain language *as an aside* with a fix offer: *"One tool you'd connected
    earlier isn't reachable anymore — I'll leave it out. You can reconnect it later."* The missing
-   connection is never a blocker; host-native always works.
+   connection is never a blocker; host-native always works, and one failed learned tool never
+   takes the healthy live/native routes down with it.
 
    If host-native is the only source, there is one family and nothing to route between, so roles stay
    `[auto]` (the host resolves them live at run time) — the union of picks is empty and the registry
@@ -141,8 +149,19 @@ Both say the same thing; the second hides nothing that matters and never sends t
      pinned to a **different model** than the role it guards (verifier independence is vs the
      *producer* it checks; different family preferred). Keep verifiers/critical roles in
      `master.hardVerificationTags` (`strong`).
-   - **Stay `[auto]`** for a role only when the pool is empty, no model clearly fits, or independence
-     can't be guaranteed here (one model) — and name which roles stayed `auto` and why.
+- **Stay `[auto]`** for a role only when the pool is empty, no model clearly fits, or independence
+  can't be guaranteed here (one model) — and name which roles stayed `auto` and why.
+- **Pinning a model to a tool (the model-level binding rule).** When the user wants a specific
+  alias to always run through one specific route (e.g. "this opus always goes through `omp`"),
+  record that as `models.<alias>.binding: <host-native | learned-tool-name>`. **Never** set
+  `roles.<name>.binding` — the schema rejects it, and even if it didn't, the tool route is a
+  property of the *model* the role picks through `use`, not of the role. Bindings only live on
+  `models.<alias>` entries.
+- **Reject or omit noncanonical model ids.** Any id the discovery step surfaced that does not
+  match `^[^\s/]+/[^\s]+$` (display names like "Claude Opus 4.6", bare `MiniMax-M3`, anything
+  that isn't a strict `<provider>/<model>`) is not a candidate. The server would reject it at
+  resolve-time; do not normalize or coerce — drop it and tell the user in plain language that
+  one inventory returned display names only and was not used.
 
 ### Pick few, pick current (what keeps `.moa.yml` lean)
 The registry is the **union of the per-role picks**, nothing more — so fewer, newer models is the
@@ -174,10 +193,13 @@ model only if a research role exists. Everything else the host serves stays out 
 7. **Render and write `.moa.yml`** at the repo root.
    - Start from `templates/<name>.yml` **verbatim** — its comments are the in-file
      docs and must survive.
-   - **Assemble the registry** = the union of every model any role picked in step 5, one entry each
-     (`id`, `family`, `context` if known, seeded `tags`) — and *nothing the roles don't reference*.
-     Fill the template's `models: {}` with it, and replace each role's `use: [auto]` placeholder with
-     its step-5 assignment.
+- **Assemble the registry** = the union of every model any role picked in step 5, one entry each
+  (`id`, `family`, `context` if known, seeded `tags`, optional `binding`) — and *nothing the
+  roles don't reference*. Fill the template's `models: {}` with it, and replace each role's
+  `use: [auto]` placeholder with its step-5 assignment. **`.moa.yml` contains only the
+  aliases roles selected, never the full live inventory** — anything `moa_tools` reported but
+  no role picked stays out of the file. When the user pinned a route in step 5, the
+  `binding:` key lives on the `models.<alias>` entry — never on a `roles.<name>` field.
    - **Keep pipelines named; never emit a `default`.** Templates ship **named** pipeline(s) — e.g.
      full-engineering's `engineering`+`quick` — and no `default`, so a fresh config runs in **adaptive
      mode** (config-present fork: the master picks the approach per task); don't rewrite, rename, or prune them. Emit a
@@ -208,16 +230,21 @@ model only if a research role exists. Everything else the host serves stays out 
   union of picks is empty and the registry is `{}` + comment; success — gates stay independent
   across the host's models — but flag that the preferred cross-family grade needs a second tool
   bound via `learn-tool`.
+- A learned tool that fails live discovery during step 4 → that tool is skipped; register the
+  rest of the inventory and tell the user in plain language which tool to re-learn. Healthy
+  live and host-native routes keep working; one failed tool never takes the rest down.
 - A learned profile that won't parse / is stale → register what's usable, skip the rest, say
   which models resolved and which profile to re-learn.
 - Unknown template arg → list the five names, stop.
-- `.moa.yml` exists, no `--force` → show its template/models, instruct, no write.
 - Unrecognizable project → detection falls to `full-engineering`; user confirms.
+- Discovery returns display-name or otherwise noncanonical ids → reject that tool's rows,
+  not normalize them; proceed with what survived.
 
 ## Stay agnostic
 Never write a CLI name, flag, or command into `.moa.yml` or your reasoning. The `models`
-registry holds only the model refs the roles use (drawn from host-native enumeration and learned
-tool profiles); how those models run is profile data resolved at orchestration time, not here.
+registry holds only the model refs the roles use (drawn from `moa_tools` and the host-native
+capability); how those models run is profile data resolved at orchestration time, not here.
+Binding a model to a specific route belongs on the `models.<alias>` entry, not on a role.
 
 See also: SKILL.md, `references/learn-tool.md`, `references/adaptive.md`,
 `schema/config.schema.json`, `templates/`.

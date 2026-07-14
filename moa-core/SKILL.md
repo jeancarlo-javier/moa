@@ -1,6 +1,6 @@
 ---
 name: moa
-version: 0.7.0
+version: 0.8.0
 allowed-tools: mcp__moa__*
 description: |
   Master of Agents (moa) — per-project, runtime-AGNOSTIC multi-agent orchestration. Become the
@@ -26,8 +26,6 @@ hold the whole-problem picture; delegate specialized/parallel/heavy work to the 
 subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and enforce the rules
 (config, resolution, gate sequencing, independence); you supply the judgment they can't.
 
-## The flow — every run
-
 1. **`moa_load`** before ANY reasoning about the task — even to judge it trivial ("small" is judged
    *from* the config). It returns the validated config, dispatch mode, roles, pipelines, and
    connected tools as data. Then dispatch:
@@ -35,12 +33,17 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
    - first arg `learn-tool` → `references/learn-tool.md` (probe + prove; `moa_binding_save` binds).
    - otherwise → orchestrate (workflow if a `default` pipeline exists; adaptive if not — see
      `references/adaptive.md` for the config-absent fork and its arc).
-   Call `moa_tools` only when you need an on-demand compact list of connected external tools,
-   models, and capabilities; it reloads newly learned tools without a server restart.
-2. **`moa_resolve`** — pass the models YOUR host can spawn subagents on (only you know them).
-   The server merges registry + learned tools + host, pins every role's model/effort/binding with
-   a recorded reason, and writes `effective-config.json`. Surface its diagnostics plainly
-   (`blocked_no_model` → offer to adjust the registry or `/moa learn-tool`).
+   `moa_load` itself does not run any external inventory; call `moa_tools` only when you need an
+   on-demand compact list of currently-connected external tools, models, and capabilities — every
+   `moa_tools` call executes the registered `modelDiscovery` recipe fresh and reports what the
+   tools serve *now*; it never reports them as native, and never persists a stored list.
+2. **`moa_resolve`** — pass the models YOUR host can spawn subagents on (only you know them) as
+   `hostModels`. The server performs its own live discovery (the same `modelDiscovery` recipe each
+   tool was bound with), then intersects those live external routes with the `models` aliases in
+   `.moa.yml` and the `hostModels` you passed, pins every role's model/effort/binding with a
+   recorded reason, and writes `effective-config.json`. The `binding` field lives only on
+   `models.<alias>` entries, never on a role; roles select through `use`. Surface its diagnostics
+   plainly (`blocked_no_model` → offer to adjust the registry or `/moa learn-tool`).
 3. **`moa_run_start`** — pass the task plus a named pipeline, or ad-hoc `steps` you composed
    (adaptive), or nothing in workflow mode. **Always pass `masterModel`/`masterFamily`** — your own
    model — so independence is checked against you when you author a phase. Print the returned
@@ -48,8 +51,12 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
 4. **Execute each step, then `moa_step_report`** — the ONLY way to advance. Per step:
    - `spawn.kind: native` → launch the subagent with your host capability on the step's
      `model`/`effort`, scoped to the role's tools as far as the host allows.
-   - `spawn.kind: profile` → call `moa_spawn` with the role's prompt; inspect the normalized
-     result and actual workspace effects, then report the phase. The MCP server owns safe execution.
+   - `spawn.kind: profile` → call `moa_spawn` with the role's prompt; before launch the server
+     re-runs the bound tool's discovery against the tool's *current* inventory and confirms the
+     frozen model still resolves — drift between resolve-time and spawn-time surfaces as
+     `model_not_served`, not as a silent route through a stale assumption. Inspect the normalized
+     result and actual workspace effects, then report the phase. The MCP server owns safe
+     execution.
    - `isMaster: true` → the phase is yours (frame, finalize).
    - Report honestly: gate phases need the verifier's parseable verdict; producing phases need
      `changedFiles` and the **actual** `producerModel` (yourself included, if you authored).
@@ -87,7 +94,9 @@ verifier must differ from (that's why `masterModel` is passed).
   raw pages to a write-capable role.
 - **Verify producers by inspecting the workspace** (diff the cwd), never by the worker's
   self-report — then report `changedFiles` from what you saw.
-- **Fan out only disjoint write-sets**, each isolated; merge serially; serialize overlaps.
+- **`moa_tools` is live, not cached** — it runs the registered `modelDiscovery` recipe on every
+  call; the model inventory is never a stored field. A re-discovery of an already-bound tool
+  cannot quietly reintroduce a stored `models`/`listModels` snapshot.
 - **Speak plainly** — never expose internal vocabulary (binding, profile, registry, dispatch) or
   raw terminal-state names; translate to outcomes, lead with the next action
   (`references/init.md` → *Speak plainly*).
@@ -95,13 +104,33 @@ verifier must differ from (that's why `masterModel` is passed).
   reporting makes the grade real. A gate's REVISE is never advisory; you don't overrule it.
 
 ## Anti-patterns
-
+- Writing `.moa.yml` by hand (that's `moa_init`'s job, and only in `init` mode).
 - Acting before `moa_load`; deciding the next phase yourself instead of obeying `moa_step_report`.
 - Reporting a wrong/absent `producerModel` — it silently corrupts the independence check.
 - Narrowing/refusing a non-code task — map it to produce/verify roles.
-- Writing `.moa.yml` by hand (that's `moa_init`'s job, and only in `init` mode).
 - Hardcoding a CLI name/flag — that's profile data.
 - Presenting `done_unverified` as done, or a `self-check` grade as independent verification.
+
+## Routing example — model-level binding
+
+Binding is a model-level pin (a route the role picks through), not a role-level field:
+
+```yaml
+models:
+  opus-via-omp:
+    id: anthropic/claude-opus-4-8
+    family: claude
+    tags: [strong, vision]
+    effort: [high]
+    binding: omp                  # optional exact route pin: host-native or one learned tool name
+roles:
+  planner:
+    use: [opus-via-omp]           # role selects an alias; binding lives on the model entry
+```
+
+`roles.planner.binding` is never a valid field — the server schema rejects it. The
+exact same rule applies to `roles.<any>.binding` for every role; only `models.<alias>.binding`
+exists. Roles pick through `use`; tools are picked through `binding`, which belongs on the model.
 
 ## Fallback — tools unavailable
 
