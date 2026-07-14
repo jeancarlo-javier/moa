@@ -198,6 +198,7 @@ function resolveExecutable(bin, envPath = process.env.PATH ?? "") {
     : envPath.split(path.delimiter).filter(Boolean).map((dir) => path.join(dir, bin));
   for (const candidate of candidates) {
     try {
+      if (!fs.statSync(candidate).isFile()) continue;
       fs.accessSync(candidate, fs.constants.X_OK);
       return fs.realpathSync(candidate);
     } catch {}
@@ -469,6 +470,7 @@ export function opResolve({ hostModels = [], overrides = {} } = {}) {
     const useList = overrides[rname] ? [overrides[rname]] : role.use;
     for (const use of useList) {
       if (use === "auto") {
+        lastBindingPin = role.binding ?? null;
         const selected = autoPick(pool, { needTags, notGroups, role, subagents });
         sawModelWithoutRoute ||= selected.sawModelWithoutRoute;
         if (selected.model) {
@@ -881,6 +883,11 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
     return errorResult("master_phase", `phase '${phase}' belongs to the master`);
 
   const resolved = manifest.resolved[step.role];
+  if (!resolved)
+    return errorResult(
+      "role_unresolved",
+      `phase '${phase}' has no resolved role '${step.role}'`,
+    );
   if (resolved.binding === "host-native")
     return errorResult("native_spawn_required", "use the host's native subagent capability");
 

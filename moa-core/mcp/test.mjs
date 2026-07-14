@@ -205,6 +205,14 @@ t("tools: promptVia arg profiles are skipped", () => {
     item.tool === profile.tool && item.reason === "unsafe_prompt_transport"));
 });
 
+t("tools: executable directories are unavailable", () => {
+  const saved = opBindingSave({
+    profile: provenProfile({ tool: "directorycli", bin: TMP }),
+  });
+  assert.equal(saved.tool.available, false);
+  assert.equal(saved.tool.reason, "executable_not_found");
+});
+
 function writeRouteRepo(name, subagents = "auto", roleBinding = null) {
   const repo = path.join(TMP, name);
   fs.mkdirSync(repo, { recursive: true });
@@ -263,6 +271,23 @@ t("resolve: runtime.subagents filters routes", () => {
 
 t("resolve: an unavailable binding pin is diagnosed", () => {
   const repo = writeRouteRepo("route-bad-pin", "auto", "missingcli");
+  opLoad({ cwd: repo });
+  const result = opResolve({ hostModels: HOST });
+  assert.equal(result.diagnostics[0].state, "blocked_no_binding");
+  assert.match(result.diagnostics[0].hint, /missingcli/);
+});
+
+t("resolve: an auto role binding pin is named in diagnostics", () => {
+  const repo = path.join(TMP, "route-auto-bad-pin");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+roles:
+  worker:
+    use: [auto]
+    binding: missingcli
+pipelines: {}
+`);
   opLoad({ cwd: repo });
   const result = opResolve({ hostModels: HOST });
   assert.equal(result.diagnostics[0].state, "blocked_no_binding");
@@ -523,6 +548,61 @@ await ta("spawn: native and master phases remain host-owned", async () => {
     phase: "frame",
     prompt: "hello",
   })).code, "master_phase");
+});
+
+await ta("spawn: reports unresolved roles without throwing", async () => {
+  const repo = path.join(TMP, "spawn-unresolved-role");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+runtime:
+  subagents: external
+models:
+  ghost: { id: ghost-1, family: ghost }
+roles:
+  worker: { use: [ghost] }
+pipelines:
+  broken:
+    steps:
+      - { phase: work, role: worker }
+`);
+  opLoad({ cwd: repo });
+  const resolved = opResolve({ hostModels: HOST });
+  assert.equal(resolved.diagnostics[0].state, "blocked_no_binding");
+  const run = opRunStart({ task: "blocked role", pipeline: "broken" });
+  const result = await opSpawn({ runId: run.runId, phase: "work", prompt: "hello" });
+  assert.equal(result.code, "role_unresolved");
+});
+
+await ta("spawn: reports unavailable tools and model drift", async () => {
+  let profile = runnableProfile({ tool: "fake-gone" });
+  let run = startExternalRun(profile).run;
+  fs.rmSync(path.join(
+    process.env.MOA_HOME,
+    ".moa",
+    "bindings",
+    profile.tool,
+  ), { recursive: true, force: true });
+  assert.equal((await opSpawn({
+    runId: run.runId,
+    phase: "work",
+    prompt: "hello",
+  })).code, "tool_unavailable");
+
+  profile = runnableProfile({ tool: "fake-model-drift" });
+  run = startExternalRun(profile).run;
+  const drifted = runnableProfile({ tool: profile.tool });
+  drifted.models = [{
+    id: "vendor/other-9",
+    family: "fake",
+    tags: ["strong"],
+  }];
+  opBindingSave({ profile: drifted });
+  assert.equal((await opSpawn({
+    runId: run.runId,
+    phase: "work",
+    prompt: "hello",
+  })).code, "model_not_served");
 });
 
 await ta("spawn: extracts JSON and JSONL result paths", async () => {
