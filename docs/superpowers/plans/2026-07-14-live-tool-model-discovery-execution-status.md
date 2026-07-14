@@ -4,7 +4,7 @@
 **Worktree:** `/Users/jeancarlojavier/pr26/moa--feat-mcp`
 **Branch:** `feat/mcp`
 **Baseline commit:** `cbb0e7085881e584eb00328679061bd8bf9a27be`
-**Status:** Implementation and acceptance complete — Opus 4.8 approved the fix; final MOA reporting and branch disposition remain.
+**Status:** Complete and verified — MOA terminal `done`; branch and worktree preserved pending the user's integration choice.
 
 ## Source of truth
 
@@ -23,8 +23,8 @@
 
 - MOA run: `run-20260714-194000-54df`
 - Pipeline: `frame → implement → review → validate → finalize`
-- Current MOA phase: `implement` has not yet been reported because the complete plan is not finished.
-- The host exposed only one native model identity, so native critical-gate independence was unavailable. The final external Opus 4.8 review is intended to provide independent cross-model review.
+- MOA terminal: `done`; all five phases reported and both critical gates passed.
+- Independent verifier: `anthropic/claude-opus-4-8:xhigh` (different model family from the implementation producer).
 
 ## Completed work
 
@@ -141,7 +141,7 @@ All probes used isolated temporary directories and an isolated `MOA_HOME`; the u
 - [x] Required static contract searches passed: obsolete runtime reads absent, version synchronized, discovery/binding documentation present, templates empty.
 - [x] Worktree hygiene passed: clean status; `.omp-work` and `.omp-subagents.json` untracked/ignored; isolated dogfood state removed.
 - [x] External independent review: `anthropic/claude-opus-4-8:xhigh` **APPROVE**.
-- [ ] Report the remaining MOA phases and record the terminal state.
+- [x] MOA terminal `done`: `frame`, `implement`, `review`, `validate`, and `finalize` reported.
 - [ ] Use the development-branch finishing workflow; do not merge without the user's choice.
 
 ## Current deterministic evidence
