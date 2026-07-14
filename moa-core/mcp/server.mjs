@@ -272,30 +272,72 @@ const shortName = (id) => String(id).split("/").pop().split(":")[0];
 
 function candidatePool(cfg, bindings, hostModels) {
   const pool = [];
-  // dedupe by independence group: provider aliases collapse; first declaration wins (registry first)
-  const add = (m) => {
-    const group = independenceGroup(m.id);
-    const existing = pool.find((p) => p.group === group);
-    if (existing) { existing.sources.push(m.source); return; }
-    pool.push({ ...m, group, sources: [m.source] });
+  const byGroup = new Map();
+  let priority = 0;
+
+  const ensure = (model) => {
+    const group = independenceGroup(model.id);
+    let candidate = byGroup.get(group);
+    if (!candidate) {
+      candidate = {
+        shortName: model.shortName ?? shortName(model.id),
+        id: model.id,
+        family: model.family,
+        tags: model.tags ?? [],
+        context: model.context,
+        cost: model.cost,
+        priority: model.priority ?? priority++,
+        effort: model.effort,
+        group,
+        registryBinding: model.registryBinding,
+        sources: [],
+        routes: [],
+      };
+      byGroup.set(group, candidate);
+      pool.push(candidate);
+    }
+    candidate.sources.push(model.source);
+    return candidate;
   };
-  let i = 0;
+
+  const addRoute = (candidate, route) => {
+    if (!candidate.routes.some((item) =>
+      item.binding === route.binding && item.modelId === route.modelId))
+      candidate.routes.push(route);
+  };
+
   for (const [name, entry] of Object.entries(cfg?.models ?? {})) {
     if (entry.enabled === false) continue;
-    add({
-      shortName: name, id: entry.id ?? name, family: entry.family,
-      tags: entry.tags ?? [], context: entry.context, cost: entry.cost,
-      priority: entry.priority ?? i++, effort: entry.effort,
-      binding: entry.binding, source: "registry",
+    ensure({
+      shortName: name,
+      id: entry.id ?? name,
+      family: entry.family,
+      tags: entry.tags,
+      context: entry.context,
+      cost: entry.cost,
+      priority: entry.priority,
+      effort: entry.effort,
+      registryBinding: entry.binding,
+      source: "registry",
     });
   }
-  for (const b of bindings)
-    for (const m of b.models ?? [])
-      add({ shortName: shortName(m.id), id: m.id, family: m.family, tags: m.tags ?? [],
-            priority: 1000 + i++, binding: b.tool, source: `binding:${b.tool}` });
-  for (const m of hostModels ?? [])
-    add({ shortName: shortName(m.id), id: m.id, family: m.family, tags: m.tags ?? [],
-          context: m.context, priority: 2000 + i++, binding: "host-native", source: "host" });
+
+  for (const profile of bindings) {
+    for (const model of profile.models) {
+      const candidate = ensure({ ...model, source: `binding:${profile.tool}` });
+      addRoute(candidate, {
+        binding: profile.tool,
+        modelId: model.id,
+        source: `binding:${profile.tool}`,
+      });
+    }
+  }
+
+  for (const model of hostModels ?? []) {
+    const candidate = ensure({ ...model, source: "host" });
+    addRoute(candidate, { binding: "host-native", modelId: model.id, source: "host" });
+  }
+
   return pool;
 }
 
@@ -364,14 +406,30 @@ export function opLoad({ cwd = process.cwd() } = {}) {
   };
 }
 
-function autoPick(pool, { role, roleName, needTags, notGroups, cfg }) {
-  let c = pool.filter((m) => needTags.every((t) => (m.tags ?? []).includes(t)));
-  if (notGroups.size) c = c.filter((m) => !notGroups.has(m.group));
-  if (!c.length) return null;
+function selectRoute(candidate, bindingPin, subagents = "auto") {
+  const allowed = candidate.routes.filter((route) => {
+    if (subagents === "blocked") return false;
+    if (subagents === "native") return route.binding === "host-native";
+    if (subagents === "external") return route.binding !== "host-native";
+    return true;
+  });
+  if (bindingPin) return allowed.find((route) => route.binding === bindingPin) ?? null;
+  return allowed.find((route) => route.binding === "host-native") ?? allowed[0] ?? null;
+}
+
+function autoPick(pool, { needTags, notGroups, role, subagents }) {
+  const candidates = pool
+    .filter((model) => needTags.every((tag) => (model.tags ?? []).includes(tag)))
+    .filter((model) => !notGroups.has(model.group));
   const costRank = { cheap: 0, standard: 1, premium: 2 };
-  c.sort((a, b) =>
-    (costRank[a.cost] ?? 1) - (costRank[b.cost] ?? 1) || (a.priority - b.priority));
-  return c[0];
+  candidates.sort((a, b) =>
+    (costRank[a.cost] ?? 1) - (costRank[b.cost] ?? 1) || a.priority - b.priority);
+  for (const model of candidates) {
+    const bindingPin = role.binding ?? model.registryBinding;
+    const route = selectRoute(model, bindingPin, subagents);
+    if (route) return { model, route, sawModelWithoutRoute: false };
+  }
+  return { model: null, route: null, sawModelWithoutRoute: candidates.length > 0 };
 }
 
 export function opResolve({ hostModels = [], overrides = {} } = {}) {
@@ -385,43 +443,81 @@ export function opResolve({ hostModels = [], overrides = {} } = {}) {
   const hardTags = cfg.master?.hardVerificationTags ?? ["strong"];
   // criticality: a role is hard-verifier if any pipeline step running it has gate: critical
   const criticalRoles = new Set();
-  for (const p of Object.values(cfg.pipelines ?? {}))
-    for (const s of p.steps) if (s.gate === "critical") criticalRoles.add(s.role);
+  for (const pipeline of Object.values(cfg.pipelines ?? {}))
+    for (const step of pipeline.steps)
+      if (step.gate === "critical") criticalRoles.add(step.role);
 
   // resolve in dependency order: roles without differentModelFrom first
   const names = Object.keys(cfg.roles ?? {});
-  names.sort((a, b) => (cfg.roles[a].differentModelFrom ? 1 : 0) - (cfg.roles[b].differentModelFrom ? 1 : 0));
+  names.sort((a, b) =>
+    (cfg.roles[a].differentModelFrom ? 1 : 0) - (cfg.roles[b].differentModelFrom ? 1 : 0));
   const roles = {};
   const diagnostics = [];
+  const subagents = cfg.runtime?.subagents ?? "auto";
   for (const rname of names) {
     const role = cfg.roles[rname];
     const notGroups = new Set();
     if (role.differentModelFrom && roles[role.differentModelFrom])
       notGroups.add(roles[role.differentModelFrom].group);
     const needTags = criticalRoles.has(rname) ? hardTags : [];
-    let pick = null, reason = null;
+    let pick = null;
+    let route = null;
+    let reason = null;
+    let sawModelWithoutRoute = false;
+    let lastBindingPin = null;
     const useList = overrides[rname] ? [overrides[rname]] : role.use;
-    for (const u of useList) {
-      if (u === "auto") {
-        pick = autoPick(pool, { role, roleName: rname, needTags, notGroups, cfg });
-        if (pick) reason = `auto: ${needTags.length ? `tags [${needTags}] ` : ""}lowest-cost/priority pick`;
+    for (const use of useList) {
+      if (use === "auto") {
+        const selected = autoPick(pool, { needTags, notGroups, role, subagents });
+        sawModelWithoutRoute ||= selected.sawModelWithoutRoute;
+        if (selected.model) {
+          ({ model: pick, route } = selected);
+          reason = `auto: ${needTags.length ? `tags [${needTags}] ` : ""}lowest-cost/priority pick`;
+        }
       } else {
-        const m = pool.find((x) => x.shortName === u || x.id === u);
-        if (m && !notGroups.has(m.group)) { pick = m; reason = overrides[rname] ? "per-run override" : `pinned '${u}'`; }
-        else if (m) reason = `'${u}' skipped: same model as '${role.differentModelFrom}'`;
+        const model = pool.find((candidate) =>
+          candidate.shortName === use || candidate.id === use);
+        if (model && !notGroups.has(model.group)) {
+          lastBindingPin = role.binding ?? model.registryBinding ?? null;
+          const selectedRoute = selectRoute(model, lastBindingPin, subagents);
+          if (selectedRoute) {
+            pick = model;
+            route = selectedRoute;
+            reason = overrides[rname] ? "per-run override" : `pinned '${use}'`;
+          } else {
+            sawModelWithoutRoute = true;
+          }
+        } else if (model) {
+          reason = `'${use}' skipped: same model as '${role.differentModelFrom}'`;
+        }
       }
       if (pick) break;
     }
+
     if (!pick) {
-      diagnostics.push({ state: "blocked_no_model", role: rname, tried: useList, hint: "no candidate in registry/bindings/host cleared the constraints" });
+      diagnostics.push({
+        state: sawModelWithoutRoute ? "blocked_no_binding" : "blocked_no_model",
+        role: rname,
+        tried: useList,
+        hint: sawModelWithoutRoute
+          ? lastBindingPin
+            ? `binding '${lastBindingPin}' does not serve an eligible route for this model`
+            : `no ${subagents} subagent route serves this model`
+          : "no candidate cleared the model and independence constraints",
+      });
       continue;
     }
+
     const effort = role.effort ?? pick.effort ?? ["auto"];
     roles[rname] = {
-      model: pick.id, shortName: pick.shortName, family: pick.family ?? null,
-      group: pick.group, binding: role.binding ?? pick.binding ?? "host-native",
-      effort, effortRung: 0,
-      selectionReason: reason,
+      model: route.modelId,
+      shortName: pick.shortName,
+      family: pick.family ?? null,
+      group: pick.group,
+      binding: route.binding,
+      effort,
+      effortRung: 0,
+      selectionReason: `${reason}; route ${route.binding}`,
     };
   }
   state.resolved = { pool, roles, hardTags };
@@ -436,7 +532,14 @@ export function opResolve({ hostModels = [], overrides = {} } = {}) {
     effectiveConfig: path.join(wd, "effective-config.json"),
   };
 }
-const poolRow = (m) => ({ shortName: m.shortName, id: m.id, family: m.family ?? null, tags: m.tags, binding: m.binding ?? "host-native", source: m.sources.join("+") });
+const poolRow = (model) => ({
+  shortName: model.shortName,
+  id: model.id,
+  family: model.family ?? null,
+  tags: model.tags,
+  routes: model.routes.map((route) => ({ binding: route.binding, modelId: route.modelId })),
+  source: model.sources.join("+"),
+});
 
 // --- run state machine ----------------------------------------------------
 

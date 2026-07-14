@@ -15,6 +15,8 @@ const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opSpawnPr
 const HOST = [
   { id: "claude-opus-4-8", family: "claude", tags: ["strong"] },
   { id: "claude-sonnet-4-6", family: "claude", tags: ["strong", "cheap"] },
+  { id: "openai/gpt-5.5", family: "gpt", tags: ["strong"] },
+  { id: "minimax/MiniMax-M3", family: "minimax", tags: ["strong", "cheap"] },
 ];
 
 const provenProfile = (overrides = {}) => ({
@@ -173,7 +175,70 @@ t("tools: promptVia arg profiles are skipped", () => {
     item.tool === profile.tool && item.reason === "unsafe_prompt_transport"));
 });
 
+function writeRouteRepo(name, subagents = "auto", roleBinding = null) {
+  const repo = path.join(TMP, name);
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+runtime:
+  subagents: ${subagents}
+models:
+  fake: { id: fake-9, family: fake, tags: [strong] }
+roles:
+  worker:
+    use: [fake]
+${roleBinding ? `    binding: ${roleBinding}\n` : ""}pipelines: {}
+`);
+  return repo;
+}
+
 // --- resolve -----------------------------------------------------------------
+
+t("resolve: registry aliases use a registered external route", () => {
+  const repo = writeRouteRepo("route-external");
+  opLoad({ cwd: repo });
+  const result = opResolve({ hostModels: HOST });
+  assert.equal(result.roles.worker.model, "vendor/fake-9");
+  assert.equal(result.roles.worker.binding, "fakecli");
+  assert.equal(result.roles.worker.group, "fake-9");
+});
+
+t("resolve: host-native exists only when the host reports the model", () => {
+  const repo = writeRouteRepo("route-native");
+  opLoad({ cwd: repo });
+  const result = opResolve({
+    hostModels: [...HOST, { id: "host/fake-9", family: "fake", tags: ["strong"] }],
+  });
+  assert.equal(result.roles.worker.model, "host/fake-9");
+  assert.equal(result.roles.worker.binding, "host-native");
+});
+
+t("resolve: runtime.subagents filters routes", () => {
+  const nativeRepo = writeRouteRepo("route-native-only", "native");
+  opLoad({ cwd: nativeRepo });
+  assert.equal(opResolve({ hostModels: HOST }).diagnostics[0].state, "blocked_no_binding");
+
+  const externalRepo = writeRouteRepo("route-external-only", "external");
+  opLoad({ cwd: externalRepo });
+  assert.equal(opResolve({
+    hostModels: [...HOST, { id: "host/fake-9", family: "fake" }],
+  }).roles.worker.binding, "fakecli");
+
+  const blockedRepo = writeRouteRepo("route-blocked", "blocked");
+  opLoad({ cwd: blockedRepo });
+  assert.equal(opResolve({
+    hostModels: [...HOST, { id: "host/fake-9", family: "fake" }],
+  }).diagnostics[0].state, "blocked_no_binding");
+});
+
+t("resolve: an unavailable binding pin is diagnosed", () => {
+  const repo = writeRouteRepo("route-bad-pin", "auto", "missingcli");
+  opLoad({ cwd: repo });
+  const result = opResolve({ hostModels: HOST });
+  assert.equal(result.diagnostics[0].state, "blocked_no_binding");
+  assert.match(result.diagnostics[0].hint, /missingcli/);
+});
+
 
 t("resolve: pinned + auto + differentModelFrom honored", () => {
   opLoad({ cwd: REPO });
@@ -213,7 +278,9 @@ roles:
 pipelines: {}
 `);
   opLoad({ cwd: solo });
-  const r = opResolve({ hostModels: [] });
+  const r = opResolve({
+    hostModels: [{ id: "nowhere/ghost-1", family: "ghost", tags: ["strong"] }],
+  });
   assert.equal(r.roles.a.model, "nowhere/ghost-1");
   assert.equal(r.diagnostics[0].state, "blocked_no_model");
   assert.equal(r.diagnostics[0].role, "b");
