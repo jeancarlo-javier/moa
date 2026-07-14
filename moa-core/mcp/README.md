@@ -123,7 +123,7 @@ against the *currently loaded* profile:
 
 **Enforcement modes.** `strict`/`sandbox` fail closed: an unsupported compilation returns
 `tool_policy_unsupported` (`reason` one of `disable_all_unsupported`, `allow_list_unsupported`,
-`unmapped_tool` [+ `tool`], `deny_only_unsupported`) and the external process never launches.
+`unmapped_tool` [+ `tool`], `deny_only_unsupported`) and the agent task process never launches.
 `best-effort` launches without tool-list flags and returns `enforcement: { state: "degraded",
 reason, … }` instead — the degradation is explicit in both the result and the run manifest,
 never silent.

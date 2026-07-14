@@ -58,9 +58,10 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
      frozen model still resolves — drift between resolve-time and spawn-time surfaces as
      `model_not_served`, not as a silent route through a stale assumption. It then compiles the
      run's frozen role tool policy against the currently loaded binding's proven `toolControl`
-     adapter: `strict`/`sandbox` fail closed (`tool_policy_unsupported`) before anything launches
-     when the adapter can't express the policy; `best-effort` launches without tool-list flags and
-     reports the degradation explicitly in the result and the run manifest — never silently.
+     adapter: `strict`/`sandbox` fail closed (`tool_policy_unsupported`) before the agent task
+     launches when the adapter can't express the policy; `best-effort` launches without
+     tool-list flags and reports the degradation explicitly in the result and run manifest —
+     never silently.
      Inspect the normalized result and actual workspace effects, then report the phase. The MCP
      server owns safe execution.
    - `isMaster: true` → the phase is yours (frame, finalize).

@@ -248,11 +248,11 @@ these — it splices only `models` and each role's `use` list; the `toolPolicies
 role's `tools:` reference pass through the chosen template verbatim. What that canonical policy
 compiles into is a launcher-specific decision, made live at `moa_spawn` against the tool profile
 currently loaded for that role — never at init time, and never named here.
-`runtime.requireEnforcement` (`strict`/`sandbox`, most templates' default) fails a spawn closed
-before anything runs when the selected binding's learned profile can't express the role's
-policy; `best-effort` still launches but reports the degradation explicitly in the result and
-run manifest — never hidden. Host-native phases receive the same frozen policy only as a
-request: the host, not the server, is responsible for applying it.
+`runtime.requireEnforcement: strict` or `sandbox`, when configured, fails a spawn closed before
+the agent task launches when the selected binding's learned profile can't express the role's
+policy; `best-effort` (the schema default) still launches but reports the degradation explicitly
+in the result and run manifest — never hidden. Host-native phases receive the same frozen policy
+only as a request: the host, not the server, is responsible for applying it.
 
 ## Stay agnostic
 Never write a CLI name, flag, or command into `.moa.yml` or your reasoning. The `models`
