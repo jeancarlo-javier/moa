@@ -4,7 +4,7 @@
 **Worktree:** `/Users/jeancarlojavier/pr26/moa--feat-mcp`
 **Branch:** `feat/mcp`
 **Baseline commit:** `cbb0e7085881e584eb00328679061bd8bf9a27be`
-**Status:** In progress — Tasks 1–3 are complete; the Opus 4.8 blocking finding is fixed and one re-review remains.
+**Status:** Implementation and acceptance complete — Opus 4.8 approved the fix; final MOA reporting and branch disposition remain.
 
 ## Source of truth
 
@@ -98,17 +98,20 @@ Resolution:
 - Updated the former cosmetic group assertion from `fake` to `fake-9`.
 - Commit: `f9d98be fix(mcp): preserve sibling model independence`.
 - Post-fix focused suite: **55 checks passed**, exit 0.
+- Re-review result: `.omp-work/results/opus-4-8-rereview.md`.
+- Final Opus verdict: **APPROVE**.
+- Opus confirmed the regression fails under the removed heuristic, passes with exact selector grouping, duplicate aliases still share one group, distinct sibling selectors remain independent, and provider/effort normalization remains intact.
 
 Opus also reported low-priority duplicate test coverage, sync `opInit` awaited by callers, and redundant `discovery.error || discovery.code` disjuncts. They are nonblocking and intentionally left unchanged to avoid unrelated cleanup.
 
-## Current review and remaining work
+## Final acceptance
 
-### Finish Opus 4.8 review
+### Opus 4.8 review — complete
 
-1. Regenerate the branch review patch through `f9d98be`.
-2. Request one read-only re-review from `anthropic/claude-opus-4-8:xhigh`, focused on the independence fix and regression.
-3. If approved, record the final verdict here and complete the final gates.
-4. If revised, fix only a new blocking correctness or contract finding.
+1. Initial verdict: **REVISE** with one blocking correctness finding.
+2. Blocking finding fixed in `f9d98be` with a red/green regression.
+3. Re-review model: `anthropic/claude-opus-4-8:xhigh`.
+4. Final verdict: **APPROVE** with no new blocking correctness, safety, or contract regression.
 
 ### Task 3 — Installed-CLI dogfood and final acceptance — complete
 
@@ -134,12 +137,12 @@ All probes used isolated temporary directories and an isolated `MOA_HOME`; the u
 
 ### Final gates
 
-1. Run the focused deterministic suite after all changes.
-2. Run required static contract searches.
-3. Confirm worktree contains no accidental `.omp-subagents.json`, `.omp-work`, debug logs, inventory files, temporary MOA homes, or scratch projects in tracked output.
-4. Report the MOA `implement`, `review`, `validate`, and `finalize` phases honestly; identify the actual external review model.
-5. Update this document with final commits, Opus verdict, Task 3 evidence, and terminal state.
-6. Use the development-branch finishing workflow; do not merge without the user's choice.
+- [x] Focused deterministic suite after the code fix: **55 checks passed**, exit 0.
+- [x] Required static contract searches passed: obsolete runtime reads absent, version synchronized, discovery/binding documentation present, templates empty.
+- [x] Worktree hygiene passed: clean status; `.omp-work` and `.omp-subagents.json` untracked/ignored; isolated dogfood state removed.
+- [x] External independent review: `anthropic/claude-opus-4-8:xhigh` **APPROVE**.
+- [ ] Report the remaining MOA phases and record the terminal state.
+- [ ] Use the development-branch finishing workflow; do not merge without the user's choice.
 
 ## Current deterministic evidence
 
