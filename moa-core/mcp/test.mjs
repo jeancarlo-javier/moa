@@ -122,7 +122,7 @@ models:
   gpt: { id: openai/gpt-5.5, family: gpt, tags: [strong], effort: [medium, xhigh] }
   mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong, cheap], cost: cheap }
 roles:
-  planner: { use: [opus, auto] }
+  planner: { use: [opus, auto], effort: [low, high] }
   coder: { use: [mini] }
   reviewer: { use: [gpt, auto], differentModelFrom: planner }
   verifier: { use: [gpt, auto], differentModelFrom: coder }
@@ -147,6 +147,14 @@ t("load: config found from a subdirectory (walk up)", () => {
   const sub = path.join(REPO, "src", "deep");
   fs.mkdirSync(sub, { recursive: true });
   assert.equal(opLoad({ cwd: sub }).configPath, path.join(REPO, ".moa.yml"));
+});
+
+t("load: an empty roles map is rejected, matching the JSON schema", () => {
+  // the JSON schema says minProperties: 1; zod must not quietly accept roles: {}
+  const dir = path.join(TMP, "no-roles");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".moa.yml"), "schemaVersion: 1\nroles: {}\n");
+  assert.ok(opLoad({ cwd: dir }).errors, "roles: {} loaded without error");
 });
 
 t("load: every removed tool-policy key is rejected, not silently ignored", () => {
@@ -677,14 +685,30 @@ await ta("step_report: gate without verdict rejected", async () => {
 });
 
 await ta("gate REVISE loops back and climbs the effort ladder", async () => {
-  const { runId } = await freshRun();
-  opStepReport({ runId, phase: "plan", summary: "planned" });
-  const r = opStepReport({ runId, phase: "review-plan", verdict: "REVISE", summary: "missing edge case" });
+  const run = await freshRun();
+  // planner declares effort: [low, high] — rung 0 before any loop-back.
+  assert.equal(run.next.effort, "low");
+  opStepReport({ runId: run.runId, phase: "plan", summary: "planned" });
+  const r = opStepReport({ runId: run.runId, phase: "review-plan", verdict: "REVISE", summary: "missing edge case" });
   assert.equal(r.looped, true);
   assert.equal(r.next.phase, "plan");
-  opStepReport({ runId, phase: "plan", summary: "replanned" });
-  const gate = opStepReport({ runId, phase: "plan", summary: "dup" });
+  // the point of the loop-back: retry the same phase with more thinking.
+  assert.equal(r.next.effort, "high");
+  opStepReport({ runId: run.runId, phase: "plan", summary: "replanned" });
+  const gate = opStepReport({ runId: run.runId, phase: "plan", summary: "dup" });
   assert.ok(gate.error);
+});
+
+await ta("effort ladder clamps at its top rung, never past the end", async () => {
+  const run = await freshRun();
+  opStepReport({ runId: run.runId, phase: "plan", summary: "planned" });
+  let r = opStepReport({ runId: run.runId, phase: "review-plan", verdict: "REVISE", summary: "again" });
+  assert.equal(r.next.effort, "high");
+  opStepReport({ runId: run.runId, phase: "plan", summary: "replanned" });
+  // second REVISE: loops = 2 but the ladder only has 2 rungs — stay on the top one.
+  r = opStepReport({ runId: run.runId, phase: "review-plan", verdict: "REVISE", summary: "still" });
+  assert.equal(r.looped, true);
+  assert.equal(r.next.effort, "high");
 });
 
 await ta("maxGateLoops exceeded → terminal with blocker", async () => {

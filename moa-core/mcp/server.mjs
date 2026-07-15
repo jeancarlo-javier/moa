@@ -60,7 +60,6 @@ const zRole = z.object({
   use: z.array(z.string()).min(1),
   effort: zEffort.optional(),
   instructions: z.string().optional(),
-  instructionsFile: z.string().optional(),
   differentModelFrom: z.string().optional(),
 }).strict();
 
@@ -102,7 +101,10 @@ const zConfig = z.object({
     hardVerificationTags: z.array(z.string()).optional(),
     instructions: z.string().optional(),
   }).strict().optional(),
-  roles: z.record(z.string(), zRole).optional(),
+  // mirrors schema/config.schema.json: roles may be absent, but never an empty map
+  roles: z.record(z.string(), zRole).refine((r) => Object.keys(r).length > 0, {
+    message: "must declare at least one role",
+  }).optional(),
   pipelines: z.record(z.string(), zPipeline).optional(),
 }).strict();
 
@@ -505,7 +507,7 @@ export function opLoad({ cwd = process.cwd() } = {}) {
     schemaVersion: cfg.schemaVersion,
     roles: Object.fromEntries(Object.entries(cfg.roles ?? {}).map(([n, r]) => [n, {
       use: r.use, differentModelFrom: r.differentModelFrom,
-      instructions: r.instructions ?? (r.instructionsFile ?? null),
+      instructions: r.instructions ?? null,
     }])),
     models: cfg.models ?? {},
     pipelines: Object.fromEntries(Object.entries(cfg.pipelines ?? {}).map(([n, p]) => [n, {

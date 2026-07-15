@@ -105,7 +105,6 @@
           "effort": { "type": "array", "items": { "type": "string" }, "minItems": 1,
             "description": "Optional per-role reasoning/thinking effort — ALWAYS an array, same shape and rules as models.<name>.effort. A single-element array pins (e.g. ['high']); a multi-element ascending array is an escalation ladder climbed one rung per gate loop-back. Overrides the model's 'effort' and any ':<effort>' suffix baked into its id/key; ignored by models without effort control." },
           "instructions": { "type": "string" },
-          "instructionsFile": { "type": "string" },
           "differentModelFrom": { "type": "string", "description": "Role name whose resolved model this role must differ from (different family preferred)." }
         },
         "required": ["use"]
