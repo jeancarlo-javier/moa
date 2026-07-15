@@ -782,6 +782,20 @@ function runChild({ bin, args, cwd, stdin, timeoutSeconds }) {
 
 // --- run state machine ----------------------------------------------------
 
+// The only statuses a manifest may carry, and the single source of truth for them:
+// saveRun refuses anything else, and moa_step_report's description is generated from
+// this map — so a client never has to guess the list, and the list cannot drift from
+// the code that assigns it.
+const RUN_STATUS = Object.freeze({
+  running: "mid-pipeline; not terminal",
+  done: "finished clean — nothing was mutated, or a critical gate approved after the last change",
+  done_unverified: "finished, but the last repo mutation was never covered by a passed critical gate",
+  max_loops_exceeded: "a gate returned REVISE more times than maxGateLoops allows",
+  blocked_verifier_disagreement: "a gate returned BLOCKED; needs an independent arbiter",
+  verification_unavailable: "the next gate has no independent verifier to route to",
+});
+const TERMINAL_STATUS = Object.entries(RUN_STATUS).filter(([s]) => s !== "running");
+
 function runDir(runId) {
   if (!state.loaded) throw new Error("call moa_load first");
   const wd = workDirOf(state.loaded);
@@ -793,6 +807,8 @@ function loadRun(runId) {
   return JSON.parse(fs.readFileSync(p, "utf8"));
 }
 function saveRun(m) {
+  if (!Object.hasOwn(RUN_STATUS, m.status))
+    throw new Error(`unknown run status '${m.status}' — must be one of ${Object.keys(RUN_STATUS).join(", ")}`);
   const d = runDir(m.runId);
   fs.mkdirSync(d, { recursive: true });
   fs.writeFileSync(path.join(d, "manifest.json"), JSON.stringify(m, null, 2) + "\n");
@@ -871,6 +887,12 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } 
   if (steps) {
     const v = z.array(zStep).min(1).safeParse(steps);
     if (!v.success) return { error: "invalid steps: " + v.error.issues.map((i) => i.message).join("; ") };
+    // The same rule the loader enforces on config pipelines (see 'duplicate phase' above):
+    // a phase name identifies a step, and finish(), loopBackTo and the loop counters all key
+    // on it. Ad-hoc steps skipped this, so a duplicate name let a plain phase inherit an
+    // earlier step's critical gate tier and falsely certify an ungated write.
+    const dupe = steps.map((s) => s.phase).find((p, i, all) => all.indexOf(p) !== i);
+    if (dupe) return { error: `duplicate phase '${dupe}' in steps — phase names must be unique within a run` };
     for (const s of steps)
       if (s.role !== "master" && !state.resolved.roles[s.role])
         return { error: `steps name unresolved role '${s.role}' — declare it in .moa.yml or resolve it first` };
@@ -930,13 +952,20 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
   if (usage) manifest.usage.push({ phase, ...usage });
 
   const finish = () => {
-    const mutated = manifest.phases.some((p) => p.changedFiles?.length);
-    const criticalPassed = manifest.steps.some((s, i) => s.gate === "critical" &&
-      manifest.phases.some((p) => p.phase === s.phase && p.verdict === "APPROVE"));
-    if (mutated && !criticalPassed) {
+    // The mutation floor (references/anti-self-certification.md): every repo mutation must be
+    // covered by a passed critical gate, and coverage is ORDERED — a gate can only vouch for
+    // what already existed when it ran. So the last mutation must be followed by an approved
+    // critical gate. Two unordered existence checks ("something mutated" AND "some gate
+    // approved") let a write land after the gate and still finish 'done'.
+    const lastMutation = manifest.phases.findLastIndex((p) => p.changedFiles?.length);
+    const coveredByCriticalGate = () => manifest.phases.some((p, i) =>
+      i > lastMutation && p.verdict === "APPROVE" &&
+      manifest.steps.find((s) => s.phase === p.phase)?.gate === "critical");
+    if (lastMutation >= 0 && !coveredByCriticalGate()) {
       manifest.status = "done_unverified";
       saveRun(manifest);
-      return { terminal: manifest.status, label: "unverified inline mode — repo mutated without a passed critical gate", runId };
+      return { terminal: manifest.status, runId,
+        label: "unverified — the repo was mutated with no passed critical gate covering the last change" };
     }
     manifest.status = "done";
     saveRun(manifest);
@@ -1220,7 +1249,9 @@ async function startMcp() {
 
   server.tool(
     "moa_step_report",
-    "Report the current phase's outcome; the server records it and returns the NEXT step or a terminal state. Enforced here (not by you): gates need a verdict; REVISE loops back (maxGateLoops capped, effort ladder climbs); verifier independence is checked against the actual producer; a mutated repo without a passed critical gate finishes labeled 'unverified'. Never decide the next phase yourself.",
+    "Report the current phase's outcome; the server records it and returns the NEXT step or a terminal state. Enforced here (not by you): gates need a verdict; REVISE loops back (maxGateLoops capped, effort ladder climbs); verifier independence is checked against the actual producer; a mutated repo without a passed critical gate finishes labeled 'unverified'. Never decide the next phase yourself. " +
+      `A REVISE loop is NOT a terminal state — the run stays 'running'. The terminal states are exactly: ${
+        TERMINAL_STATUS.map(([s, why]) => `'${s}' (${why})`).join("; ")}.`,
     {
       runId: z.string(),
       phase: z.string().describe("the phase being reported — must be the current one"),

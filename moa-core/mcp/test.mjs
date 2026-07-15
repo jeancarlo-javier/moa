@@ -750,6 +750,113 @@ await ta("gate BLOCKED → blocked_verifier_disagreement", async () => {
   assert.equal(r.terminal, "blocked_verifier_disagreement");
 });
 
+// RUN_STATUS declares six statuses; before these two, a probe showed the suite only ever
+// wrote four. done_unverified was reachable in production (an ungated pipeline whose worker
+// writes a file) with nothing asserting it, and verification_unavailable needs strict mode,
+// which no test config had.
+await ta("mutation with no critical gate → done_unverified", async () => {
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  const { runId } = opRunStart({
+    task: "gather facts into an artifact",
+    steps: [{ phase: "gather", role: "coder" }],
+    masterModel: "host/master", masterFamily: "host",
+  });
+  const r = opStepReport({
+    runId, phase: "gather", summary: "wrote the artifact",
+    changedFiles: ["research-facts.json"],
+    producerModel: "minimax/MiniMax-M3", producerFamily: "minimax",
+  });
+  assert.equal(r.terminal, "done_unverified");
+  assert.match(r.label, /mutated with no passed critical gate/);
+});
+
+await ta("ad-hoc steps reject duplicate phase names", async () => {
+  // Config pipelines are loader-checked for this; ad-hoc steps were not. A duplicate name let
+  // a gate:none phase inherit an earlier step's critical tier, and an ungated write finished 'done'.
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  const r = opRunStart({
+    task: "duplicate phase names",
+    steps: [
+      { phase: "check", role: "verifier", gate: "critical" },
+      { phase: "execute", role: "coder" },
+      { phase: "check", role: "coder" },
+    ],
+    masterModel: "host/master", masterFamily: "host",
+  });
+  assert.match(r.error, /duplicate phase 'check'/);
+});
+
+await ta("write landing after the last critical gate → done_unverified", async () => {
+  // The floor is ordered: a gate can only vouch for what existed when it ran. This finished
+  // as 'done' while b.js had passed no gate at all, because the check was two unordered
+  // existence tests ("something mutated" AND "some critical gate approved").
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  const { runId } = opRunStart({
+    task: "write, gate, then write again",
+    steps: [
+      { phase: "execute", role: "coder" },
+      { phase: "validate", role: "verifier", gate: "critical" },
+      { phase: "execute2", role: "coder" },
+    ],
+    masterModel: "host/master", masterFamily: "host",
+  });
+  const mut = { producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" };
+  opStepReport({ runId, phase: "execute", summary: "wrote a", changedFiles: ["a.js"], ...mut });
+  opStepReport({ runId, phase: "validate", verdict: "APPROVE", summary: "a.js is fine" });
+  const r = opStepReport({ runId, phase: "execute2", summary: "wrote b after the gate", changedFiles: ["b.js"], ...mut });
+  assert.equal(r.terminal, "done_unverified");
+  assert.match(r.label, /covering the last change/);
+});
+
+await ta("no mutation, no gate → plain done ('done' is not a verification claim)", async () => {
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  const { runId } = opRunStart({
+    task: "answer a read-only question",
+    steps: [{ phase: "gather", role: "coder" }],
+    masterModel: "host/master", masterFamily: "host",
+  });
+  const r = opStepReport({
+    runId, phase: "gather", summary: "answered; wrote nothing",
+    producerModel: "minimax/MiniMax-M3", producerFamily: "minimax",
+  });
+  assert.equal(r.terminal, "done");
+  assert.deepEqual(r.gatesPassed, []);
+});
+
+await ta("strict mode + critical gate + no independent verifier → verification_unavailable", async () => {
+  const srepo = path.join(TMP, "strict-repo");
+  fs.mkdirSync(srepo, { recursive: true });
+  fs.writeFileSync(path.join(srepo, ".moa.yml"), `
+schemaVersion: 1
+master:
+  mode: strict
+models:
+  mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong] }
+roles:
+  coder: { use: [mini] }
+  verifier: { use: [mini] }
+pipelines:
+  build:
+    steps:
+      - { phase: execute, role: coder }
+      - { phase: validate, role: verifier, gate: critical }
+`);
+  opLoad({ cwd: srepo });
+  await opResolve({ hostModels: HOST });
+  const { runId } = opRunStart({ task: "t", pipeline: "build", masterModel: "host/master", masterFamily: "host" });
+  // producer and verifier both resolve to mini → self-check → strict halts rather than pretend
+  const r = opStepReport({
+    runId, phase: "execute", summary: "coded", changedFiles: ["a.js"],
+    producerModel: "minimax/MiniMax-M3", producerFamily: "minimax",
+  });
+  assert.equal(r.terminal, "verification_unavailable");
+  assert.equal(r.step.independence.grade, "self-check");
+});
+
 await ta("finished run refuses further reports", async () => {
   const { runId } = await freshRun();
   opStepReport({ runId, phase: "plan", summary: "p" });
@@ -1143,7 +1250,10 @@ await ta("tools/list: every param declares a JSON Schema type", async () => {
   }).finally(() => srv.kill());
 
   assert.ok(tools.length >= 8, `expected the full tool set, got ${tools.length}`);
-  const typed = (s) => s.type || s.$ref || s.anyOf || s.allOf || s.oneOf || s.enum || s.const;
+  // Deliberately strict: a bare enum/const/combinator is not a declared type, and the
+  // ambiguity is the whole bug. Every param carries a literal type today, so if a future
+  // one does not, that should fail here and be thought about.
+  const typed = (s) => s.type || s.$ref;
   for (const tool of tools)
     for (const [param, schema] of Object.entries(tool.inputSchema?.properties ?? {}))
       assert.ok(typed(schema), `${tool.name}.${param} has no JSON Schema type — clients will send it as a string`);
@@ -1153,6 +1263,14 @@ await ta("tools/list: every param declares a JSON Schema type", async () => {
   assert.equal(profile.type, "object");
   assert.deepEqual(profile.required.sort(),
     ["bin", "capabilities", "evidence", "modelDiscovery", "run", "tool"]);
+
+  // Terminal states must be discoverable from the tool itself. When they were not, a
+  // client invented a plausible-looking list (with 'revise' and 'blocked', neither real).
+  const report = tools.find((t) => t.name === "moa_step_report").description;
+  for (const status of ["done", "done_unverified", "max_loops_exceeded",
+                        "blocked_verifier_disagreement", "verification_unavailable"])
+    assert.ok(report.includes(`'${status}'`), `moa_step_report does not name '${status}'`);
+  assert.ok(/REVISE loop is NOT a terminal state/.test(report));
 });
 
 console.log(`\n${n} checks passed`);

@@ -73,8 +73,13 @@ the most capable — different-model independence still holds either way.
 
 Right-sizing lets trivial, **non-mutating** tasks answer inline. But **any repo mutation**
 must pass a **`gate: critical`** verification, at the best grade the ladder allows. There is no
-opt-out: a run that mutated the repo without a passed critical gate finishes as
-`done_unverified`, labeled **"unverified inline mode"** so no one mistakes it for verified work.
+opt-out: a run whose mutations are not covered by a passed critical gate finishes as
+`done_unverified`, labeled **"unverified — the repo was mutated with no passed critical gate
+covering the last change"** so no one mistakes it for verified work.
+
+Coverage is **ordered**: a gate vouches only for what existed when it ran, so the gate must
+follow the last write. A pipeline that writes *after* its critical gate is not verified — that
+write passed no gate — and finishes `done_unverified` no matter how many gates ran earlier.
 
 ## On disagreement
 
