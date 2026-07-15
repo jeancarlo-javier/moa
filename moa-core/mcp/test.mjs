@@ -1113,4 +1113,46 @@ await ta("init: unknown template rejected", async () => {
   assert.ok(r.error.includes("unknown template"));
 });
 
+// Every check above calls the ops directly, so none of them sees the tool boundary:
+// a param declared z.any() emits JSON Schema {} — no "type" — and MCP clients then
+// transport it as a string, making the tool uncallable while the suite stays green.
+await ta("tools/list: every param declares a JSON Schema type", async () => {
+  const { spawn } = await import("node:child_process");
+  const srv = spawn("node", [path.join(import.meta.dirname, "server.mjs")], {
+    stdio: ["pipe", "pipe", "ignore"],
+  });
+  const send = (o) => srv.stdin.write(JSON.stringify(o) + "\n");
+  const tools = await new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error("tools/list timed out")), 10_000);
+    let buf = "";
+    srv.stdout.on("data", (d) => {
+      buf += d;
+      const lines = buf.split("\n");
+      buf = lines.pop();
+      for (const line of lines) {
+        const m = JSON.parse(line);
+        if (m.id === 1) {
+          send({ jsonrpc: "2.0", method: "notifications/initialized" });
+          send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
+        }
+        if (m.id === 2) { clearTimeout(timer); resolve(m.result.tools); }
+      }
+    });
+    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
+      protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } } });
+  }).finally(() => srv.kill());
+
+  assert.ok(tools.length >= 8, `expected the full tool set, got ${tools.length}`);
+  const typed = (s) => s.type || s.$ref || s.anyOf || s.allOf || s.oneOf || s.enum || s.const;
+  for (const tool of tools)
+    for (const [param, schema] of Object.entries(tool.inputSchema?.properties ?? {}))
+      assert.ok(typed(schema), `${tool.name}.${param} has no JSON Schema type — clients will send it as a string`);
+
+  // the regression that motivated this: profile must arrive as a real object
+  const profile = tools.find((t) => t.name === "moa_binding_save").inputSchema.properties.profile;
+  assert.equal(profile.type, "object");
+  assert.deepEqual(profile.required.sort(),
+    ["bin", "capabilities", "evidence", "modelDiscovery", "run", "tool"]);
+});
+
 console.log(`\n${n} checks passed`);

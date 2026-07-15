@@ -1266,7 +1266,7 @@ async function startMcp() {
   server.tool(
     "moa_binding_save",
     "Validate, discover (live), and persist a learn-tool profile to ~/.moa/bindings/<tool>/profile.yml. Refuses in code any profile whose evidence lacks modelDiscovery+T1+T2+T4 = pass, or that lacks promptSafe: true / canSelectModel: true, or whose run.argv names any placeholder beyond {bin} {model} {promptFile} {cwd} {maxTime}. Runs the discovery recipe once before persistence to confirm the model inventory currently served by the tool. The saved profile contains only run/output/capability metadata — never the resolved model list.",
-    { profile: z.any().describe("the full profile object per references/learn-tool.md") },
+    { profile: zProfile.describe("the full profile object per references/learn-tool.md") },
     async (a) => json(await opBindingSave(a))
   );
 
