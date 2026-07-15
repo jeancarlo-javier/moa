@@ -6,7 +6,9 @@ hard work**. This is the skill's top safety invariant (`master.selfCertification
 
 ## The rule
 
-- Every phase result carries `verdict` + `verifiedBy` + `confidence`.
+- Every phase result carries a `verdict`, and names the model that produced it
+  (`producerModel`) — when it does not, moa reads the phase as the model it routed that role
+  to. Naming it matters: it is what a gate's independence is judged against.
 - The master MAY accept low-stakes, non-mutating results on its own judgment.
 - Any phase with `gate: standard` or `gate: critical` REQUIRES an independent verification
   before it can pass. The master may **reject** a gate result, but it may **never replace a
@@ -17,6 +19,13 @@ hard work**. This is the skill's top safety invariant (`master.selfCertification
 Discovery returns normalized metadata per model: `{ provider, modelFamily, modelId,
 capabilityTier, independenceGroup }`. **`independenceGroup` identifies the underlying MODEL,
 collapsing provider aliases** — two routes to one model cannot pose as independent verification.
+It collapses the `provider/` prefix and any `:effort` suffix, which covers the canonical
+`vendor/model` ids moa asks for. It does **not** decode vendor-decorated ids: a deployment
+string like `bedrock/us.anthropic.claude-sonnet-4-6-v1:0` will not collapse onto
+`anthropic/claude-sonnet-4-6`, and the two would grade as independent though they are one model.
+Correct collapsing needs an explicit alias table, not a prefix-stripping guess that could fuse
+genuinely different models — until there is one, **give aliases of the same model the same
+canonical id in `models:`** rather than trusting the grader to see through them.
 Independence keys on the **model, never the family**: a verifier must have a **different
 `independenceGroup`** than the producer — Opus checking Sonnet's work is independent; Sonnet
 checking Sonnet's (any provider, any fresh context) is not. Family is a **preference, not the
@@ -80,6 +89,25 @@ covering the last change"** so no one mistakes it for verified work.
 Coverage is **ordered**: a gate vouches only for what existed when it ran, so the gate must
 follow the last write. A pipeline that writes *after* its critical gate is not verified — that
 write passed no gate — and finishes `done_unverified` no matter how many gates ran earlier.
+
+Coverage also requires the gate to be **real**, and it is judged **per write, against the model
+that wrote it** — not against the phase the gate nominally reviews, and not against the run as a
+whole. A gate clears only the writes whose author it differs from: two writers therefore cannot
+cover for each other (a gate independent of the *last* writer still cannot certify what it wrote
+itself earlier), a loop-back whose rework names a different model does not launder the original
+author's own APPROVE, and the master is never an independent verifier whatever model it runs.
+Outside `strict` (which halts at `verification_unavailable`) the run still completes — `auto`
+degrades rather than blocks — but it finishes `done_unverified`, labeled with the reason.
+
+## What the floor rests on
+
+moa enforces these rules over what the master **reports** — the phases, their verdicts, the
+models that produced them, and the files a phase declares in `changedFiles`. It does not read
+the working tree, and it cannot see whether a verifier was ever actually spawned. A master that
+omits `changedFiles`, or reports an `APPROVE` from a verifier that never ran, defeats the floor
+by lying to it rather than by finding a hole in it. `moa_spawn` is what makes routing
+observable; the floor is exactly as honest as the reports it is handed. This is the boundary of
+the guarantee, and it is the reason the master is instructed never to author its own gate.
 
 ## On disagreement
 

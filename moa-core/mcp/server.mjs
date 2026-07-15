@@ -952,20 +952,43 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
   if (usage) manifest.usage.push({ phase, ...usage });
 
   const finish = () => {
-    // The mutation floor (references/anti-self-certification.md): every repo mutation must be
-    // covered by a passed critical gate, and coverage is ORDERED — a gate can only vouch for
-    // what already existed when it ran. So the last mutation must be followed by an approved
-    // critical gate. Two unordered existence checks ("something mutated" AND "some gate
-    // approved") let a write land after the gate and still finish 'done'.
-    const lastMutation = manifest.phases.findLastIndex((p) => p.changedFiles?.length);
-    const coveredByCriticalGate = () => manifest.phases.some((p, i) =>
-      i > lastMutation && p.verdict === "APPROVE" &&
-      manifest.steps.find((s) => s.phase === p.phase)?.gate === "critical");
-    if (lastMutation >= 0 && !coveredByCriticalGate()) {
+    // The mutation floor (references/anti-self-certification.md): every write must be covered by
+    // a passed critical gate independent of THE MODEL THAT WROTE IT, and coverage is ORDERED —
+    // a gate vouches only for what existed when it ran. So walk the run carrying the authors of
+    // writes nothing has vouched for; each passed critical gate clears the authors it differs
+    // from; whatever is left was never verified, however many gates ran. Asking one summary
+    // question instead ("was the LAST write covered?") let two writers cover for each other:
+    // mini writes a.js, gpt writes b.js, mini gates — independent of gpt, yet a.js is mini's.
+    // A phase's model: the one the reporter named, else the model moa routed that role to, else
+    // (for the master) itself — the same fallback producerFor uses. Without that last case a
+    // master that right-sizes a write reads as an unknown author, which nothing can be
+    // independent of, and a run its verifier really did check would finish 'unverified'.
+    const modelOf = (p) => p?.producerModel ??
+      (p?.role === "master" ? manifest.masterModel : manifest.resolved[p?.role]?.model) ?? null;
+    const gateOf = (p) => manifest.steps.find((s) => s.phase === p.phase)?.gate ?? "none";
+    let uncovered = [];        // models whose writes no gate has vouched for
+    let gateFellShort = false; // a gate ran and still could not vouch for them
+    for (const p of manifest.phases) {
+      // The master is never an independent verifier, whatever model it names: it may never be
+      // the final word on a gate. Clear before recording this phase's own writes — a gate
+      // cannot vouch for a change it made itself.
+      if (gateOf(p) === "critical" && p.verdict === "APPROVE" && p.role !== "master") {
+        const verifier = modelOf(p);
+        uncovered = uncovered.filter((author) => !(verifier && author &&
+          independenceGroup(verifier) !== independenceGroup(author)));
+        if (uncovered.length) gateFellShort = true;
+      }
+      if (p.changedFiles?.length) uncovered.push(modelOf(p));
+    }
+    if (uncovered.length) {
       manifest.status = "done_unverified";
       saveRun(manifest);
+      // Name the reason: "no gate ran" and "a gate ran but was the author's own model" call for
+      // different fixes, and conflating them is how a fake gate reads as a missing one.
       return { terminal: manifest.status, runId,
-        label: "unverified — the repo was mutated with no passed critical gate covering the last change" };
+        label: gateFellShort
+          ? "unverified — a critical gate approved a change written by its own model: nothing can certify its own work"
+          : "unverified — the repo was mutated with no passed critical gate covering the last change" };
     }
     manifest.status = "done";
     saveRun(manifest);

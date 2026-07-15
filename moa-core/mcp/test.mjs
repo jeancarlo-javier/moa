@@ -202,7 +202,11 @@ pipelines:
       - { phase: x, role: a, loopBackTo: zz }
 `);
   const r = opLoad({ cwd: bad });
-  assert.ok(r.errors.length >= 3, JSON.stringify(r.errors));
+  // Assert each validator fired by name. A count (>= 3) passes with any one of them deleted —
+  // this YAML trips four, so the check had a whole validator's worth of slack in it.
+  const all = JSON.stringify(r.errors);
+  for (const expected of [/ghost/, /nobody/, /duplicate phase 'x'/, /zz/])
+    assert.match(all, expected);
 });
 
 
@@ -521,8 +525,12 @@ await ta("resolve: pinned + auto + differentModelFrom honored", async () => {
 });
 
 await ta("resolve: requires load first (state discipline)", async () => {
-  const r = await opResolve({ hostModels: HOST });
-  assert.ok(!r.error); // loaded above — just confirms happy path is stable
+  // A fresh module instance is the only way to see this guard: state.loaded is module-level
+  // and every earlier check has already loaded. Asserting !error on the loaded module tested
+  // the happy path under this name and would have passed with the guard deleted.
+  const fresh = await import("./server.mjs?unloaded");
+  assert.equal((await fresh.opResolve({ hostModels: HOST })).error, "call moa_load first");
+  assert.ok(!(await opResolve({ hostModels: HOST })).error); // loaded here — still fine
 });
 
 await ta("resolve: unresolvable role → blocked_no_model diagnostic", async () => {
@@ -809,6 +817,140 @@ await ta("write landing after the last critical gate → done_unverified", async
   const r = opStepReport({ runId, phase: "execute2", summary: "wrote b after the gate", changedFiles: ["b.js"], ...mut });
   assert.equal(r.terminal, "done_unverified");
   assert.match(r.label, /covering the last change/);
+});
+
+await ta("a gate moa graded self-check cannot earn 'done'", async () => {
+  // moa computed pass:false for these and then counted the APPROVE anyway, so the producer's
+  // own model certified its own mutation and the run finished 'done' — the exact thing
+  // references/anti-self-certification.md forbids. Auto mode still completes; it just cannot
+  // claim the work was verified.
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  const mut = { producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" };
+  const runFloor = async (gateRole, gateReport) => {
+    const { runId } = opRunStart({
+      task: "self-certify",
+      steps: [{ phase: "write", role: "coder" }, { phase: "check", role: gateRole, gate: "critical" }],
+      masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude",
+    });
+    opStepReport({ runId, phase: "write", summary: "wrote x", changedFiles: ["x.js"], ...mut });
+    return opStepReport({ runId, phase: "check", verdict: "APPROVE", summary: "lgtm", ...gateReport });
+  };
+
+  const own = await runFloor("coder", mut);           // producer grading itself
+  assert.equal(own.terminal, "done_unverified");
+  assert.match(own.label, /approved a change written by its own model/);
+
+  // a provider alias is the same model wearing a different name — independenceGroup collapses it
+  assert.equal((await runFloor("verifier", { producerModel: "bedrock/MiniMax-M3", producerFamily: "minimax" })).terminal,
+    "done_unverified");
+
+  // the master may route and reject, but it is never the final word on a gate
+  assert.equal((await runFloor("master", { producerModel: "anthropic/claude-opus-4-8", producerFamily: "claude" })).terminal,
+    "done_unverified");
+
+  // and the legitimate path still earns it
+  const real = await runFloor("verifier", { producerModel: "openai/gpt-5.5", producerFamily: "gpt" });
+  assert.equal(real.terminal, "done", JSON.stringify(real));
+});
+
+await ta("a rework naming another model cannot launder the author's self-check", async () => {
+  // Coverage was graded against the producing phase's LATEST report instead of against whoever
+  // wrote the code still on disk. So a loop-back whose rework changed nothing but reported a
+  // different model re-labelled the original author as independent, and the author's own
+  // APPROVE of its own mutation finished 'done'.
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  const mini = { producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" };
+  const gpt = { producerModel: "openai/gpt-5.5", producerFamily: "gpt" };
+  const { runId } = opRunStart({
+    task: "launder",
+    steps: [
+      { phase: "execute", role: "coder" },
+      { phase: "check", role: "coder", gate: "critical", loopBackTo: "execute" },
+    ],
+    masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude",
+  });
+  opStepReport({ runId, phase: "execute", summary: "mini wrote a.js", changedFiles: ["a.js"], ...mini });
+  opStepReport({ runId, phase: "check", verdict: "REVISE", summary: "needs work", ...mini });
+  opStepReport({ runId, phase: "execute", summary: "gpt looked, changed nothing", changedFiles: [], ...gpt });
+  // a.js is still mini's code, so mini approving it is self-certification however it is routed
+  const r = opStepReport({ runId, phase: "check", verdict: "APPROVE", summary: "lgtm", ...mini });
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+  assert.match(r.label, /approved a change written by its own model/);
+});
+
+await ta("the legitimate paths still earn 'done'", async () => {
+  // The floor is only useful if honest work passes it. Both of these broke (or would have gone
+  // unnoticed if broken) while the escapes above were being closed: verifying that a run CANNOT
+  // cheat proves nothing if no test says which runs must succeed.
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  const mini = { producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" };
+  const gpt = { producerModel: "openai/gpt-5.5", producerFamily: "gpt" };
+
+  // the master right-sizes the write and hands the check to an independent verifier. It names
+  // no producerModel — moa knows its model from run_start, and without that fallback the write
+  // reads as an unknown author that nothing can be independent of.
+  const rs = opRunStart({
+    task: "right-size",
+    steps: [{ phase: "execute", role: "master" }, { phase: "validate", role: "verifier", gate: "critical" }],
+    masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude",
+  });
+  opStepReport({ runId: rs.runId, phase: "execute", summary: "master wrote a.js itself", changedFiles: ["a.js"] });
+  assert.equal(opStepReport({ runId: rs.runId, phase: "validate", verdict: "APPROVE", summary: "checked", ...gpt }).terminal,
+    "done", "the master may author a write and hand the gate to an independent verifier");
+
+  // a REVISE loop is not a failure: rework, then an independent APPROVE, still earns 'done'
+  const lb = opRunStart({
+    task: "rework",
+    steps: [{ phase: "execute", role: "coder" },
+            { phase: "validate", role: "verifier", gate: "critical", loopBackTo: "execute" }],
+    masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude",
+  });
+  opStepReport({ runId: lb.runId, phase: "execute", summary: "v1", changedFiles: ["a.js"], ...mini });
+  assert.equal(opStepReport({ runId: lb.runId, phase: "validate", verdict: "REVISE", summary: "bug", ...gpt }).to, "execute");
+  opStepReport({ runId: lb.runId, phase: "execute", summary: "v2 reworked", changedFiles: ["a.js"], ...mini });
+  assert.equal(opStepReport({ runId: lb.runId, phase: "validate", verdict: "APPROVE", summary: "fixed", ...gpt }).terminal,
+    "done", "rework then an independent APPROVE is verified work");
+});
+
+await ta("two writers cannot cover for each other", async () => {
+  // Coverage is per-author, not per-run: asking only whether the LAST write was covered let a
+  // gate that is independent of the last writer certify an earlier write it made itself.
+  // mini writes a.js, gpt writes b.js, mini gates — independent of gpt, but a.js is mini's own.
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  const mini = { producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" };
+  const gpt = { producerModel: "openai/gpt-5.5", producerFamily: "gpt" };
+  const { runId } = opRunStart({
+    task: "two writers",
+    steps: [
+      { phase: "write-a", role: "coder" },
+      { phase: "write-b", role: "coder" },
+      { phase: "check", role: "coder", gate: "critical" },
+    ],
+    masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude",
+  });
+  opStepReport({ runId, phase: "write-a", summary: "mini wrote a.js", changedFiles: ["a.js"], ...mini });
+  opStepReport({ runId, phase: "write-b", summary: "gpt wrote b.js", changedFiles: ["b.js"], ...gpt });
+  const r = opStepReport({ runId, phase: "check", verdict: "APPROVE", summary: "lgtm", ...mini });
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+
+  // and a gate independent of BOTH writers covers the run
+  const two = opRunStart({
+    task: "two writers, real gate",
+    steps: [
+      { phase: "write-a", role: "coder" },
+      { phase: "write-b", role: "coder" },
+      { phase: "check", role: "coder", gate: "critical" },
+    ],
+    masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude",
+  });
+  opStepReport({ runId: two.runId, phase: "write-a", summary: "mini wrote a.js", changedFiles: ["a.js"], ...mini });
+  opStepReport({ runId: two.runId, phase: "write-b", summary: "mini wrote b.js", changedFiles: ["b.js"], ...mini });
+  assert.equal(opStepReport({ runId: two.runId, phase: "check", verdict: "APPROVE", summary: "ok", ...gpt }).terminal,
+    "done");
 });
 
 await ta("no mutation, no gate → plain done ('done' is not a verification claim)", async () => {
@@ -1220,34 +1362,57 @@ await ta("init: unknown template rejected", async () => {
   assert.ok(r.error.includes("unknown template"));
 });
 
-// Every check above calls the ops directly, so none of them sees the tool boundary:
+// Every check above calls the ops in-process, so none of them sees the tool boundary:
 // a param declared z.any() emits JSON Schema {} — no "type" — and MCP clients then
 // transport it as a string, making the tool uncallable while the suite stays green.
-await ta("tools/list: every param declares a JSON Schema type", async () => {
+// A real server process over real JSON-RPC is the only way to see what a client sees.
+async function mcpClient({ cwd } = {}) {
   const { spawn } = await import("node:child_process");
   const srv = spawn("node", [path.join(import.meta.dirname, "server.mjs")], {
-    stdio: ["pipe", "pipe", "ignore"],
+    stdio: ["pipe", "pipe", "ignore"], cwd,
   });
-  const send = (o) => srv.stdin.write(JSON.stringify(o) + "\n");
-  const tools = await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => reject(new Error("tools/list timed out")), 10_000);
-    let buf = "";
-    srv.stdout.on("data", (d) => {
-      buf += d;
-      const lines = buf.split("\n");
-      buf = lines.pop();
-      for (const line of lines) {
-        const m = JSON.parse(line);
-        if (m.id === 1) {
-          send({ jsonrpc: "2.0", method: "notifications/initialized" });
-          send({ jsonrpc: "2.0", id: 2, method: "tools/list" });
-        }
-        if (m.id === 2) { clearTimeout(timer); resolve(m.result.tools); }
-      }
-    });
-    send({ jsonrpc: "2.0", id: 1, method: "initialize", params: {
-      protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } } });
-  }).finally(() => srv.kill());
+  let buf = "", id = 0;
+  const pending = new Map();
+  srv.stdout.on("data", (d) => {
+    buf += d;
+    const lines = buf.split("\n");
+    buf = lines.pop();
+    for (const line of lines) {
+      if (!line.trim()) continue;
+      const m = JSON.parse(line);
+      pending.get(m.id)?.(m);
+      pending.delete(m.id);
+    }
+  });
+  const rpc = (method, params) => new Promise((resolve, reject) => {
+    const mid = ++id;
+    const timer = setTimeout(() => reject(new Error(`${method} timed out`)), 10_000);
+    pending.set(mid, (m) => { clearTimeout(timer); resolve(m); });
+    srv.stdin.write(JSON.stringify({ jsonrpc: "2.0", id: mid, method, params }) + "\n");
+  });
+  await rpc("initialize", { protocolVersion: "2024-11-05", capabilities: {}, clientInfo: { name: "test", version: "0" } });
+  srv.stdin.write(JSON.stringify({ jsonrpc: "2.0", method: "notifications/initialized" }) + "\n");
+  return {
+    list: async () => (await rpc("tools/list")).result.tools,
+    // Returns what the server actually put on the wire, not an in-process return value.
+    // isError alone does not mean the handler broke — json() sets it for ordinary refusals too
+    // (server.mjs: isError: !!r?.error). What separates them is the shape: a refusal is JSON
+    // carrying an {error} field, a thrown handler is a bare message that will not parse.
+    // Matching on message text instead only catches the wordings you thought to list.
+    call: async (name, args) => {
+      const m = await rpc("tools/call", { name, arguments: args });
+      if (m.error) return { _rpcError: m.error.message };
+      const text = m.result?.content?.[0]?.text ?? "";
+      try { return JSON.parse(text); }
+      catch { return m.result?.isError ? { _threw: text } : { _raw: text }; }
+    },
+    stop: () => srv.kill(),
+  };
+}
+
+await ta("tools/list: every param declares a JSON Schema type", async () => {
+  const c = await mcpClient();
+  const tools = await c.list().finally(() => c.stop());
 
   assert.ok(tools.length >= 8, `expected the full tool set, got ${tools.length}`);
   // Deliberately strict: a bare enum/const/combinator is not a declared type, and the
@@ -1271,6 +1436,88 @@ await ta("tools/list: every param declares a JSON Schema type", async () => {
                         "blocked_verifier_disagreement", "verification_unavailable"])
     assert.ok(report.includes(`'${status}'`), `moa_step_report does not name '${status}'`);
   assert.ok(/REVISE loop is NOT a terminal state/.test(report));
+});
+
+// tools/list only proves a tool is advertised. This drives real runs through tools/call —
+// the transport where a handler that throws, misroutes arguments or serializes wrong stays
+// invisible to every in-process check above.
+await ta("tools/call: gated runs over JSON-RPC — the floor holds at the boundary", async () => {
+  const c = await mcpClient({ cwd: REPO });
+  try {
+    assert.ok(!(await c.call("moa_load", { cwd: REPO })).error);
+    assert.ok(!(await c.call("moa_resolve", { hostModels: HOST })).error);
+    const run = async (steps) => {
+      const r = await c.call("moa_run_start", {
+        task: "e2e", steps, masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude" });
+      assert.ok(r.runId, `run_start failed over the wire: ${JSON.stringify(r)}`);
+      return r.runId;
+    };
+    const wrote = (runId, phase) => c.call("moa_step_report", { runId, phase, summary: "wrote a.js",
+      changedFiles: ["a.js"], producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" });
+
+    // an independent critical gate covering the write → the label moa exists to earn
+    let runId = await run([{ phase: "execute", role: "coder" },
+                           { phase: "validate", role: "verifier", gate: "critical" }]);
+    await wrote(runId, "execute");
+    const ok = await c.call("moa_step_report", { runId, phase: "validate", summary: "checked",
+      verdict: "APPROVE", producerModel: "openai/gpt-5.5", producerFamily: "gpt" });
+    assert.equal(ok.terminal, "done", JSON.stringify(ok));
+
+    // the producer's own model grading its own mutation is self-certification, not a gate
+    runId = await run([{ phase: "execute", role: "coder" },
+                       { phase: "validate", role: "coder", gate: "critical" }]);
+    await wrote(runId, "execute");
+    const self = await c.call("moa_step_report", { runId, phase: "validate", summary: "lgtm",
+      verdict: "APPROVE", producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" });
+    assert.equal(self.terminal, "done_unverified", JSON.stringify(self));
+    assert.match(self.label, /approved a change written by its own model/);
+  } finally { c.stop(); }
+});
+
+// The run path above still left most of the toolset unproven over the wire — including
+// moa_binding_save, the one tool whose schema bug started all this. A handler that throws or
+// mis-transports its arguments must not be able to hide behind in-process tests.
+await ta("tools/call: every advertised tool answers over the wire", async () => {
+  const c = await mcpClient({ cwd: REPO });
+  try {
+    const advertised = (await c.list()).map((t) => t.name);
+    const initDir = fs.mkdtempSync(path.join(TMP, "wire-init-"));
+    // Each tool gets an argument AND a claim only its own handler could satisfy. "It did not
+    // throw" would pass for a handler wired to the wrong op, or one that returns {}.
+    const calls = {
+      moa_load: [{ cwd: REPO }, (r) => assert.equal(r.configPath, path.join(REPO, ".moa.yml"))],
+      moa_resolve: [{ hostModels: HOST }, (r) => assert.ok(r.roles.coder.model, JSON.stringify(r).slice(0, 120))],
+      moa_tools: [{}, (r) => assert.ok(Array.isArray(r.tools), JSON.stringify(r).slice(0, 120))],
+      // A real template — "nope" never reaches the handler at all, the schema enum rejects it
+      // at the boundary. The proof it arrived is the config on disk.
+      moa_init: [{ template: "lite-build", cwd: initDir },
+        () => assert.ok(fs.existsSync(path.join(initDir, ".moa.yml")), "moa_init wrote no config")],
+      // A real profile, so the handler actually RUNS: a stub is refused by the schema, which
+      // proves the argument crossed the wire but nothing about the code behind it.
+      moa_binding_save: [{ profile: provenProfile({ tool: "wirecli" }) },
+        () => assert.ok(fs.existsSync(path.join(process.env.MOA_HOME, ".moa", "bindings", "wirecli", "profile.yml")),
+          "moa_binding_save persisted no profile")],
+      moa_run_start: [{ task: "wire", steps: [{ phase: "p", role: "coder" }] },
+        (r) => assert.match(r.runId, /^run-/)],
+      // these two must reach their op to know the run does not exist
+      moa_step_report: [{ runId: "no-such-run", phase: "p", summary: "s" },
+        (r) => assert.match(r.error, /unknown runId/)],
+      moa_spawn: [{ runId: "no-such-run", phase: "p", prompt: "hi" },
+        (r) => assert.match(JSON.stringify(r), /unknown_run|unknown runId/)],
+    };
+    assert.deepEqual(advertised.filter((t) => !(t in calls)), [], "a tool is advertised but never called here");
+    for (const name of advertised) {
+      const [args, expect] = calls[name];
+      const r = await c.call(name, args);
+      // Never acceptable: a transport failure, a thrown handler, or an argument arriving as the
+      // wrong type. Then the tool-specific claim, which only the right handler can meet.
+      assert.ok(!r._rpcError, `${name} failed at the transport: ${r._rpcError}`);
+      assert.ok(!r._threw, `${name} threw instead of answering: ${r._threw?.slice(0, 160)}`);
+      assert.ok(!/received string/i.test(JSON.stringify(r)),
+        `${name} mis-transported its arguments: ${JSON.stringify(r).slice(0, 160)}`);
+      expect(r);
+    }
+  } finally { c.stop(); }
 });
 
 console.log(`\n${n} checks passed`);
