@@ -72,9 +72,9 @@ the most capable — different-model independence still holds either way.
 ## The mutation gate floor
 
 Right-sizing lets trivial, **non-mutating** tasks answer inline. But **any repo mutation**
-must pass a **`gate: critical`** verification, at the best grade the ladder allows. The only
-exception: `runtime.defaults.allowInlineWithoutGates: true` AND a non-critical task — and even
-then the output is labeled **"unverified inline mode"** so no one mistakes it for verified work.
+must pass a **`gate: critical`** verification, at the best grade the ladder allows. There is no
+opt-out: a run that mutated the repo without a passed critical gate finishes as
+`done_unverified`, labeled **"unverified inline mode"** so no one mistakes it for verified work.
 
 ## On disagreement
 

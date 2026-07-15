@@ -14,11 +14,11 @@ registered external tools; host-native phases still use the host's own subagent 
 | `moa_load` | First call, always | `.moa.yml` cwd→root search, safe-subset YAML, schema + cross-checks, dispatch mode, `~/.moa/bindings` profiles (metadata only — no inventory subprocess) |
 | `moa_tools` | On-demand external-tool discovery | runs every registered `modelDiscovery` recipe live; returns the models each learned tool currently serves plus the stable spawn call; **never persists** a stored list; reports external routes only, never host-native as external |
 | `moa_resolve` | Second; pass `hostModels` | independently re-runs live discovery across every learned tool, then intersects the live external routes with `.moa.yml`'s model aliases and the `hostModels` you passed; pins every role's model/effort/binding (model-level only — `roles.<name>.binding` is rejected) with a recorded reason, writes `effective-config.json` |
-| `moa_run_start` | Per task | pipeline selection, run store + manifest, the Frame assembled from real data; freezes each role's `toolPolicies` reference and `runtime.requireEnforcement` mode for the run's lifetime |
+| `moa_run_start` | Per task | pipeline selection, run store + manifest, the Frame assembled from real data |
 | `moa_step_report` | After every phase | gate verdicts required, REVISE→loopBackTo, `maxGateLoops`, independence grade vs the *actual* producer, mutation floor (`done_unverified` label), terminal states |
-| `moa_spawn` | Current registered-tool phase | re-runs `modelDiscovery` against the bound tool's current inventory; refuses to launch when the frozen model is no longer served (`model_not_served`); compiles the frozen role tool policy against the currently loaded binding's proven `toolControl` adapter and returns an explicit `enforcement` block (also recorded in the run manifest) — `strict`/`sandbox` fail closed before launch when unsupported, `best-effort` degrades and reports it; exact route, file or stdin prompt transport, `shell: false`, timeout, 4 MiB output bound, normalized result; never advances state |
+| `moa_spawn` | Current registered-tool phase | re-runs `modelDiscovery` against the bound tool's current inventory; refuses to launch when the frozen model is no longer served (`model_not_served`); exact route, file or stdin prompt transport, `shell: false`, timeout, 4 MiB output bound, normalized result; never advances state |
 | `moa_init` | `/moa init` | overwrite guard, comment-preserving template splice, registry = union of picks (only the aliases roles chose — never the full live inventory), validation before write |
-| `moa_binding_save` | `/moa learn-tool` | refuses profiles without `modelDiscovery` + T1 + T2 + T4 = pass and `promptSafe: true`; a declared `toolControl.disableAll`/`allowList` is refused unless its matching `evidence.tests.disableAll`/`.allowList` is also `pass`; runs the discovery recipe once before persistence to confirm the live model inventory |
+| `moa_binding_save` | `/moa learn-tool` | refuses profiles without `modelDiscovery` + T1 + T2 + T4 = pass, `promptSafe: true` and `canSelectModel: true`; refuses any `run.argv` placeholder spawn cannot expand; runs the discovery recipe once before persistence to confirm the live model inventory |
 
 ## Native vs external
 
@@ -88,60 +88,6 @@ The conductor calls `moa_load`, optionally inspects `moa_tools`, then calls `moa
 reports a verdict, or advances the manifest; `moa_step_report` remains the only transition
 operation.
 
-## Tool policy: freeze, compile, enforce
-
-A role's `tools:` reference (`.moa.yml` → `toolPolicies.<name>`) is canonical and
-launcher-agnostic — `allow`/`deny` are the only fields the server compiles into CLI arguments;
-`network`/`filesystem`/`secrets`/`bash` stay advisory and are reported back as `unenforced`
-dimensions, never claimed as enforced.
-
-**Freeze (`moa_run_start`).** Each role's resolved `{ name, policy }` and
-`runtime.requireEnforcement` (`strict`/`sandbox`/`best-effort`, default `best-effort`) are
-copied into the run manifest at start and never re-read from `.moa.yml` again — a later edit to
-the file never retroactively changes an in-flight run.
-
-**Profile adapter schema (`toolControl`, learned via `learn-tool`).** A profile may declare:
-- `disableAll.argv` — a literal argv fragment (no placeholders) used when the compiled
-  allow-list is empty.
-- `allowList.names` — canonical → native tool name map, plus exactly one of:
-  - `joined.argv` (`{tools}` exactly once, joined with `separator`), or
-  - `repeated.argv` (`{tool}` exactly once, repeated per tool).
-
-Absence of a mode means the binding cannot enforce that shape. Every mode a profile advertises
-must have live proof — `evidence.tests.disableAll` / `.allowList` = `pass` — or
-`moa_binding_save` refuses it (see `references/learn-tool.md`).
-
-**Structural compilation (`moa_spawn`).** `run.argv` carries the exact bare element
-`{toolArgs}` when (and only when) `toolControl` is declared. At spawn, the server expands it to
-zero or more literal argv elements — never a shell string — from the frozen policy compiled
-against the *currently loaded* profile:
-1. No role policy → zero elements, `enforcement.state: "not_requested"`.
-2. `allow` (deduped, deny-subtracted) empty → `disableAll.argv` verbatim, `mode: "disable_all"`.
-3. Non-empty → every name mapped through `allowList.names`, rendered via `joined` or
-   `repeated`, `mode: "allow_list"`.
-4. `deny` without `allow` is unsupported — the server cannot infer a complete tool universe.
-
-**Enforcement modes.** `strict`/`sandbox` fail closed: an unsupported compilation returns
-`tool_policy_unsupported` (`reason` one of `disable_all_unsupported`, `allow_list_unsupported`,
-`unmapped_tool` [+ `tool`], `deny_only_unsupported`) and the agent task process never launches.
-`best-effort` launches without tool-list flags and returns `enforcement: { state: "degraded",
-reason, … }` instead — the degradation is explicit in both the result and the run manifest,
-never silent.
-
-**Manifest evidence.** Every compiled outcome — `enforced`, `degraded`, and `not_requested` —
-is appended to `manifest.enforcement` with `phase`, `role`, `binding`, `state`, and (when
-applicable) `policy`/`mode`/`reason`/`tool`/`unenforced`. No raw profile data, argv, prompt
-bytes, secrets, or inventories are ever persisted.
-
-**Host-native phases.** `moa_spawn` still returns `native_spawn_required` for a host-native
-route, now carrying `requestedPolicy` and `enforcementMode` alongside `enforcement: { state:
-"host_owned" }` — the server reports the frozen request; the host, not the server, is
-responsible for applying it.
-
-**Compatibility.** A profile with the legacy `run.isolationFlags` field is rejected outright —
-there is no alias. Profiles without `toolControl` remain valid and simply can't serve a role
-that declares `tools:` (they degrade or fail closed per the enforcement mode above).
-
 ## Register
 
 ```sh
@@ -165,8 +111,9 @@ node test.mjs
 
 - The server cannot enumerate the host's own models (a stdio server has no view into the agent
   runtime) — that's why `moa_resolve` takes `hostModels` as input.
-- Deliberately out (see `temp-docs` design note / DESIGN.md): budget *enforcement* (usage is
-  recorded per phase), patches-first merge machinery. Tool-policy enforcement is now IN — see
-  *Tool policy: freeze, compile, enforce* above; `bindings/` documents a separate, still-archived
-  adapter-process design (`bindings/README.md`).
+- Deliberately out: budget *enforcement* (only what `moa_step_report` is given as `usage` is
+  recorded; no ceiling halts a run), patches-first merge machinery, and any attempt to restrict
+  a spawned tool's own tools/network/filesystem. `DESIGN.md` is the **historical** design pass
+  and still specifies several of these — the code wins. `bindings/` documents a separate,
+  still-archived adapter-process design (`bindings/README.md`).
 - `MOA_HOME` env var overrides `~` for bindings storage (used by tests).

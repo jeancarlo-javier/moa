@@ -46,24 +46,18 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
    plainly (`blocked_no_model` → offer to adjust the registry or `/moa learn-tool`).
 3. **`moa_run_start`** — pass the task plus a named pipeline, or ad-hoc `steps` you composed
    (adaptive), or nothing in workflow mode. **Always pass `masterModel`/`masterFamily`** — your own
-   model — so independence is checked against you when you author a phase. It also **freezes**
-   each role's tool-policy reference and `runtime.requireEnforcement` mode into the run for its
-   lifetime, so a later `.moa.yml` edit never retroactively changes an in-flight run's policy.
-   Print the returned `frame` to the user before any action, then execute `next`.
+   model — so independence is checked against you when you author a phase. Print the returned
+   `frame` to the user before any action, then execute `next`.
 4. **Execute each step, then `moa_step_report`** — the ONLY way to advance. Per step:
    - `spawn.kind: native` → launch the subagent with your host capability on the step's
-     `model`/`effort`, scoped to the role's tools as far as the host allows.
+     `model`/`effort`, giving it the tools the role's work needs, as far as the host allows.
    - `spawn.kind: profile` → call `moa_spawn` with the role's prompt; before launch the server
      re-runs the bound tool's discovery against the tool's *current* inventory and confirms the
      frozen model still resolves — drift between resolve-time and spawn-time surfaces as
-     `model_not_served`, not as a silent route through a stale assumption. It then compiles the
-     run's frozen role tool policy against the currently loaded binding's proven `toolControl`
-     adapter: `strict`/`sandbox` fail closed (`tool_policy_unsupported`) before the agent task
-     launches when the adapter can't express the policy; `best-effort` launches without
-     tool-list flags and reports the degradation explicitly in the result and run manifest —
-     never silently.
+     `model_not_served`, not as a silent route through a stale assumption.
      Inspect the normalized result and actual workspace effects, then report the phase. The MCP
-     server owns safe execution.
+     server owns shell-free process launch, timeout, and output bounds — not what the spawned
+     agent does once running.
    - `isMaster: true` → the phase is yours (frame, finalize).
    - Report honestly: gate phases need the verifier's parseable verdict; producing phases need
      `changedFiles` and the **actual** `producerModel` (yourself included, if you authored).
@@ -145,11 +139,9 @@ If the `mcp__moa__*` tools don't exist or fail, orchestrate by prose: follow `re
 procedure (`init.md`, `learn-tool.md`, `adaptive.md`, `anti-self-certification.md`,
 `run-store.md`) with `schema/config.schema.json` as the config contract — read `.moa.yml`
 yourself, resolve and sequence by hand, and hold every rule above with extra care (the gate
-floor, mutation floor, and independence checks are then discipline, not enforcement). Register
+floor, mutation floor, and independence checks are then discipline only). Register
 the server when convenient: `moa-core/mcp/` (see its README).
 
 See also: `references/`, `schema/config.schema.json`, `templates/`, `mcp/` (the server, including
-per-role tool-policy enforcement — live profile data compiled at `moa_spawn` through a proven
-`toolControl` adapter, never a parked binding model), `bindings/` (an archived adapter-process
-design superseded by the live tool-policy contract above). Host-native phases receive the frozen
-policy as a request only; the host — not the server — is responsible for applying it.
+how it spawns a bound external tool — live profile data, never a parked binding model),
+`bindings/` (an archived adapter-process design). Host-native phases are spawned by the host.

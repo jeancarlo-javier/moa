@@ -19,7 +19,7 @@ changes only four things:
   before any action, even a trivial inline answer; its `config:` line quotes path, `schemaVersion`,
   and declared role names — values you cannot echo without reading the file).
   *Config absent*: the Frame is a **discipline** (restate goal, constraints, non-goals,
-  done-criteria + evidence; surface ambiguity), not an enforced proof-of-read.
+  done-criteria + evidence; surface ambiguity), not a hard proof-of-read.
 - **(d) the `/moa init` nudge** — offered **only when no `.moa.yml` exists** (see *When to suggest
   `init`*). The config-present fork already has a config; never nudge it.
 
@@ -29,7 +29,7 @@ You stay CLI-agnostic in both forks: name no runtime, model, tool, or command. Y
 the abstract capability "spawn a subagent on a chosen model", and resolve HOW it runs from the host —
 the host-native capability, or a CLI taught via `learn-tool` (its profile lives in `~/.moa/bindings/`).
 The config-absent fork is moa's discipline **without** the config: same conductor, same gated
-instinct, every role/model/tool-policy resolved from runtime defaults instead of a declared workflow.
+instinct, every role and model resolved from runtime defaults instead of a declared workflow.
 
 ## Task-agnostic by construction
 moa is agnostic about the **task's domain**, not just the runtime. The pipeline is a *shape* —
@@ -54,21 +54,16 @@ are capabilities, not job titles.
   own say-so. Take the **best independent verification the host allows** — always a different
   model, a different family whenever one exists — and when it falls short, **name the grade** (see
   the verification floor), never hide it. See `references/anti-self-certification.md`.
-- **Least privilege, best-effort.** Config-present: each role names a canonical `toolPolicies`
-  bundle in `.moa.yml`; `moa_run_start` freezes the reference, and `moa_spawn` compiles it
-  against whichever launcher is currently loaded for that role — `strict`/`sandbox` block an
-  external control the launcher can't express before anything runs, `best-effort` still launches
-  and reports the degradation explicitly (never hidden). Host-native phases receive that same
-  frozen policy only as a request; the host, not the server, applies it. Config-absent: there is
-  no declared policy to compile, so scope each delegated subagent to the tools its job needs to
-  whatever granularity the host/binding supports, and load no arbitrary external skills, as
-  discipline rather than a runtime guarantee.
+- **Scope the tools a subagent actually needs.** Whether you are following a declared `.moa.yml`
+  or improvising ad-hoc, restrict each delegated subagent to the tools its job needs (at
+  whatever granularity the host or bound binding supports) and load no arbitrary external skills
+  — discipline, not a runtime guarantee.
 - **Verify, don't assume.** A subagent's "done" is a claim until you see the artifacts.
 
 ## The config-absent fork: what you drop
 With no `.moa.yml` there are no declared `pipelines`, role registry, `models` map, or bindings —
 you improvise their equivalent from runtime defaults, and stay **honest about the weaker guarantee**:
-this fork trades enforced determinism for zero-setup usefulness, and labels every result with the
+this fork trades pinned determinism for zero-setup usefulness, and labels every result with the
 grade it actually reached.
 
 ## The config-absent fork: resolve capability at runtime (no registry)
@@ -154,7 +149,7 @@ different-model verifier halts at `verification_unavailable`.
 
 ## When to suggest `init`
 After substantial work, if the user is clearly doing repeated heavy engineering in this project,
-mention **once** that `/moa init` would pin roles/models and enforce the gates the config-absent fork
+mention **once** that `/moa init` would pin roles/models and run the gates the config-absent fork
 only approximates. Never push it for one-off or light tasks — zero-setup is the point. (Config-absent
 fork only; single-family runs may also mention `/moa learn-tool` once — it upgrades gates from
 cross-model to cross-family.)

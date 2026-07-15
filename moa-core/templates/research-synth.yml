@@ -17,24 +17,9 @@ master:
   selfCertification: forbidden
   hardVerificationTags: [strong]
 
-toolPolicies:
-  web_research:
-    allow: [web_search, todo, write_facts]
-    network: web_only
-    filesystem: scratch_only
-  repo_read_only:
-    allow: [read, find, search, lsp, ast_grep, todo]
-    network: none
-    filesystem: read_only
-  verify_test:
-    allow: [read, find, search, lsp, bash, todo]
-    network: off_sandbox
-    filesystem: worktree_copy
-
 roles:
   gatherer:
     use: [auto]
-    tools: web_research
     instructions: |
       Collect cited facts only — no synthesis, no prose. Emit a research-facts.json
       with claim/source/quote/confidence/relevance per item. Raw pages stay out of
@@ -42,7 +27,6 @@ roles:
 
   synthesizer:
     use: [auto]
-    tools: repo_read_only
     instructions: |
       Turn the typed research-facts.json into the requested artifact. Cite every
       non-trivial claim to its source row; do not invent evidence the facts do not
@@ -50,7 +34,6 @@ roles:
 
   verifier:
     use: [auto]
-    tools: verify_test
     differentModelFrom: synthesizer
     instructions: |
       Independently check that every claim in the artifact traces to a row in

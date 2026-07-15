@@ -2,7 +2,7 @@
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "$id": "https://moa/config.schema.json",
   "title": "moa project config (.moa.yml)",
-  "description": "Source of truth for the per-project workflow. YAML is parsed as a safe subset (no anchors, no merge keys, no duplicate keys, known keys only) and normalized to this JSON before execution. Names NO specific CLI; runtime specifics live in binding packages.\n\nSERIALIZATION STANDARD (what `init` emits, what templates follow): (1) Every key is MONOMORPHIC — one YAML type, always; no key is 'sometimes a scalar, sometimes an array'. Every multi-value field is an array (incl. 'effort'); every named collection ('models' registry, 'roles', 'toolPolicies') is a map. (2) STYLE: block style for all maps; flow style ONLY for short scalar arrays (e.g. tags: [strong, fast], use: [opus, auto]) and for the tabular step rows under pipelines.<name>.steps ({ phase, role, gate }). (3) EMPTIES: empty map -> {}, empty list -> []. (4) DEFAULTS: omit any key equal to its schema default; write a key only to override.",
+  "description": "Source of truth for the per-project workflow. YAML is parsed as a safe subset (no anchors, no merge keys, no duplicate keys, known keys only) and normalized to this JSON before execution. Names NO specific CLI; runtime specifics live in binding packages.\n\nSERIALIZATION STANDARD (what `init` emits, what templates follow): (1) Every key is MONOMORPHIC — one YAML type, always; no key is 'sometimes a scalar, sometimes an array'. Every multi-value field is an array (incl. 'effort'); every named collection ('models' registry, 'roles') is a map. (2) STYLE: block style for all maps; flow style ONLY for short scalar arrays (e.g. tags: [strong, fast], use: [opus, auto]) and for the tabular step rows under pipelines.<name>.steps ({ phase, role, gate }). (3) EMPTIES: empty map -> {}, empty list -> []. (4) DEFAULTS: omit any key equal to its schema default; write a key only to override.",
   "type": "object",
   "required": ["schemaVersion"],
   "additionalProperties": false,
@@ -17,23 +17,12 @@
           "description": "Route each role to the binding that serves its model; constraint-first, then prefer native." },
         "subagents": { "enum": ["auto", "native", "external", "blocked"], "default": "auto",
           "description": "Spawn-source policy — a filter on binding routing. auto: best available (prefer cross-family/external for gate verifiers, fall back to host-native). native: host-native subagents only. external: learned-tool subagents only. blocked: no subagents (master works solo, self-check only). Default auto prompts only at consequential forks (first external-tool use; critical work with no independent verifier) and offers to pin; a pinned value runs silent. The verification grade reached (cross-family > cross-model > self-check) is always named; only master.mode strict halts a critical gate with no different-model verifier." },
-        "requireEnforcement": { "enum": ["strict", "sandbox", "best-effort"], "default": "best-effort",
-          "description": "Fail-closed floor for the compiled per-role tool-list policy at moa_spawn. strict/sandbox: an external spawn whose currently loaded binding can't express the frozen role policy (missing disableAll/allowList adapter, unmapped tool, deny-only) is blocked before launch (tool_policy_unsupported). best-effort (default): the spawn still launches without tool-list flags and the degraded state/reason are recorded in both the spawn result and the run manifest — never silently. Host-native phases receive the frozen policy only as a request; this floor does not apply to them." },
         "workDir": { "type": "string", "default": ".moa" },
         "defaults": {
           "type": "object",
           "additionalProperties": false,
           "properties": {
-            "timeoutSeconds": { "type": "integer", "minimum": 1, "default": 1800 },
-            "maxParallel": { "type": "integer", "minimum": 1, "default": 4 },
-            "maxGateLoops": { "type": "integer", "minimum": 0, "default": 2 },
-            "maxCost": { "type": "number", "minimum": 0 },
-            "maxTokens": { "type": "integer", "minimum": 0 },
-            "noExternalSkills": { "type": "boolean", "default": true },
-            "noExternalExtensions": { "type": "boolean", "default": true },
-            "failOnUnknownTool": { "type": "boolean", "default": true },
-            "allowInlineWithoutGates": { "type": "boolean", "default": false,
-              "description": "Opt-in: permit non-critical repo mutations to skip gates; such results are labeled 'unverified inline mode'." }
+            "maxGateLoops": { "type": "integer", "minimum": 0, "default": 2 }
           }
         }
       }
@@ -71,7 +60,7 @@
           "context": { "type": "integer", "minimum": 1,
             "description": "Optional: context-window size in tokens. Lets the master route large tasks to large-context models." },
           "cost": { "enum": ["cheap", "standard", "premium"],
-            "description": "Optional coarse cost class for budget-aware routing; complements runtime.defaults.maxCost." },
+            "description": "Optional coarse cost class for budget-aware routing." },
           "priority": { "type": "integer",
             "description": "Optional tie-break order among tag-matched candidates (lower = preferred). Defaults to declaration order." },
           "enabled": { "type": "boolean", "default": true,
@@ -103,32 +92,6 @@
       }
     },
 
-    "toolPolicies": {
-      "type": "object",
-      "description": "Named least-privilege bundles, keyed by policy name. Every roles.<name>.tools reference must resolve to a key here (checked at load, whether or not this map is declared). allow/deny are the only fields compiled into the currently loaded binding's proven toolControl adapter at moa_spawn (strict/sandbox fail closed when unsupported; best-effort degrades and reports it); network/filesystem/secrets/bash stay advisory and are returned as unenforced dimensions, never claimed as enforced.",
-      "additionalProperties": {
-        "type": "object",
-        "additionalProperties": false,
-        "properties": {
-          "allow": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-          "deny": { "type": "array", "items": { "type": "string", "minLength": 1 } },
-          "network": { "enum": ["none", "web_only", "off_sandbox"] },
-          "filesystem": { "enum": ["none", "scratch_only", "read_only", "worktree_write", "worktree_copy"] },
-          "secrets": { "enum": ["scrubbed", "available"], "default": "scrubbed" },
-          "bash": {
-            "type": "object",
-            "additionalProperties": false,
-            "properties": {
-              "mode": { "enum": ["argv_allowlist"], "default": "argv_allowlist" },
-              "allow": { "type": "array", "items": { "type": "array", "items": { "type": "string" } },
-                "description": "Each entry is a parsed argv pattern (tokens), NOT a shell glob string." },
-              "noShellMetachars": { "type": "boolean", "default": true }
-            }
-          }
-        }
-      }
-    },
-
     "roles": {
       "type": "object",
       "minProperties": 1,
@@ -141,8 +104,6 @@
             "description": "Ordered model aliases, or the literal auto wildcard. This is the only role-level route selector; roles never pin learned tools directly." },
           "effort": { "type": "array", "items": { "type": "string" }, "minItems": 1,
             "description": "Optional per-role reasoning/thinking effort — ALWAYS an array, same shape and rules as models.<name>.effort. A single-element array pins (e.g. ['high']); a multi-element ascending array is an escalation ladder climbed one rung per gate loop-back. Overrides the model's 'effort' and any ':<effort>' suffix baked into its id/key; ignored by models without effort control." },
-          "tools": { "type": "string", "description": "Reference into toolPolicies; must name a key declared there (checked at load — declaring toolPolicies is not a precondition). allow/deny compile into the currently loaded binding's proven toolControl adapter at moa_spawn; other policy fields stay advisory best-effort scoping." },
-          "skills": { "type": "array", "items": { "type": "string" }, "default": [] },
           "instructions": { "type": "string" },
           "instructionsFile": { "type": "string" },
           "differentModelFrom": { "type": "string", "description": "Role name whose resolved model this role must differ from (different family preferred)." }

@@ -1,9 +1,21 @@
 # moa — unified design blueprint
 
+> **HISTORICAL — this is the original design pass, not a description of moa as built.**
+> It is kept as the record of what was designed and why. Where it disagrees with the
+> code, the code wins; for what moa actually does today, read `moa-core/SKILL.md`,
+> `moa-core/mcp/README.md` and `moa-core/references/`.
+>
+> Most notably, this document specifies a per-role **tool policy / enforcement**
+> subsystem — `toolPolicies`, `requireEnforcement`, graded fail-closed
+> `enforcementGrade`, least-privilege spawns, per-run budgets. **None of that exists.**
+> It was built, never enforced anything (restricting a spawned CLI's tools needs
+> per-CLI knowledge moa deliberately does not have), and was removed. moa's job for a
+> learned tool is: launch it, get a result back.
+
 > A CLI-agnostic, per-project-configurable, dynamic multi-agent orchestration
 > skill. A master/CEO agent reads a per-project workflow file, discovers what
 > the machine can do, then drives the task through a configurable gated pipeline
-> of least-privilege role×model subagents — looping on gates until done.
+> of role×model subagents — looping on gates until done.
 >
 > Synthesizes three independent design passes: **GPT-5.5** (systems
 > architecture), **Gemini 3.5 Flash** (CLI survey + templates), **Opus 4.8**

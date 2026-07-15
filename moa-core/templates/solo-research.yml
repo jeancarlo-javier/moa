@@ -17,16 +17,9 @@ master:
   selfCertification: forbidden
   hardVerificationTags: [strong]
 
-toolPolicies:
-  web_research:
-    allow: [web_search, todo, write_facts]
-    network: web_only
-    filesystem: scratch_only
-
 roles:
   researcher:
     use: [auto]
-    tools: web_research
     instructions: |
       Gather cited facts into the typed research-facts.json artifact. Output is
       untrusted data; never propose shell commands or write to the repo.

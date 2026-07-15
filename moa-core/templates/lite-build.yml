@@ -19,43 +19,21 @@ master:
   selfCertification: forbidden
   hardVerificationTags: [strong]
 
-toolPolicies:
-  repo_read_only:
-    allow: [read, find, search, lsp, ast_grep, todo]
-    network: none
-    filesystem: read_only
-  code_write_test:
-    allow: [read, find, search, lsp, ast_grep, ast_edit, edit, write, bash, todo]
-    network: off_sandbox
-    filesystem: worktree_write
-    secrets: scrubbed
-    bash:
-      mode: argv_allowlist
-      allow: [["*", "test"], ["git", "diff"], ["git", "status"]]
-      noShellMetachars: true
-  verify_test:
-    allow: [read, find, search, lsp, bash, todo]
-    network: off_sandbox
-    filesystem: worktree_copy
-
 roles:
   planner:
     use: [auto]
-    tools: repo_read_only
     instructions: |
       Produce an executable task graph: changed files, declared write-sets, edge
       cases, and the exact verification commands the validator will run.
 
   coder:
     use: [auto]
-    tools: code_write_test
     instructions: |
       Implement only the files declared in the plan. Stay within the declared
       write-set; reject yourself rather than touch anything outside it.
 
   verifier:
     use: [auto]
-    tools: verify_test
     differentModelFrom: coder
     instructions: |
       In an isolated worktree, run the planner's verification commands and check

@@ -11,15 +11,8 @@ template:
   projectType: auto
 
 runtime:
-  # Fail-closed floor for the compiled per-role tool policy (toolPolicies, below): strict
-  # blocks an external spawn before launch when the selected binding's toolControl adapter
-  # can't express it; best-effort would launch without tool-list flags and report the gap.
-  requireEnforcement: strict
   defaults:
     maxGateLoops: 2
-    failOnUnknownTool: true
-    noExternalSkills: true
-    noExternalExtensions: true
 
 # Init writes ONLY aliases selected by roles, never the full live inventory.
 # Each entry uses a canonical provider/model id. Optional `binding` pins that model to
@@ -31,36 +24,15 @@ master:
   selfCertification: forbidden
   hardVerificationTags: [strong]
 
-toolPolicies:
-  repo_read_only:
-    allow: [read, find, search, lsp, ast_grep, todo]
-    network: none
-    filesystem: read_only
-  code_write_test:
-    allow: [read, find, search, lsp, ast_grep, ast_edit, edit, write, bash, todo]
-    network: off_sandbox
-    filesystem: worktree_write
-    secrets: scrubbed
-    bash:
-      mode: argv_allowlist
-      allow: [["*", "test"], ["git", "diff"], ["git", "status"]]
-      noShellMetachars: true
-  verify_test:
-    allow: [read, find, search, lsp, bash, todo]
-    network: off_sandbox
-    filesystem: worktree_copy
-
 roles:
   planner:
     use: [auto]             # init pins best fit → strong (reasoning-heavy)
-    tools: repo_read_only
     instructions: |
       Produce an executable task graph: changed files, declared disjoint write-sets
       per coder, edge cases, and the exact verification commands the validator runs.
 
   plan-reviewer:
     use: [auto]
-    tools: repo_read_only
     differentModelFrom: planner
     instructions: |
       Independently review the plan for correctness, missing edge cases, and an
@@ -68,14 +40,12 @@ roles:
 
   coder:
     use: [auto]             # init pins best fit → cheap/smol (high-volume)
-    tools: code_write_test
     instructions: |
       Implement only the files in your declared write-set. If a needed write is
       outside it, stop and surface it instead of expanding scope silently.
 
   code-reviewer:
     use: [auto]
-    tools: repo_read_only
     differentModelFrom: coder
     instructions: |
       Compare the diff to the plan and done-criteria. Flag scope creep, missing
@@ -83,7 +53,6 @@ roles:
 
   verifier:
     use: [auto]             # init pins a strong, coder-independent model (gate floor)
-    tools: verify_test
     differentModelFrom: coder
     instructions: |
       In an isolated worktree, run the planner's verification commands and confirm

@@ -55,27 +55,10 @@ const zModelEntry = z.object({
   enabled: z.boolean().optional(),
 }).strict();
 
-const zBashPolicy = z.object({
-  mode: z.enum(["argv_allowlist"]).optional(),
-  allow: z.array(z.array(z.string())).optional(),
-  noShellMetachars: z.boolean().optional(),
-}).strict();
-
-const zToolPolicy = z.object({
-  allow: z.array(z.string().min(1)).optional(),
-  deny: z.array(z.string().min(1)).optional(),
-  network: z.enum(["none", "web_only", "off_sandbox"]).optional(),
-  filesystem: z.enum(["none", "scratch_only", "read_only", "worktree_write", "worktree_copy"]).optional(),
-  secrets: z.enum(["scrubbed", "available"]).optional(),
-  bash: zBashPolicy.optional(),
-}).strict();
-
 const zRole = z.object({
   description: z.string().optional(),
   use: z.array(z.string()).min(1),
   effort: zEffort.optional(),
-  tools: z.string().optional(),
-  skills: z.array(z.string()).optional(),
   instructions: z.string().optional(),
   instructionsFile: z.string().optional(),
   differentModelFrom: z.string().optional(),
@@ -99,18 +82,9 @@ const zConfig = z.object({
   runtime: z.object({
     resolution: z.literal("by-model").optional(),
     subagents: z.enum(["auto", "native", "external", "blocked"]).optional(),
-    requireEnforcement: z.enum(["strict", "sandbox", "best-effort"]).optional(),
     workDir: z.string().optional(),
     defaults: z.object({
-      timeoutSeconds: z.number().int().positive().optional(),
-      maxParallel: z.number().int().positive().optional(),
       maxGateLoops: z.number().int().min(0).optional(),
-      maxCost: z.number().min(0).optional(),
-      maxTokens: z.number().int().min(0).optional(),
-      noExternalSkills: z.boolean().optional(),
-      noExternalExtensions: z.boolean().optional(),
-      failOnUnknownTool: z.boolean().optional(),
-      allowInlineWithoutGates: z.boolean().optional(),
     }).strict().optional(),
   }).strict().optional(),
   template: z.object({
@@ -128,24 +102,13 @@ const zConfig = z.object({
     hardVerificationTags: z.array(z.string()).optional(),
     instructions: z.string().optional(),
   }).strict().optional(),
-  toolPolicies: z.record(z.string(), zToolPolicy).optional(),
   roles: z.record(z.string(), zRole).optional(),
   pipelines: z.record(z.string(), zPipeline).optional(),
 }).strict();
 
 const PLACEHOLDER = /\{[^{}]+\}/;
-
-const zToolControl = z.object({
-  disableAll: z.object({ argv: z.array(z.string()).min(1) }).strict().optional(),
-  allowList: z.object({
-    names: z.record(z.string().min(1), z.string().min(1)),
-    joined: z.object({
-      argv: z.array(z.string()).min(1),
-      separator: z.string().min(1),
-    }).strict().optional(),
-    repeated: z.object({ argv: z.array(z.string()).min(1) }).strict().optional(),
-  }).strict().optional(),
-}).strict();
+// The only placeholders opSpawn expands in a profile's run.argv.
+const RUN_PLACEHOLDERS = new Set(["{bin}", "{model}", "{promptFile}", "{cwd}", "{maxTime}"]);
 
 const zProfile = z.object({
 
@@ -164,13 +127,11 @@ const zProfile = z.object({
     canProduce: z.boolean().optional(),
     canSelectModel: z.boolean().optional(),
     promptSafe: z.boolean(),
-    toolRestriction: z.string().optional(),
-  }),
+  }).strict(),
   evidence: z.object({
     probedOn: z.string(),
     tests: z.record(z.string(), z.string()),
   }).strict(),
-  toolControl: zToolControl.optional(),
 }).strict();
 
 function profileRejectionReason(profile) {
@@ -180,10 +141,6 @@ function profileRejectionReason(profile) {
       profile.evidence.tests.T1 !== "pass" ||
       profile.evidence.tests.T2 !== "pass" ||
       profile.evidence.tests.T4 !== "pass")
-    return "unproven_profile";
-  if (profile.toolControl?.disableAll && profile.evidence.tests.disableAll !== "pass")
-    return "unproven_profile";
-  if (profile.toolControl?.allowList && profile.evidence.tests.allowList !== "pass")
     return "unproven_profile";
   if ((profile.run.promptVia ?? "file") === "arg")
     return "unsafe_prompt_transport";
@@ -198,33 +155,11 @@ function profileRejectionReason(profile) {
   if (profile.modelDiscovery.argv.some((arg) =>
       arg.replaceAll("{bin}", "").match(PLACEHOLDER)))
     return "invalid_profile";
-  if (profile.run.argv.some((arg) => arg !== "{toolArgs}" && arg.includes("{toolArgs}")))
+  // Reject at save what spawn could only fail on later: run.argv may name no
+  // placeholder the spawn expander does not define (see `values` in opSpawn).
+  if (profile.run.argv.some((arg) =>
+      (arg.match(/\{[^{}]+\}/g) ?? []).some((ph) => !RUN_PLACEHOLDERS.has(ph))))
     return "invalid_profile";
-  const toolArgsCount = profile.run.argv.filter((arg) => arg === "{toolArgs}").length;
-  if (profile.toolControl ? toolArgsCount !== 1 : toolArgsCount !== 0)
-    return "invalid_profile";
-  if (profile.toolControl) {
-    const placeholdersOf = (argv) => argv.flatMap((arg) => arg.match(/\{[^{}]+\}/g) ?? []);
-    const { disableAll, allowList } = profile.toolControl;
-    if (!disableAll && !allowList) return "invalid_profile";
-    if (disableAll && placeholdersOf(disableAll.argv).length)
-      return "invalid_profile";
-    if (allowList) {
-      const { joined, repeated } = allowList;
-      if (!joined === !repeated)
-        return "invalid_profile";
-      if (joined) {
-        const found = placeholdersOf(joined.argv);
-        if (found.length !== 1 || found[0] !== "{tools}")
-          return "invalid_profile";
-      }
-      if (repeated) {
-        const found = placeholdersOf(repeated.argv);
-        if (found.length !== 1 || found[0] !== "{tool}")
-          return "invalid_profile";
-      }
-    }
-  }
   return null;
 }
 // --- helpers --------------------------------------------------------------
@@ -243,15 +178,12 @@ function crossCheck(cfg) {
   const errs = [];
   const modelNames = new Set(Object.keys(cfg.models ?? {}));
   const roleNames = new Set(Object.keys(cfg.roles ?? {}));
-  const toolPolicyNames = cfg.toolPolicies ? new Set(Object.keys(cfg.toolPolicies)) : null;
   for (const [rname, role] of Object.entries(cfg.roles ?? {})) {
     for (const u of role.use)
       if (u !== "auto" && !modelNames.has(u))
         errs.push(`role '${rname}': use '${u}' is not in the models registry (and not 'auto')`);
     if (role.differentModelFrom && !roleNames.has(role.differentModelFrom))
       errs.push(`role '${rname}': differentModelFrom names unknown role '${role.differentModelFrom}'`);
-    if (role.tools && !toolPolicyNames?.has(role.tools))
-      errs.push(`role '${rname}': tools names unknown policy '${role.tools}'`);
   }
   for (const [mname, entry] of Object.entries(cfg.models ?? {})) {
     if (mname === "auto") continue;
@@ -572,7 +504,7 @@ export function opLoad({ cwd = process.cwd() } = {}) {
     configPath, dispatch, mode: cfg.master?.mode ?? "auto",
     schemaVersion: cfg.schemaVersion,
     roles: Object.fromEntries(Object.entries(cfg.roles ?? {}).map(([n, r]) => [n, {
-      use: r.use, tools: r.tools, differentModelFrom: r.differentModelFrom,
+      use: r.use, differentModelFrom: r.differentModelFrom,
       instructions: r.instructions ?? (r.instructionsFile ?? null),
     }])),
     models: cfg.models ?? {},
@@ -958,15 +890,9 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } 
     mode: cfg?.master?.mode ?? "auto",
     dispatch,
     maxGateLoops: cfg?.runtime?.defaults?.maxGateLoops ?? 2,
-    allowInlineWithoutGates: cfg?.runtime?.defaults?.allowInlineWithoutGates ?? false,
     steps: chosen, current: 0,
     resolved: state.resolved.roles,
     roleInstructions: Object.fromEntries(Object.entries(cfg?.roles ?? {}).map(([n, r]) => [n, r.instructions ?? null])),
-    enforcementMode: cfg?.runtime?.requireEnforcement ?? "best-effort",
-    roleToolPolicies: Object.fromEntries(Object.entries(cfg?.roles ?? {}).map(([n, r]) => [n, {
-      name: r.tools ?? null,
-      policy: r.tools ? structuredClone(cfg.toolPolicies?.[r.tools] ?? null) : null,
-    }])),
     masterModel: masterModel ?? null, masterFamily: masterFamily ?? null,
     phases: [], loops: {}, usage: [], status: "running",
     createdAt: new Date().toISOString(),
@@ -1065,57 +991,8 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
   return { next };
 }
 
-function advisoryDims(policy) {
-  const dims = {};
-  for (const key of ["network", "filesystem", "secrets", "bash"])
-    if (policy[key] !== undefined) dims[key] = policy[key];
-  return Object.keys(dims).length ? dims : null;
-}
-
-// Compiles a role's frozen canonical tool policy into the launcher-specific
-// {toolArgs} argv the selected profile's proven adapter declares. Returns
-// either a compiled { args, evidence } pair or an errorResult-shaped
-// { error, code: "tool_policy_unsupported", ... } for strict/sandbox fail-closed;
-// best-effort degrades to { args: [], evidence: { state: "degraded", ... } } instead.
-function compileToolPolicy({ role, policyName, policy, profile, enforcement }) {
-  if (!policy) return { args: [], evidence: { state: "not_requested" } };
-  const unenforced = advisoryDims(policy);
-  const base = { policy: policyName, binding: profile.tool, ...(unenforced ? { unenforced } : {}) };
-  const fail = (reason, extra = {}) =>
-    enforcement === "best-effort"
-      ? { args: [], evidence: { state: "degraded", ...base, reason, ...extra } }
-      : errorResult(
-          "tool_policy_unsupported",
-          `role '${role}': tool policy '${policyName}' unsupported (${reason})`,
-          { role, ...base, reason, ...extra },
-        );
-
-  if (!Object.hasOwn(policy, "allow")) return fail("deny_only_unsupported");
-
-  const denied = new Set(policy.deny ?? []);
-  const allowed = [...new Set(policy.allow)].filter((name) => !denied.has(name));
-
-  if (!allowed.length) {
-    const args = profile.toolControl?.disableAll?.argv;
-    return args
-      ? { args, evidence: { state: "enforced", ...base, mode: "disable_all" } }
-      : fail("disable_all_unsupported");
-  }
-
-  const adapter = profile.toolControl?.allowList;
-  if (!adapter) return fail("allow_list_unsupported");
-
-  const native = allowed.map((name) => adapter.names[name]);
-  const missing = allowed.find((name, index) => !native[index]);
-  if (missing) return fail("unmapped_tool", { tool: missing });
-
-  const args = adapter.joined
-    ? adapter.joined.argv.map((arg) => arg.replaceAll("{tools}", native.join(adapter.joined.separator)))
-    : native.flatMap((tool) => adapter.repeated.argv.map((arg) => arg.replaceAll("{tool}", tool)));
-  return { args, evidence: { state: "enforced", ...base, mode: "allow_list" } };
-}
-
 export async function opSpawn({ runId, phase, prompt } = {}) {
+
   const manifest = loadRun(runId);
   if (!manifest) return errorResult("unknown_run", `unknown runId '${runId}'`);
   if (manifest.status !== "running")
@@ -1134,12 +1011,7 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
       `phase '${phase}' has no resolved role '${step.role}'`,
     );
   if (resolved.binding === "host-native") {
-    const requestedPolicy = manifest.roleToolPolicies?.[step.role] ?? { name: null, policy: null };
-    return errorResult("native_spawn_required", "use the host's native subagent capability", {
-      requestedPolicy,
-      enforcementMode: manifest.enforcementMode ?? "best-effort",
-      enforcement: { state: "host_owned" },
-    });
+    return errorResult("native_spawn_required", "use the host's native subagent capability");
   }
 
   const { bindings } = loadBindings();
@@ -1157,19 +1029,6 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
       `registered tool '${resolved.binding}' no longer serves '${resolved.model}'`,
     );
 
-  const roleToolPolicy = manifest.roleToolPolicies?.[step.role] ?? { name: null, policy: null };
-  const compiled = compileToolPolicy({
-    role: step.role,
-    policyName: roleToolPolicy.name,
-    policy: roleToolPolicy.policy,
-    profile,
-    enforcement: manifest.enforcementMode ?? "best-effort",
-  });
-  if (compiled.error) return compiled;
-  manifest.enforcement ??= [];
-  manifest.enforcement.push({ phase, role: step.role, binding: profile.tool, ...compiled.evidence });
-  saveRun(manifest);
-
   const dir = runDir(runId);
   fs.mkdirSync(dir, { recursive: true });
   const promptFile = path.join(dir, `prompt-${phase}-${Date.now()}.md`);
@@ -1184,15 +1043,11 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
   };
   const argv = [];
   for (const arg of profile.run.argv) {
-    if (arg === "{toolArgs}") { argv.push(...compiled.args); continue; }
     let expanded = String(arg);
     for (const [placeholder, value] of Object.entries(values))
       expanded = expanded.replaceAll(placeholder, value);
     argv.push(expanded);
   }
-  const unknown = argv.find((arg) => PLACEHOLDER.test(arg));
-  if (unknown)
-    return errorResult("unknown_placeholder", `unexpanded placeholder in '${unknown}'`);
   if (resolveExecutable(argv[0]) !== profile.resolvedBin)
     return errorResult("spawn_failed", "run.argv[0] does not resolve to profile.bin");
 
@@ -1221,7 +1076,6 @@ export async function opSpawn({ runId, phase, prompt } = {}) {
     exitCode: execution.exitCode,
     durationMs: execution.durationMs,
     result,
-    enforcement: compiled.evidence,
   };
 }
 
@@ -1346,7 +1200,7 @@ async function startMcp() {
 
   server.tool(
     "moa_run_start",
-    "Start a gated run. Selects the pipeline (named; 'default' in workflow mode; or explicit ad-hoc steps in adaptive mode), creates the run store + manifest — freezing each role's tool-policy reference and runtime.requireEnforcement mode for the run's lifetime — and returns {runId, frame, next}. Print the frame to the user, then execute `next`.",
+    "Start a gated run. Selects the pipeline (named; 'default' in workflow mode; or explicit ad-hoc steps in adaptive mode), creates the run store + manifest, and returns {runId, frame, next}. Print the frame to the user, then execute `next`.",
     {
       task: z.string().describe("one-line task statement"),
       pipeline: z.string().optional().describe("named pipeline from the config"),
@@ -1380,7 +1234,7 @@ async function startMcp() {
 
   server.tool(
     "moa_spawn",
-    "Executes the current run phase through its resolved registered external agent tool. Before launch, re-runs the bound tool's modelDiscovery against its CURRENT inventory and refuses to launch when the frozen model is no longer served (model_not_served, instead of routing through a stale assumption). Compiles the run's frozen role tool policy against the currently loaded binding's proven toolControl adapter: strict/sandbox block launch with tool_policy_unsupported when the adapter can't express it, best-effort launches without tool-list flags and reports the degraded state/reason. Transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result plus an explicit enforcement block (also recorded in the run manifest). Does not advance the run; inspect the result and call moa_step_report separately.",
+    "Executes the current run phase through its resolved registered external agent tool. Before launch, re-runs the bound tool's modelDiscovery against its CURRENT inventory and refuses to launch when the frozen model is no longer served (model_not_served, instead of routing through a stale assumption). Transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result. Does not advance the run; inspect the result and call moa_step_report separately.",
     {
       runId: z.string(),
       phase: z.string().describe("must be the run's current non-master external phase"),
@@ -1409,7 +1263,7 @@ async function startMcp() {
 
   server.tool(
     "moa_binding_save",
-    "Validate, discover (live), and persist a learn-tool profile to ~/.moa/bindings/<tool>/profile.yml. Refuses in code any profile whose evidence lacks modelDiscovery+T1+T2+T4 = pass or promptSafe: true; a declared toolControl.disableAll/allowList mode is refused unless evidence.tests.disableAll/allowList is also 'pass' — no advertised control mode is trusted without its own live probe. Runs the discovery recipe once before persistence to confirm the model inventory currently served by the tool. The saved profile contains only run/output/capability/toolControl metadata — never the resolved model list.",
+    "Validate, discover (live), and persist a learn-tool profile to ~/.moa/bindings/<tool>/profile.yml. Refuses in code any profile whose evidence lacks modelDiscovery+T1+T2+T4 = pass, or that lacks promptSafe: true / canSelectModel: true, or whose run.argv names any placeholder beyond {bin} {model} {promptFile} {cwd} {maxTime}. Runs the discovery recipe once before persistence to confirm the model inventory currently served by the tool. The saved profile contains only run/output/capability metadata — never the resolved model list.",
     { profile: z.any().describe("the full profile object per references/learn-tool.md") },
     async (a) => json(await opBindingSave(a))
   );

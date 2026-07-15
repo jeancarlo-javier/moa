@@ -17,39 +17,21 @@ master:
   selfCertification: forbidden
   hardVerificationTags: [strong]
 
-toolPolicies:
-  repo_read_only:
-    allow: [read, find, search, lsp, ast_grep, todo]
-    network: none
-    filesystem: read_only
-  code_write_test:
-    allow: [read, find, search, lsp, ast_grep, ast_edit, edit, write, bash, todo]
-    network: off_sandbox
-    filesystem: worktree_write
-    secrets: scrubbed
-    bash:
-      mode: argv_allowlist
-      allow: [["*", "test"], ["git", "diff"], ["git", "status"]]
-      noShellMetachars: true
-
 roles:
   design-consult:
     use: [auto]
-    tools: repo_read_only
     instructions: |
       Frame the design brief: goals, audience, constraints, tokens to honor,
       and the artifact(s) the builder must produce.
 
   builder:
     use: [auto]
-    tools: code_write_test
     instructions: |
       Produce the design artifact within the declared write-set (assets, tokens,
       code). If something required is outside it, surface it instead of expanding.
 
   design-reviewer:
     use: [auto]
-    tools: repo_read_only
     differentModelFrom: builder
     instructions: |
       Compare the artifact to the brief and to the surrounding system. Check

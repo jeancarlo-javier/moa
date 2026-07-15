@@ -12,7 +12,7 @@ learn a new tool, but it never spawns one or runs the pipeline.
 
 ## Speak plainly to the user (governs every prompt and message you show)
 You reason internally in precise terms — *binding, profile, models registry, family/independence,
-enforcement, host-native*. **The user needs none of that vocabulary**, and showing it makes moa
+host-native*. **The user needs none of that vocabulary**, and showing it makes moa
 feel broken and intimidating (a newcomer reading *"OMP binding is broken (symlink target missing,
 parked model)"* will just ask "what's a binding?"). Translate at the boundary:
 
@@ -22,7 +22,7 @@ parked model)"* will just ask "what's a binding?"). Translate at the boundary:
 | models registry | "the AI models moa can use here" |
 | model family / independence / verifier | "a second, different AI to double-check the work" |
 | host-native | "the AI I'm already running on" |
-| enforcement grade · parked · symlink · `serves()` · registry | *don't mention — internal* |
+| parked · symlink · `serves()` · registry | *don't mention — internal* |
 | a tool's internal id (e.g. `omp`) | use it only if the user used it first |
 
 - **Lead with the outcome and the one next action**, not the internal cause. The user wants
@@ -241,18 +241,10 @@ model only if a research role exists. Everything else the host serves stays out 
 - Discovery returns display-name or otherwise noncanonical ids → reject that tool's rows,
   not normalize them; proceed with what survived.
 
-## Tool policy: canonical intent, launcher-specific enforcement
-`roles.<name>.tools` names a canonical least-privilege bundle (`toolPolicies.<name>` — declared
-by every bundled template you write from, never invented at init). `init` never edits or removes
-these — it splices only `models` and each role's `use` list; the `toolPolicies` block and each
-role's `tools:` reference pass through the chosen template verbatim. What that canonical policy
-compiles into is a launcher-specific decision, made live at `moa_spawn` against the tool profile
-currently loaded for that role — never at init time, and never named here.
-`runtime.requireEnforcement: strict` or `sandbox`, when configured, fails a spawn closed before
-the agent task launches when the selected binding's learned profile can't express the role's
-policy; `best-effort` (the schema default) still launches but reports the degradation explicitly
-in the result and run manifest — never hidden. Host-native phases receive the same frozen policy
-only as a request: the host, not the server, is responsible for applying it.
+## Role intent (advisory, never a runtime constraint)
+`roles.<name>.instructions` is advisory prompt steering the master passes to the role — it is
+*not* enforced and never constrains the spawned agent. `init` never edits or removes it; the
+`instructions:` reference passes through the chosen template verbatim.
 
 ## Stay agnostic
 Never write a CLI name, flag, or command into `.moa.yml` or your reasoning. The `models`

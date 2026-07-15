@@ -34,8 +34,10 @@ transition recorded in the manifest. Consequences:
 
 ## Budgets & determinism
 
-- Per-run `maxCost` / `maxTokens` / `maxTime` (from `runtime.defaults`) are enforced; exceeding
-  them halts the run cleanly with the partial manifest intact.
-- `usage` and `cost` from every `SpawnResult` accumulate into the manifest.
+- Budgets are **not** enforced, and moa does not meter spawns itself: `moa_spawn` returns no
+  usage or cost. Only what the conductor passes to `moa_step_report` as `usage` accumulates into
+  the manifest — an honest record of what was reported, nothing more. A run is bounded per spawn
+  by the profile's own `run.timeoutSeconds` and the server's output limit, never by a per-run
+  cost or token ceiling.
 - For CI / release-critical templates, the `models` registry must use **pinned** refs (no `auto`),
   so the same config produces the same routing on every machine.
