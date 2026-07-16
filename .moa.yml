@@ -1,0 +1,169 @@
+# .moa.yml — moa, dogfooding itself
+# Developing moa = editing a precision spec: the SKILL.md hot path (re-read every run),
+# references/*, the 5 templates, schema/config.schema.json, and evals. The failure modes here
+# are not broken builds — they are token bloat on the hot path, a leaked CLI name (breaks the
+# agnostic invariant), a schema change that doesn't propagate to every template, a dangling
+# cross-reference, or a dropped behavioral invariant. The roles + gates below encode those exact
+# checks. No `default` pipeline -> adaptive mode: the master picks the flow per task.
+schemaVersion: 1
+
+template:
+  base: custom
+  projectType: moa-skill
+
+# Four models, all referenced by roles. Fable plans; Sonnet edits; Sol independently reviews
+# and verifies. MiniMax is the explicit cross-family gate fallback if Sol is unavailable.
+# Registry = the union of per-role picks, never the host's full set (AGENTS.md).
+models:
+  fable:
+    id: anthropic/claude-fable-5
+    family: claude
+    effort: [high]
+    tags: [strong]
+  sonnet:
+    id: anthropic/claude-sonnet-4-6
+    family: claude
+    effort: [high]
+    tags: [strong]
+  gpt-5.6-sol:
+    id: openai-codex/gpt-5.6-sol
+    family: gpt
+    effort: [medium]
+    context: 1000000
+    tags: [strong]
+  minimax-m3:
+    id: minimax-1m/MiniMax-M3
+    family: minimax
+    tags: [strong, cheap]
+
+master:
+  mode: auto                   # right-size small edits; the critical validate gate stays absolute
+
+roles:
+  planner:
+    use: [fable, auto]
+    instructions: |
+      Classify the change as skill, MCP, cross-cutting, narrow, or compaction work. Name exact
+      files, observable contracts, regression risks, and executable evidence. Skill plans define
+      baseline/current evals and discriminating assertions; MCP plans cover direct operations and
+      the protocol transport; cross-cutting plans map prose requirements to enforcement and tests.
+      State the hot-path token effect whenever SKILL.md moves.
+
+  plan-reviewer:
+    use: [gpt-5.6-sol, minimax-m3, auto]
+    differentModelFrom: planner
+    instructions: |
+      Reject nominal checks without a runnable grading path, non-discriminating skill assertions,
+      a missing pre-change baseline, or MCP plans that omit transport, errors, or state transitions.
+      Require complete schema/template propagation and intact cross-references. For compaction,
+      reject capability deletion disguised as token reduction. APPROVE only when executable as-is.
+
+  editor:
+    use: [sonnet, auto]
+    instructions: |
+      Implement only approved files. Preserve runtime, task, and model agnosticism; keep skill prose
+      aligned with MCP enforcement. Tighten hot-path prose before appending and surface any required
+      out-of-scope write instead of silently expanding scope.
+
+  diff-reviewer:
+    use: [gpt-5.6-sol, minimax-m3, auto]
+    differentModelFrom: editor
+    instructions: |
+      Compare the diff with the approved plan and contracts. Check scope, maintainability, duplicate
+      conventions, dangling references, hot-path bloat, and mismatches between skill instructions
+      and MCP enforcement. Static review never substitutes for execution evidence.
+
+  skill-validator:
+    use: [gpt-5.6-sol, minimax-m3, auto]
+    differentModelFrom: editor
+    instructions: |
+      In isolation, run the changed and pre-change skills against identical evals; grade objective
+      assertions and report per-case evidence, pass-rate, token, and timing deltas. Generate the
+      standard human-review artifact, evaluate trigger near-misses when the description changes,
+      and verify references plus hot-path impact. BLOCKED, not APPROVE, when no real eval path exists.
+
+  mcp-validator:
+    use: [gpt-5.6-sol, minimax-m3, auto]
+    differentModelFrom: editor
+    instructions: |
+      In isolation, run the complete MCP contract suite and exercise direct operations plus real
+      JSON-RPC tools/list and tools/call paths. Check input schemas, serialization, errors, state
+      transitions, live inventory drift, mutation-floor behavior, independence grading, and STDIO
+      output discipline. Require a regression test for each new observable contract.
+
+  release-validator:
+    use: [gpt-5.6-sol, minimax-m3, auto]
+    differentModelFrom: editor
+    instructions: |
+      For cross-cutting work, require both skill and MCP evidence contracts, schema validation for
+      the changed config and every affected template, cross-references, and prose-to-enforcement
+      alignment. For tighten, run the minimum complete evidence matrix selected by touched files;
+      narrow scope never excuses skipping a changed observable contract.
+
+  compactor:
+    use: [sonnet, auto]
+    instructions: |
+      Reduce the SKILL.md hot path through progressive disclosure, never capability deletion.
+      Relocate detail to references or deterministic bundled resources; preserve each constraint's
+      reason, behavioral coverage, and trigger quality.
+
+  capability-verifier:
+    use: [gpt-5.6-sol, minimax-m3, auto]
+    differentModelFrom: compactor
+    instructions: |
+      In isolation, compare the compacted skill with the pre-change baseline. APPROVE only when
+      hot-path tokens fall without pass-rate, invariant, or trigger regression. Verify preservation
+      claims and name every touched capability the eval set does not cover.
+
+pipelines:
+  skill-change:
+    description: Eval-driven skill, reference, template, or behavioral-eval change with baseline comparison and independent review.
+    steps:
+      - { phase: frame,       role: master }
+      - { phase: plan,        role: planner }
+      - { phase: review-plan, role: plan-reviewer, gate: standard, loopBackTo: plan }
+      - { phase: execute,     role: editor }
+      - { phase: review-work, role: diff-reviewer, gate: standard, loopBackTo: execute }
+      - { phase: validate,    role: skill-validator, gate: critical, loopBackTo: execute }
+      - { phase: finalize,    role: master }
+
+  mcp-change:
+    description: MCP implementation, contract, package, documentation, or server-test change with handler and transport evidence.
+    steps:
+      - { phase: frame,       role: master }
+      - { phase: plan,        role: planner }
+      - { phase: review-plan, role: plan-reviewer, gate: standard, loopBackTo: plan }
+      - { phase: execute,     role: editor }
+      - { phase: review-work, role: diff-reviewer, gate: standard, loopBackTo: execute }
+      - { phase: validate,    role: mcp-validator, gate: critical, loopBackTo: execute }
+      - { phase: finalize,    role: master }
+
+  cross-cutting:
+    description: Coordinated skill, MCP, schema, or template change requiring both behavioral and enforced-contract evidence.
+    steps:
+      - { phase: frame,       role: master }
+      - { phase: plan,        role: planner }
+      - { phase: review-plan, role: plan-reviewer, gate: standard, loopBackTo: plan }
+      - { phase: execute,     role: editor }
+      - { phase: review-work, role: diff-reviewer, gate: standard, loopBackTo: execute }
+      - { phase: validate,    role: release-validator, gate: critical, loopBackTo: execute }
+      - { phase: finalize,    role: master }
+
+  tighten:
+    description: Narrow single-surface fix or documentation correction with the touched surface's complete critical evidence.
+    steps:
+      - { phase: frame,    role: master }
+      - { phase: plan,     role: planner }
+      - { phase: execute,  role: editor }
+      - { phase: validate, role: release-validator, gate: critical, loopBackTo: execute }
+      - { phase: finalize, role: master }
+
+  compact:
+    description: Measured SKILL.md hot-path reduction with baseline behavioral and trigger parity.
+    steps:
+      - { phase: frame,       role: master }
+      - { phase: plan,        role: planner }
+      - { phase: review-plan, role: plan-reviewer, gate: standard, loopBackTo: plan }
+      - { phase: execute,     role: compactor }
+      - { phase: validate,    role: capability-verifier, gate: critical, loopBackTo: execute }
+      - { phase: finalize,    role: master }
