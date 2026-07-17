@@ -11,7 +11,7 @@ process.env.MOA_HOME = path.join(TMP, "home");
 const REPO = path.join(TMP, "repo");
 fs.mkdirSync(REPO, { recursive: true });
 
-const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opSpawnStatus, opSpawnCancel, opInit, opBindingSave } =
+const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opSpawnStatus, opSpawnCancel, opSpawnWait, opInit, opBindingSave } =
   await import("./server.mjs");
 
 const CANONICAL_FAKE_MODEL = "vendor/fake-9";
@@ -407,6 +407,7 @@ await ta("tools: a proven save is immediately discoverable", async () => {
   assert.ok(record, `tool ${tool} missing from listing`);
   assert.deepEqual(record.usage, {
     start: { tool: "moa_spawn", arguments: ["runId", "phase", "prompt", "requestKey"] },
+    wait: { tool: "moa_spawn_wait", arguments: ["runId", "spawnId", "waitMs"] },
     status: { tool: "moa_spawn_status", arguments: ["runId", "spawnId"] },
     cancel: { tool: "moa_spawn_cancel", arguments: ["runId", "spawnId"] },
   });
@@ -1680,6 +1681,211 @@ await ta("spawn jobs: a foreign status call honors the origin's live child inste
   }
 });
 
+// --- spawn wait ----------------------------------------------------------------
+
+await ta("spawn wait: returns the exact terminal result shortly after release", async () => {
+  const ready = path.join(TMP, `wait-ok-ready-${crypto.randomUUID()}`);
+  const release = path.join(TMP, `wait-ok-release-${crypto.randomUUID()}`);
+  const profile = runnableProfile({
+    tool: `wait-ok-${crypto.randomUUID()}`,
+    mode: "wait",
+    timeoutSeconds: 5,
+    runArgs: ["--ready-file", ready, "--release-file", release],
+  });
+  const { run } = await startExternalRun(profile);
+  const start = opSpawn({ runId: run.runId, phase: "work", prompt: "wait-result", requestKey: crypto.randomUUID() });
+  await waitFor(() => fs.existsSync(ready));
+  const waitPromise = opSpawnWait({ runId: run.runId, spawnId: start.spawnId, waitMs: 5000 });
+  await new Promise((resolve) => setTimeout(resolve, 50));
+  const releasedAt = Date.now();
+  fs.writeFileSync(release, "go");
+  const result = await waitPromise;
+  assert.equal(result.status, "completed", JSON.stringify(result));
+  assert.equal(result.result, "wait-result");
+  assert.ok(Date.now() - releasedAt < 1000, `wait resolved too slowly after release: ${Date.now() - releasedAt}ms`);
+});
+
+await ta("spawn wait: expires within the bounded window with the latest nonterminal state and leaves the worker alive", async () => {
+  const ready = path.join(TMP, `wait-expire-ready-${crypto.randomUUID()}`);
+  const release = path.join(TMP, `wait-expire-release-${crypto.randomUUID()}`);
+  const profile = runnableProfile({
+    tool: `wait-expire-${crypto.randomUUID()}`,
+    mode: "wait",
+    timeoutSeconds: 5,
+    runArgs: ["--ready-file", ready, "--release-file", release],
+  });
+  const { run } = await startExternalRun(profile);
+  const start = opSpawn({ runId: run.runId, phase: "work", prompt: "expire-me", requestKey: crypto.randomUUID() });
+  await waitFor(() => fs.existsSync(ready));
+  const pid = Number(fs.readFileSync(ready, "utf8"));
+
+  const startedAt = Date.now();
+  const result = await opSpawnWait({ runId: run.runId, spawnId: start.spawnId, waitMs: 300 });
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed >= 300 && elapsed < 900, `expiry did not respect waitMs: ${elapsed}ms`);
+  assert.ok(["queued", "discovering", "running"].includes(result.status), JSON.stringify(result));
+  assert.doesNotThrow(() => process.kill(pid, 0), "worker should still be alive after wait expiry");
+
+  opSpawnCancel({ runId: run.runId, spawnId: start.spawnId });
+  await waitFor(() => {
+    const status = opSpawnStatus({ runId: run.runId, spawnId: start.spawnId });
+    return status.status === "cancelled" ? status : null;
+  });
+});
+
+await ta("spawn wait: aborting only the wait returns promptly and leaves the worker alive", async () => {
+  const ready = path.join(TMP, `wait-abort-ready-${crypto.randomUUID()}`);
+  const release = path.join(TMP, `wait-abort-release-${crypto.randomUUID()}`);
+  const profile = runnableProfile({
+    tool: `wait-abort-${crypto.randomUUID()}`,
+    mode: "wait",
+    timeoutSeconds: 5,
+    runArgs: ["--ready-file", ready, "--release-file", release],
+  });
+  const { run } = await startExternalRun(profile);
+  const start = opSpawn({ runId: run.runId, phase: "work", prompt: "abort-me", requestKey: crypto.randomUUID() });
+  await waitFor(() => fs.existsSync(ready));
+  const pid = Number(fs.readFileSync(ready, "utf8"));
+
+  const controller = new AbortController();
+  const startedAt = Date.now();
+  const waitPromise = opSpawnWait({ runId: run.runId, spawnId: start.spawnId, waitMs: 5000 }, { signal: controller.signal });
+  setTimeout(() => controller.abort("test aborting the wait only"), 50);
+  const result = await waitPromise;
+  const elapsed = Date.now() - startedAt;
+  assert.ok(elapsed < 1000, `abort did not return promptly: ${elapsed}ms`);
+  assert.ok(["queued", "discovering", "running"].includes(result.status), JSON.stringify(result));
+  assert.doesNotThrow(() => process.kill(pid, 0), "worker should still be alive after aborting only the wait");
+
+  opSpawnCancel({ runId: run.runId, spawnId: start.spawnId });
+  await waitFor(() => {
+    const status = opSpawnStatus({ runId: run.runId, spawnId: start.spawnId });
+    return status.status === "cancelled" ? status : null;
+  });
+});
+
+await ta("spawn wait: abort after the spawn reaches terminal state returns the terminal result, not a stale pre-sleep snapshot", async () => {
+  const ready = path.join(TMP, `wait-abort-fresh-ready-${crypto.randomUUID()}`);
+  const release = path.join(TMP, `wait-abort-fresh-release-${crypto.randomUUID()}`);
+  const profile = runnableProfile({
+    tool: `wait-abort-fresh-${crypto.randomUUID()}`,
+    mode: "wait",
+    timeoutSeconds: 5,
+    runArgs: ["--ready-file", ready, "--release-file", release],
+  });
+  const { run } = await startExternalRun(profile);
+  const start = opSpawn({ runId: run.runId, phase: "work", prompt: "fresh-result", requestKey: crypto.randomUUID() });
+  await waitFor(() => fs.existsSync(ready));
+
+  try {
+    const controller = new AbortController();
+    // Enters opSpawnWait's poll loop and starts its 250ms abortableDelay almost immediately —
+    // no earlier await stands between the initial status read and that delay.
+    const waitPromise = opSpawnWait({ runId: run.runId, spawnId: start.spawnId, waitMs: 5000 }, { signal: controller.signal });
+
+    // Release the worker right away and independently confirm — via a separate opSpawnStatus
+    // poll, not opSpawnWait's own — that the durable record actually reached "completed".
+    // This all happens while opSpawnWait is still asleep inside its first 250ms delay.
+    fs.writeFileSync(release, "go");
+    await waitFor(() => {
+      const status = opSpawnStatus({ runId: run.runId, spawnId: start.spawnId });
+      return status.status === "completed" ? status : null;
+    });
+
+    // Abort the wait itself before that 250ms delay timer fires on its own, forcing the abort
+    // branch of the poll loop instead of the ordinary "delay expired, re-read" branch.
+    controller.abort("test aborting after the spawn went terminal");
+    const result = await waitPromise;
+
+    assert.equal(result.status, "completed", JSON.stringify(result));
+    assert.equal(result.result, "fresh-result");
+  } finally {
+    opSpawnCancel({ runId: run.runId, spawnId: start.spawnId });
+  }
+});
+
+await ta("spawn wait: terminal jobs and error results return immediately", async () => {
+  let startedAt = Date.now();
+  let result = await opSpawnWait({
+    runId: "run-missing",
+    spawnId: `spawn-${crypto.randomBytes(12).toString("hex")}`,
+    waitMs: 5000,
+  });
+  assert.equal(result.code, "unknown_run");
+  assert.ok(Date.now() - startedAt < 200, "unknown_run should not wait");
+
+  const { run } = await startExternalRun(runnableProfile({ tool: `wait-unknown-spawn-${crypto.randomUUID()}` }));
+  startedAt = Date.now();
+  result = await opSpawnWait({
+    runId: run.runId,
+    spawnId: `spawn-${crypto.randomBytes(12).toString("hex")}`,
+    waitMs: 5000,
+  });
+  assert.equal(result.code, "unknown_spawn");
+  assert.ok(Date.now() - startedAt < 200, "unknown_spawn should not wait");
+
+  const done = await spawnResult(run.runId, "work", "already-done");
+  assert.equal(done.status, "completed");
+  startedAt = Date.now();
+  result = await opSpawnWait({ runId: run.runId, spawnId: done.spawnId, waitMs: 5000 });
+  assert.ok(Date.now() - startedAt < 200, "terminal job should not wait");
+  assert.equal(result.status, "completed");
+  assert.equal(result.result, "already-done");
+});
+
+await ta("spawn wait: a dead-owner record is promoted to terminal interrupted during the initial read", async () => {
+  const { repo, run } = await startExternalRun(runnableProfile({ tool: `wait-dead-owner-${crypto.randomUUID()}` }));
+  const spawnId = `spawn-${crypto.randomBytes(12).toString("hex")}`;
+  const spawnsDir = path.join(repo, ".moa", "runs", run.runId, "spawns");
+  fs.mkdirSync(spawnsDir, { recursive: true });
+  const dead = {
+    schemaVersion: 1,
+    spawnId, runId: run.runId, phase: "work",
+    stepIndex: 0,
+    promptFile: path.join(repo, ".moa", "runs", run.runId, `prompt-${spawnId}.md`),
+    tool: "wait-dead-owner", model: "vendor/fake-9", family: "fake",
+    status: "discovering",
+    pid: 0x7ffffffe, ownerPid: 0x7ffffffd,
+    result: null, failure: null,
+    createdAt: new Date().toISOString(),
+    updatedAt: new Date().toISOString(),
+  };
+  fs.writeFileSync(path.join(spawnsDir, `${spawnId}.json`), JSON.stringify(dead, null, 2) + "\n");
+  const startedAt = Date.now();
+  const result = await opSpawnWait({ runId: run.runId, spawnId, waitMs: 5000 });
+  assert.ok(Date.now() - startedAt < 300, "dead-owner promotion should resolve on the initial read");
+  assert.equal(result.status, "interrupted", JSON.stringify(result));
+  assert.equal(result.failure?.code, "server_restarted");
+});
+
+await ta("spawn wait: waitMs 0 is an immediate snapshot", async () => {
+  const ready = path.join(TMP, `wait-zero-ready-${crypto.randomUUID()}`);
+  const release = path.join(TMP, `wait-zero-release-${crypto.randomUUID()}`);
+  const profile = runnableProfile({
+    tool: `wait-zero-${crypto.randomUUID()}`,
+    mode: "wait",
+    timeoutSeconds: 5,
+    runArgs: ["--ready-file", ready, "--release-file", release],
+  });
+  const { run } = await startExternalRun(profile);
+  const start = opSpawn({ runId: run.runId, phase: "work", prompt: "zero-wait", requestKey: crypto.randomUUID() });
+  await waitFor(() => fs.existsSync(ready));
+  const pid = Number(fs.readFileSync(ready, "utf8"));
+
+  const startedAt = Date.now();
+  const result = await opSpawnWait({ runId: run.runId, spawnId: start.spawnId, waitMs: 0 });
+  assert.ok(Date.now() - startedAt < 200, "waitMs: 0 should not sleep");
+  assert.ok(["queued", "discovering", "running"].includes(result.status), JSON.stringify(result));
+  assert.doesNotThrow(() => process.kill(pid, 0));
+
+  opSpawnCancel({ runId: run.runId, spawnId: start.spawnId });
+  await waitFor(() => {
+    const status = opSpawnStatus({ runId: run.runId, spawnId: start.spawnId });
+    return status.status === "cancelled" ? status : null;
+  });
+});
+
+
 
 await ta("init: each template inits and loads with zero errors", async () => {
   for (const template of [
@@ -1984,6 +2190,59 @@ await ta("tools/call: stopping the server mid-spawn terminates the child and per
     assert.equal(persisted.failure?.code, persisted.status, JSON.stringify(persisted));
   } finally { try { c.stop(); } catch {} }
 });
+
+await ta("tools/call: moa_spawn_wait rejects invalid waitMs bounds over JSON-RPC", async () => {
+  const c = await mcpClient({ cwd: REPO });
+  try {
+    assert.ok(!(await c.call("moa_load", { cwd: REPO })).error);
+    const args = { runId: "run-missing", spawnId: `spawn-${crypto.randomBytes(12).toString("hex")}` };
+    for (const waitMs of [-1, 0.5, 20001]) {
+      const r = await c.call("moa_spawn_wait", { ...args, waitMs });
+      assert.ok(r._threw, `waitMs ${waitMs} should be rejected at the tool boundary: ${JSON.stringify(r)}`);
+    }
+    // in-bounds values pass the schema and reach the handler (unknown_run proves it)
+    const ok = await c.call("moa_spawn_wait", { ...args, waitMs: 20000 });
+    assert.match(JSON.stringify(ok), /unknown_run/);
+  } finally { c.stop(); }
+});
+
+await ta("tools/call: moa_spawn_wait returns on completion", async () => {
+  const ready = path.join(TMP, `wire-wait-ready-${crypto.randomUUID()}`);
+  const release = path.join(TMP, `wire-wait-release-${crypto.randomUUID()}`);
+  const profile = runnableProfile({
+    tool: `wire-wait-${crypto.randomUUID()}`,
+    mode: "wait",
+    timeoutSeconds: 5,
+    runArgs: ["--ready-file", ready, "--release-file", release],
+  });
+  await opBindingSave({ profile });
+  const repo = writeRouteRepo(`wire-wait-${crypto.randomUUID()}`, "external", profile.tool);
+  const c = await mcpClient({ cwd: repo });
+  try {
+    const send = (name, args, timeout = 10_000) => c.call(name, args, { requestTimeoutMs: timeout });
+    assert.ok(!(await send("moa_load", { cwd: repo })).error);
+    assert.ok(!(await send("moa_resolve", { hostModels: HOST })).error);
+    const run = await send("moa_run_start", {
+      task: "wire wait", steps: [{ phase: "work", role: "worker" }],
+      masterModel: "host/master", masterFamily: "host",
+    });
+    const start = await send("moa_spawn", {
+      runId: run.runId, phase: "work", prompt: "wire-wait-result",
+      requestKey: crypto.randomUUID(),
+    }, 250);
+    assert.equal(start.status, "queued");
+    await waitFor(() => fs.existsSync(ready));
+    // issue the wait BEFORE releasing so it genuinely blocks then wakes on completion.
+    const waitCall = send("moa_spawn_wait", {
+      runId: run.runId, spawnId: start.spawnId, waitMs: 5000,
+    }, 6000);
+    await new Promise((resolve) => setTimeout(resolve, 100));
+    fs.writeFileSync(release, "go");
+    const completed = await waitCall;
+    assert.equal(completed.status, "completed", JSON.stringify(completed));
+    assert.equal(completed.result, "wire-wait-result");
+  } finally { c.stop(); }
+});
 // The run path above still left most of the toolset unproven over the wire — including
 // moa_binding_save, the one tool whose schema bug started all this. A handler that throws or
 // mis-transports its arguments must not be able to hide behind in-process tests.
@@ -2017,6 +2276,8 @@ await ta("tools/call: every advertised tool answers over the wire", async () => 
       moa_spawn_status: [{ runId: "no-such-run" },
         (r) => assert.match(JSON.stringify(r), /unknown_run|unknown runId/)],
       moa_spawn_cancel: [{ runId: "no-such-run", spawnId: "spawn-000000000000000000000000" },
+        (r) => assert.match(JSON.stringify(r), /unknown_run|unknown runId/)],
+      moa_spawn_wait: [{ runId: "no-such-run", spawnId: "spawn-000000000000000000000000" },
         (r) => assert.match(JSON.stringify(r), /unknown_run|unknown runId/)],
     };
     assert.deepEqual(advertised.filter((t) => !(t in calls)), [], "a tool is advertised but never called here");

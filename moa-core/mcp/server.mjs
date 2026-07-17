@@ -245,6 +245,7 @@ function toolRecord(profile, resolvedBin) {
     modelDiscovery: { registered: Boolean(profile.modelDiscovery) },
     usage: {
       start: { tool: "moa_spawn", arguments: ["runId", "phase", "prompt", "requestKey"] },
+      wait: { tool: "moa_spawn_wait", arguments: ["runId", "spawnId", "waitMs"] },
       status: { tool: "moa_spawn_status", arguments: ["runId", "spawnId"] },
       cancel: { tool: "moa_spawn_cancel", arguments: ["runId", "spawnId"] },
     },
@@ -1419,6 +1420,41 @@ export function opSpawnCancel({ runId, spawnId } = {}) {
   return publicSpawn(job);
 }
 
+// Sleeps up to `ms`, resolving early if `signal` aborts. Used by opSpawnWait's poll loop
+// so aborting the WAIT (not the spawn) returns promptly. Removes its own abort listener
+// both when the timer fires normally and when the signal aborts, and never schedules a
+// timer for an already-aborted signal.
+function abortableDelay(ms, signal) {
+  return new Promise((resolve) => {
+    if (signal?.aborted) { resolve(); return; }
+    const onAbort = () => { clearTimeout(timer); resolve(); };
+    const timer = setTimeout(() => {
+      signal?.removeEventListener("abort", onAbort);
+      resolve();
+    }, ms);
+    signal?.addEventListener("abort", onAbort, { once: true });
+  });
+}
+
+// Bounded long-poll over the same durable record opSpawnStatus reads, so same-process,
+// foreign-process, and reconnect callers share one path. Sleeps only for the record's
+// advertised pollAfterMs, never longer than the caller's remaining wait budget. Aborting
+// this call (via signal) only stops the loop — the spawn's own controller is never
+// touched, so the worker keeps running.
+export async function opSpawnWait({ runId, spawnId, waitMs = 20_000 } = {}, { signal } = {}) {
+  const deadline = Date.now() + waitMs;
+  let job = opSpawnStatus({ runId, spawnId });
+  while (!job.error && !JOB_STATUS[job.status]) {
+    if (signal?.aborted) break;
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await abortableDelay(Math.min(job.pollAfterMs ?? 250, remaining), signal);
+    if (signal?.aborted) { job = opSpawnStatus({ runId, spawnId }); break; }
+    job = opSpawnStatus({ runId, spawnId });
+  }
+  return job;
+}
+
 // --- init ------------------------------------------------------------------
 
 export function opInit({ template, registry = {}, roles = {}, force = false, cwd = process.cwd() } = {}) {
@@ -1537,11 +1573,11 @@ async function startMcp() {
     },
     async (a) => json(await opResolve(a))
   );
-  // Spawn tools registered below — durable, returns immediately. After spawn completes,
-  // poll moa_spawn_status until terminal; only moa_step_report advances pipeline state.
+  // Spawn tools registered below — durable, returns immediately. After spawn, loop
+  // moa_spawn_wait until terminal; only moa_step_report advances pipeline state.
   server.tool(
     "moa_spawn",
-    "Durably starts the current external phase and returns immediately. requestKey makes retries idempotent. Poll moa_spawn_status until terminal; spawning never advances the run. Use moa_spawn_cancel for the durable cancellation path — aborting the JSON-RPC request races the macrotask and may return before cancellation is observable.",
+    "Durably starts the current external phase and returns immediately. requestKey makes retries idempotent. Loop moa_spawn_wait until terminal; spawning never advances the run. Use moa_spawn_cancel for the durable cancellation path — aborting the JSON-RPC request races the macrotask and may return before cancellation is observable.",
     {
       runId: z.string(),
       phase: z.string().describe("must be the run's current non-master external phase"),
@@ -1552,8 +1588,19 @@ async function startMcp() {
   );
 
   server.tool(
+    "moa_spawn_wait",
+    "Durably waits on the current external spawn's record and returns as soon as it reaches a terminal state — the normal way to observe a moa_spawn to completion, replacing shell sleeps or manual backoff. Bounded 0-20000ms, default 20000ms (below the common 30-second MCP request deadline); waitMs: 0 is an immediate snapshot. Returns the latest nonterminal state if the window expires or this call is aborted — aborting the wait does NOT cancel the spawn, which keeps running. Loop this call until terminal.",
+    {
+      runId: z.string(),
+      spawnId: z.string().regex(SPAWN_ID),
+      waitMs: z.number().int().min(0).max(20_000).optional().describe("bounded wait in ms, 0-20000; default 20000"),
+    },
+    async (args, extra) => json(await opSpawnWait(args, { signal: extra.signal }))
+  );
+
+  server.tool(
     "moa_spawn_status",
-    "Returns the latest durable state for an external spawn. Omit spawnId to recover the latest job for the current step. Terminal results are repeatable and survive reconnects.",
+    "Non-blocking snapshot/recovery read of the latest durable state for an external spawn — for reconnects or a one-off check without waiting. Omit spawnId to recover the latest job for the current step. Terminal results are repeatable and survive reconnects. For the normal completion path, loop moa_spawn_wait instead of polling this.",
     {
       runId: z.string(),
       spawnId: z.string().regex(SPAWN_ID).optional(),
@@ -1564,7 +1611,7 @@ async function startMcp() {
 
   server.tool(
     "moa_spawn_cancel",
-    "Requests cancellation of an active external spawn. Poll moa_spawn_status until the job reaches cancelled.",
+    "Requests cancellation of an active external spawn. Loop moa_spawn_wait until the job reaches cancelled.",
     {
       runId: z.string(),
       spawnId: z.string().regex(SPAWN_ID),
