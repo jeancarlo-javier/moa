@@ -243,11 +243,19 @@ function toolRecord(profile, resolvedBin) {
     ...(resolvedBin ? {} : { reason: "executable_not_found" }),
     capabilities: profile.capabilities ?? {},
     modelDiscovery: { registered: Boolean(profile.modelDiscovery) },
-    usage: { tool: "moa_spawn", arguments: ["runId", "phase", "prompt"] },
+    usage: {
+      start: { tool: "moa_spawn", arguments: ["runId", "phase", "prompt", "requestKey"] },
+      status: { tool: "moa_spawn_status", arguments: ["runId", "spawnId"] },
+      cancel: { tool: "moa_spawn_cancel", arguments: ["runId", "spawnId"] },
+    },
   };
 }
 
 function discoveryError(result) {
+  if (result.code === "cancelled")
+    return errorResult("cancelled", "model discovery cancelled", {
+      durationMs: result.durationMs,
+    });
   const code = {
     spawn_failed: "model_discovery_failed",
     nonzero_exit: "model_discovery_failed",
@@ -282,7 +290,7 @@ function parseDiscoveredModels(stdout, output) {
   return { models: [...new Set(ids)].map((id) => ({ id })) };
 }
 
-async function discoverToolModels(profile, resolvedBin = resolveExecutable(profile.bin)) {
+async function discoverToolModels(profile, resolvedBin = resolveExecutable(profile.bin), signal) {
   if (!profile.modelDiscovery)
     return errorResult("model_discovery_unavailable", `tool '${profile.tool}' has no model discovery recipe`);
   if (!resolvedBin)
@@ -299,6 +307,7 @@ async function discoverToolModels(profile, resolvedBin = resolveExecutable(profi
     cwd: os.tmpdir(),
     stdin: null,
     timeoutSeconds: profile.modelDiscovery.timeoutSeconds ?? 10,
+    signal,
   });
   if (execution.error) return discoveryError(execution);
   if (execution.exitCode !== 0)
@@ -710,76 +719,6 @@ function extractResult(stdout, output = {}) {
   }
 }
 
-function runChild({ bin, args, cwd, stdin, timeoutSeconds }) {
-  return new Promise((resolve) => {
-    const started = Date.now();
-    let timer;
-    const child = spawn(bin, args, {
-      cwd,
-      shell: false,
-      stdio: [stdin === null ? "ignore" : "pipe", "pipe", "pipe"],
-    });
-    const stdoutChunks = [];
-    const stderrChunks = [];
-    let bytes = 0;
-    let forcedCode = null;
-    let settled = false;
-
-    const stop = (code) => {
-      if (forcedCode) return;
-      forcedCode = code;
-      child.kill("SIGTERM");
-      setTimeout(() => child.kill("SIGKILL"), 1000).unref();
-    };
-    const collect = (chunks) => (chunk) => {
-      bytes += chunk.length;
-      if (bytes > MAX_OUTPUT_BYTES) {
-        stop("output_limit_exceeded");
-        return;
-      }
-      chunks.push(chunk);
-    };
-
-    child.stdout.on("data", collect(stdoutChunks));
-    child.stderr.on("data", collect(stderrChunks));
-    child.on("error", (error) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      resolve(errorResult("spawn_failed", error.message, {
-        durationMs: Date.now() - started,
-      }));
-    });
-    child.on("close", (exitCode, signal) => {
-      if (settled) return;
-      settled = true;
-      clearTimeout(timer);
-      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
-      const stderr = Buffer.concat(stderrChunks).toString("utf8");
-      if (forcedCode) {
-        resolve(errorResult(
-          forcedCode,
-          forcedCode === "timeout"
-            ? "external tool timed out"
-            : "external tool exceeded output limit",
-          { exitCode, signal, stderr, durationMs: Date.now() - started },
-        ));
-        return;
-      }
-      resolve({
-        exitCode,
-        signal,
-        stdout,
-        stderr,
-        durationMs: Date.now() - started,
-      });
-    });
-
-    timer = setTimeout(() => stop("timeout"), timeoutSeconds * 1000);
-    if (stdin !== null) child.stdin.end(stdin);
-  });
-}
-
 // --- run state machine ----------------------------------------------------
 
 // The only statuses a manifest may carry, and the single source of truth for them:
@@ -794,7 +733,182 @@ const RUN_STATUS = Object.freeze({
   blocked_verifier_disagreement: "a gate returned BLOCKED; needs an independent arbiter",
   verification_unavailable: "the next gate has no independent verifier to route to",
 });
+function runChild({ bin, args, cwd, stdin, timeoutSeconds, signal, onSpawn }) {
+  return new Promise((resolve) => {
+    const started = Date.now();
+    let timer;
+    let killTimer;
+    const child = spawn(bin, args, {
+      cwd,
+      shell: false,
+      stdio: [stdin === null ? "ignore" : "pipe", "pipe", "pipe"],
+    });
+    const stdoutChunks = [];
+    const stderrChunks = [];
+    let bytes = 0;
+    let forcedCode = null;
+    let settled = false;
+
+    const stop = (code) => {
+      if (forcedCode || settled) return;
+      forcedCode = code;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 1000);
+      // keep killTimer referenced — the escalation must survive even if nothing else holds
+      // the event loop, otherwise a child that ignores SIGTERM would run to its external timeout.
+    };
+    const onAbort = () => stop("cancelled");
+    const collect = (chunks) => (chunk) => {
+      bytes += chunk.length;
+      if (bytes > MAX_OUTPUT_BYTES) return stop("output_limit_exceeded");
+      chunks.push(chunk);
+    };
+    const finish = (value) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      signal?.removeEventListener("abort", onAbort);
+      resolve(value);
+    };
+
+    child.stdout.on("data", collect(stdoutChunks));
+    child.stderr.on("data", collect(stderrChunks));
+    child.once("spawn", () => {
+      onSpawn?.(child.pid);
+      if (signal?.aborted) stop("cancelled");
+    });
+    child.on("error", (error) => finish(errorResult("spawn_failed", error.message, {
+      durationMs: Date.now() - started,
+    })));
+    child.on("close", (exitCode, childSignal) => {
+      const stdout = Buffer.concat(stdoutChunks).toString("utf8");
+      const stderr = Buffer.concat(stderrChunks).toString("utf8");
+      if (forcedCode) {
+        finish(errorResult(
+          forcedCode,
+          forcedCode === "timeout" ? "external tool timed out" :
+            forcedCode === "cancelled" ? "external tool cancelled" :
+              "external tool exceeded output limit",
+          { exitCode, signal: childSignal, stderr, durationMs: Date.now() - started },
+        ));
+        return;
+      }
+      finish({ exitCode, signal: childSignal, stdout, stderr, durationMs: Date.now() - started });
+    });
+
+    signal?.addEventListener("abort", onAbort, { once: true });
+    timer = setTimeout(() => stop("timeout"), timeoutSeconds * 1000);
+    if (stdin !== null) child.stdin.end(stdin);
+  });
+}
 const TERMINAL_STATUS = Object.entries(RUN_STATUS).filter(([s]) => s !== "running");
+const JOB_STATUS = Object.freeze({
+  queued: false,
+  discovering: false,
+  running: false,
+  completed: true,
+  failed: true,
+  timed_out: true,
+  cancelled: true,
+  interrupted: true,
+});
+const SPAWN_ID = /^spawn-[a-f0-9]{24}$/;
+const activeSpawns = new Map();
+
+function writeJsonAtomic(file, value) {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(value, null, 2) + "\n");
+  fs.renameSync(tmp, file);
+}
+
+// True when `pid` is registered as an integer AND the OS still has it. EPERM means the
+// child exists but belongs to another user — still alive, just unreachable. Used by the
+// status reader to decide whether a foreign process is currently driving the job, so we
+// never demote a live record to `interrupted` and never promote a dead one to `running`.
+function pidIsAlive(pid) {
+  if (!Number.isInteger(pid)) return false;
+  try { process.kill(pid, 0); return true; }
+  catch (error) { return error?.code === "EPERM"; }
+}
+
+function spawnDir(runId) {
+  return path.join(runDir(runId), "spawns");
+}
+function spawnPath(runId, spawnId) {
+  if (!SPAWN_ID.test(spawnId)) throw new Error("invalid spawnId");
+  return path.join(spawnDir(runId), `${spawnId}.json`);
+}
+function spawnIdFor(runId, phase, requestKey) {
+  const digest = crypto.createHash("sha256")
+    .update(runId).update("\0").update(phase).update("\0").update(requestKey)
+    .digest("hex").slice(0, 24);
+  return `spawn-${digest}`;
+}
+function saveSpawn(file, job, patch = {}) {
+  const next = { ...job, ...patch, updatedAt: new Date().toISOString() };
+  if (!Object.hasOwn(JOB_STATUS, next.status))
+    throw new Error(`unknown spawn status '${next.status}'`);
+  writeJsonAtomic(file, next);
+  return next;
+}
+function loadSpawn(runId, spawnId) {
+  const file = spawnPath(runId, spawnId);
+  return fs.existsSync(file) ? JSON.parse(fs.readFileSync(file, "utf8")) : null;
+}
+// Exclusive create on the FINAL job path. Two server processes racing on the same
+// requestKey (or a losing process retrying after the origin persisted) both call this
+// helper; only the one whose link wins sees a return value — the loser observes EEXIST
+// and must re-read, then fall through to the replay/conflict branch above.
+// The final path is published ATOMICALLY by writing the complete job JSON to a unique
+// temp file, then `linkSync(temp, final)`. linkSync refuses an existing final path
+// (EEXIST) without overwriting, so the final path is never observed with partial bytes.
+// The temp file is unlinked on every branch (winner, loser, error) so it never lingers.
+// Only the winning linker writes `prompt-${spawnId}.md` and schedules execution; the
+// loser's prompt bytes never reach disk.
+function createSpawnExclusive({ runId, spawnId, job, prompt }) {
+  fs.mkdirSync(spawnDir(runId), { recursive: true });
+  const file = spawnPath(runId, spawnId);
+  fs.mkdirSync(path.dirname(job.promptFile), { recursive: true });
+  const body = JSON.stringify(job, null, 2) + "\n";
+  const temp = `${file}.${process.pid}.${crypto.randomBytes(4).toString("hex")}.tmp`;
+  fs.writeFileSync(temp, body);
+  try {
+    fs.linkSync(temp, file);
+  } catch (error) {
+    try { fs.unlinkSync(temp); } catch {}
+    if (error?.code === "EEXIST") return { created: false, file };
+    throw error;
+  }
+  try { fs.unlinkSync(temp); } catch {}
+  fs.writeFileSync(job.promptFile, prompt);
+  return { created: true, file };
+}
+function publicSpawn(job) {
+  const base = {
+    spawnId: job.spawnId,
+    runId: job.runId,
+    phase: job.phase,
+    status: job.status,
+    createdAt: job.createdAt,
+    updatedAt: job.updatedAt,
+    pollAfterMs: JOB_STATUS[job.status] ? undefined : 250,
+  };
+  if (job.status === "completed") return { ...base, result: job.result, durationMs: job.durationMs };
+  if (JOB_STATUS[job.status]) return { ...base, failure: job.failure, durationMs: job.durationMs };
+  return base;
+}
+function latestSpawnForCurrentStep(manifest) {
+  const dir = spawnDir(manifest.runId);
+  let files = [];
+  try { files = fs.readdirSync(dir).filter((name) => name.endsWith(".json")); }
+  catch { return null; }
+  return files
+    .map((name) => JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")))
+    .filter((job) => job.stepIndex === manifest.current)
+    .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
+}
 
 function runDir(runId) {
   if (!state.loaded) throw new Error("call moa_load first");
@@ -944,12 +1058,43 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
   if (gate !== "none" && !["APPROVE", "REVISE", "BLOCKED", "ERROR"].includes(verdict))
     return { error: `phase '${phase}' is a ${gate} gate — verdict APPROVE|REVISE|BLOCKED|ERROR is required` };
 
+  // Refuse if ANY current-step spawn job is still running — the spawn may have produced
+  // output the conductor never saw, and accepting the report would advance past it
+  // silently. Run BEFORE any in-memory mutation so a refused report leaves no half-pushed
+  // phase record that finish() would still see.
+  // A foreign server is allowed to recover a dead owner here too: nonterminal + dead
+  // ownerPid → {interrupted} so the guard does not block forever on a vanished origin.
+  let currentFiles = [];
+  try { currentFiles = fs.readdirSync(spawnDir(runId)).filter((n) => n.endsWith(".json")); }
+  catch { /* no spawns yet */ }
+  for (const name of currentFiles) {
+    const siblingPath = path.join(spawnDir(runId), name);
+    let sibling = JSON.parse(fs.readFileSync(siblingPath, "utf8"));
+    if (sibling.stepIndex !== manifest.current || JOB_STATUS[sibling.status]) continue;
+    // origin lost → promote in place, then refuse if the promotion didn't make it terminal
+    if (!pidIsAlive(sibling.ownerPid) && !pidIsAlive(sibling.pid)) {
+      sibling = saveSpawn(siblingPath, sibling, {
+        status: "interrupted",
+        failure: { code: "server_restarted", message: "MCP server restarted during external execution" },
+        completedAt: new Date().toISOString(),
+      });
+      if (JOB_STATUS[sibling.status]) continue;
+    }
+    return {
+      error: `spawn '${sibling.spawnId}' is still '${sibling.status}'`,
+      code: "spawn_in_progress",
+      spawn: publicSpawn(sibling),
+    };
+  }
+
   manifest.phases.push({
     phase, role: step.role, verdict: verdict ?? null, summary: summary ?? null,
     changedFiles, producerModel: producerModel ?? null, producerFamily: producerFamily ?? null,
     ts: new Date().toISOString(),
   });
   if (usage) manifest.usage.push({ phase, ...usage });
+
+
 
   const finish = () => {
     // The mutation floor (references/anti-self-certification.md): every write must be covered by
@@ -1045,92 +1190,233 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
   return { next };
 }
 
-export async function opSpawn({ runId, phase, prompt } = {}) {
+function terminalStatusFor(result) {
+  if (result?.code === "timeout") return "timed_out";
+  if (result?.code === "cancelled") return "cancelled";
+  return "failed";
+}
 
+async function executeSpawnJob({ file, job, manifest, profile, resolved, prompt, signal }) {
+  const started = Date.now();
+  try {
+    job = saveSpawn(file, job, { status: "discovering" });
+    const discovery = await discoverToolModels(profile, profile.resolvedBin, signal);
+    if (discovery.error || discovery.code) {
+      saveSpawn(file, job, {
+        status: terminalStatusFor(discovery),
+        failure: { code: discovery.code, message: discovery.error, details: discovery },
+        completedAt: new Date().toISOString(),
+        durationMs: Date.now() - started,
+      });
+      return;
+    }
+    if (!discovery.models.some((model) => model.id === resolved.model)) {
+      saveSpawn(file, job, {
+        status: "failed",
+        failure: { code: "model_not_served", message: `registered tool '${resolved.binding}' no longer serves '${resolved.model}'` },
+        completedAt: new Date().toISOString(),
+        durationMs: Date.now() - started,
+      });
+      return;
+    }
+
+    const timeoutSeconds = profile.run.timeoutSeconds ?? 1800;
+    const values = {
+      "{bin}": profile.resolvedBin,
+      "{model}": resolved.model,
+      "{promptFile}": job.promptFile,
+      "{cwd}": manifest.projectDir,
+      "{maxTime}": String(timeoutSeconds),
+    };
+    const argv = profile.run.argv.map((arg) => {
+      let expanded = String(arg);
+      for (const [placeholder, value] of Object.entries(values))
+        expanded = expanded.replaceAll(placeholder, value);
+      return expanded;
+    });
+    if (resolveExecutable(argv[0]) !== profile.resolvedBin) {
+      saveSpawn(file, job, {
+        status: "failed",
+        failure: { code: "spawn_failed", message: "run.argv[0] does not resolve to profile.bin" },
+        completedAt: new Date().toISOString(),
+        durationMs: Date.now() - started,
+      });
+      return;
+    }
+
+    const execution = await runChild({
+      bin: profile.resolvedBin,
+      args: argv.slice(1),
+      cwd: manifest.projectDir,
+      stdin: profile.run.promptVia === "stdin" ? prompt : null,
+      timeoutSeconds,
+      signal,
+      onSpawn: (pid) => {
+        job = saveSpawn(file, job, { status: "running", pid, startedAt: new Date().toISOString() });
+      },
+    });
+    if (execution.error) {
+      saveSpawn(file, job, {
+        status: terminalStatusFor(execution),
+        failure: { code: execution.code, message: execution.error, details: execution },
+        completedAt: new Date().toISOString(),
+        durationMs: execution.durationMs,
+      });
+      return;
+    }
+    if (execution.exitCode !== 0) {
+      saveSpawn(file, job, {
+        status: "failed",
+        failure: { code: "nonzero_exit", message: `external tool exited with ${execution.exitCode}`, details: execution },
+        completedAt: new Date().toISOString(),
+        durationMs: execution.durationMs,
+      });
+      return;
+    }
+    const result = extractResult(execution.stdout, profile.output);
+    if (result?.error) {
+      saveSpawn(file, job, {
+        status: "failed",
+        failure: { code: result.code, message: result.error, details: result },
+        completedAt: new Date().toISOString(),
+        durationMs: execution.durationMs,
+      });
+      return;
+    }
+    saveSpawn(file, job, {
+      status: "completed",
+      result,
+      completedAt: new Date().toISOString(),
+      durationMs: execution.durationMs,
+    });
+  } catch (error) {
+    saveSpawn(file, job, {
+      status: signal.aborted ? "cancelled" : "failed",
+      failure: { code: signal.aborted ? "cancelled" : "spawn_failed", message: error.message },
+      completedAt: new Date().toISOString(),
+      durationMs: Date.now() - started,
+    });
+  } finally {
+    activeSpawns.delete(job.spawnId);
+  }
+}
+
+export function opSpawn({ runId, phase, prompt, requestKey } = {}, { signal } = {}) {
   const manifest = loadRun(runId);
   if (!manifest) return errorResult("unknown_run", `unknown runId '${runId}'`);
-  if (manifest.status !== "running")
-    return errorResult("run_finished", `run is '${manifest.status}'`);
+  if (manifest.status !== "running") return errorResult("run_finished", `run is '${manifest.status}'`);
+  if (typeof requestKey !== "string" || requestKey.length < 1 || requestKey.length > 128)
+    return errorResult("invalid_request_key", "requestKey must contain 1-128 characters");
 
   const step = manifest.steps[manifest.current];
-  if (phase !== step.phase)
-    return errorResult("wrong_phase", `current phase is '${step.phase}', not '${phase}'`);
-  if (step.role === "master")
-    return errorResult("master_phase", `phase '${phase}' belongs to the master`);
-
+  if (phase !== step.phase) return errorResult("wrong_phase", `current phase is '${step.phase}', not '${phase}'`);
+  if (step.role === "master") return errorResult("master_phase", `phase '${phase}' belongs to the master`);
   const resolved = manifest.resolved[step.role];
-  if (!resolved)
-    return errorResult(
-      "role_unresolved",
-      `phase '${phase}' has no resolved role '${step.role}'`,
-    );
-  if (resolved.binding === "host-native") {
+  if (!resolved) return errorResult("role_unresolved", `phase '${phase}' has no resolved role '${step.role}'`);
+  if (resolved.binding === "host-native")
     return errorResult("native_spawn_required", "use the host's native subagent capability");
-  }
-
   const { bindings } = loadBindings();
   const profile = bindings.find((item) => item.tool === resolved.binding);
-  if (!profile)
-    return errorResult(
-      "tool_unavailable",
-      `registered tool '${resolved.binding}' is unavailable`,
-    );
-  const discovery = await discoverToolModels(profile, profile.resolvedBin);
-  if (discovery.error || discovery.code) return discovery;
-  if (!discovery.models.some((model) => model.id === resolved.model))
-    return errorResult(
-      "model_not_served",
-      `registered tool '${resolved.binding}' no longer serves '${resolved.model}'`,
-    );
+  if (!profile) return errorResult("tool_unavailable", `registered tool '${resolved.binding}' is unavailable`);
 
-  const dir = runDir(runId);
-  fs.mkdirSync(dir, { recursive: true });
-  const promptFile = path.join(dir, `prompt-${phase}-${Date.now()}.md`);
-  fs.writeFileSync(promptFile, prompt);
-  const timeoutSeconds = profile.run.timeoutSeconds ?? 1800;
-  const values = {
-    "{bin}": profile.resolvedBin,
-    "{model}": resolved.model,
-    "{promptFile}": promptFile,
-    "{cwd}": manifest.projectDir,
-    "{maxTime}": String(timeoutSeconds),
-  };
-  const argv = [];
-  for (const arg of profile.run.argv) {
-    let expanded = String(arg);
-    for (const [placeholder, value] of Object.entries(values))
-      expanded = expanded.replaceAll(placeholder, value);
-    argv.push(expanded);
+  const spawnId = spawnIdFor(runId, phase, requestKey);
+  const promptHash = crypto.createHash("sha256").update(prompt).digest("hex");
+  const existing = loadSpawn(runId, spawnId);
+  if (existing) {
+    if (existing.promptHash !== promptHash || existing.stepIndex !== manifest.current)
+      return { ...errorResult("idempotency_conflict", "requestKey was already used with different spawn input"), spawnId };
+    return publicSpawn(existing);
   }
-  if (resolveExecutable(argv[0]) !== profile.resolvedBin)
-    return errorResult("spawn_failed", "run.argv[0] does not resolve to profile.bin");
 
-  const execution = await runChild({
-    bin: profile.resolvedBin,
-    args: argv.slice(1),
-    cwd: manifest.projectDir,
-    stdin: profile.run.promptVia === "stdin" ? prompt : null,
-    timeoutSeconds,
-  });
-  if (execution.error) return execution;
-  if (execution.exitCode !== 0)
-    return errorResult(
-      "nonzero_exit",
-      `external tool exited with ${execution.exitCode}`,
-      execution,
-    );
-
-  const result = extractResult(execution.stdout, profile.output);
-  if (result?.error) return result;
-  return {
+  fs.mkdirSync(runDir(runId), { recursive: true });
+  const now = new Date().toISOString();
+  const job = {
+    schemaVersion: 1,
+    spawnId, runId, phase,
+    stepIndex: manifest.current,
+    promptHash,
+    promptFile: path.join(runDir(runId), `prompt-${spawnId}.md`),
     tool: profile.tool,
     model: resolved.model,
     family: resolved.family,
-    phase,
-    exitCode: execution.exitCode,
-    durationMs: execution.durationMs,
-    result,
+    status: "queued",
+    pid: null,
+    ownerPid: process.pid,
+    result: null,
+    failure: null,
+    createdAt: now,
+    updatedAt: now,
   };
+  // Exclusive create on the FINAL job path: only the winner writes the queued record AND
+  // the prompt file. A concurrent origin in another process must observe EEXIST, re-read,
+  // and fall through to the replay/conflict branch — never overwrite the winner's bytes
+  // nor launch a duplicate worker.
+  const created = createSpawnExclusive({ runId, spawnId, job, prompt });
+  if (!created.created) {
+    const reread = loadSpawn(runId, spawnId);
+    if (!reread) return errorResult("spawn_race", "another start raced and won but left no record");
+    if (reread.promptHash !== promptHash || reread.stepIndex !== manifest.current)
+      return { ...errorResult("idempotency_conflict", "requestKey was already used with different spawn input"), spawnId };
+    return publicSpawn(reread);
+  }
+  const file = created.file;
+
+  const controller = new AbortController();
+  const abort = () => controller.abort(signal?.reason ?? "MCP request cancelled");
+  if (signal?.aborted) abort();
+  else signal?.addEventListener("abort", abort, { once: true });
+  activeSpawns.set(spawnId, { controller, file });
+  // Defer discovery + launch to a macrotask so {opSpawn} returns the persisted queued
+  // record before any subprocess runs — the contract is "returns immediately".
+  setImmediate(() => {
+    void executeSpawnJob({ file, job, manifest, profile, resolved, prompt, signal: controller.signal })
+      .finally(() => signal?.removeEventListener("abort", abort));
+  });
+  return publicSpawn(job);
+}
+
+export function opSpawnStatus({ runId, spawnId } = {}) {
+  const manifest = loadRun(runId);
+  if (!manifest) return errorResult("unknown_run", `unknown runId '${runId}'`);
+  let job;
+  try {
+    job = spawnId ? loadSpawn(runId, spawnId) : latestSpawnForCurrentStep(manifest);
+  } catch {
+    return errorResult("invalid_spawn_id", "spawnId is invalid");
+  }
+  if (!job) return errorResult("unknown_spawn", "no matching spawn job exists");
+  // Promote nonterminal records to {interrupted} only when no live controller remains
+  // anywhere for this job. The owning server's PID is the authoritative signal: if that
+  // process is still alive, it is driving the child and a foreign status reader must NOT
+  // mark interrupted. Same-process callers additionally gate on the child PID; foreign
+  // callers gate on the owner PID (process.kill 0 probes any process the user can signal).
+  if (!JOB_STATUS[job.status] && !activeSpawns.has(job.spawnId)) {
+    const sameOwner = job.ownerPid === process.pid;
+    const alive = sameOwner ? pidIsAlive(job.pid) || pidIsAlive(job.ownerPid) : pidIsAlive(job.ownerPid);
+    if (!alive) {
+      const file = spawnPath(runId, job.spawnId);
+      job = saveSpawn(file, job, {
+        status: "interrupted",
+        failure: { code: "server_restarted", message: "MCP server restarted during external execution" },
+        completedAt: new Date().toISOString(),
+      });
+    }
+  }
+  return publicSpawn(job);
+}
+
+export function opSpawnCancel({ runId, spawnId } = {}) {
+  const manifest = loadRun(runId);
+  if (!manifest) return errorResult("unknown_run", `unknown runId '${runId}'`);
+  let job;
+  try { job = loadSpawn(runId, spawnId); }
+  catch { return errorResult("invalid_spawn_id", "spawnId is invalid"); }
+  if (!job) return errorResult("unknown_spawn", `unknown spawnId '${spawnId}'`);
+  if (JOB_STATUS[job.status]) return publicSpawn(job);
+  const active = activeSpawns.get(spawnId);
+  if (!active) return opSpawnStatus({ runId, spawnId });
+  active.controller.abort("cancelled by conductor");
+  return publicSpawn(job);
 }
 
 // --- init ------------------------------------------------------------------
@@ -1251,6 +1537,40 @@ async function startMcp() {
     },
     async (a) => json(await opResolve(a))
   );
+  // Spawn tools registered below — durable, returns immediately. After spawn completes,
+  // poll moa_spawn_status until terminal; only moa_step_report advances pipeline state.
+  server.tool(
+    "moa_spawn",
+    "Durably starts the current external phase and returns immediately. requestKey makes retries idempotent. Poll moa_spawn_status until terminal; spawning never advances the run. Use moa_spawn_cancel for the durable cancellation path — aborting the JSON-RPC request races the macrotask and may return before cancellation is observable.",
+    {
+      runId: z.string(),
+      phase: z.string().describe("must be the run's current non-master external phase"),
+      prompt: z.string(),
+      requestKey: z.string().min(1).max(128).describe("stable idempotency key; reuse it only when retrying the same start request"),
+    },
+    async (args, extra) => json(opSpawn(args, { signal: extra.signal }))
+  );
+
+  server.tool(
+    "moa_spawn_status",
+    "Returns the latest durable state for an external spawn. Omit spawnId to recover the latest job for the current step. Terminal results are repeatable and survive reconnects.",
+    {
+      runId: z.string(),
+      spawnId: z.string().regex(SPAWN_ID).optional(),
+    },
+    async (args) => json(opSpawnStatus(args))
+  );
+
+
+  server.tool(
+    "moa_spawn_cancel",
+    "Requests cancellation of an active external spawn. Poll moa_spawn_status until the job reaches cancelled.",
+    {
+      runId: z.string(),
+      spawnId: z.string().regex(SPAWN_ID),
+    },
+    async (args) => json(opSpawnCancel(args))
+  );
 
   server.tool(
     "moa_run_start",
@@ -1288,16 +1608,6 @@ async function startMcp() {
     async (a) => json(opStepReport(a))
   );
 
-  server.tool(
-    "moa_spawn",
-    "Executes the current run phase through its resolved registered external agent tool. Before launch, re-runs the bound tool's modelDiscovery against its CURRENT inventory and refuses to launch when the frozen model is no longer served (model_not_served, instead of routing through a stale assumption). Transports the prompt by file or stdin without a shell, enforces timeout/output limits, and returns the normalized worker result. Does not advance the run; inspect the result and call moa_step_report separately.",
-    {
-      runId: z.string(),
-      phase: z.string().describe("must be the run's current non-master external phase"),
-      prompt: z.string(),
-    },
-    async (args) => json(await opSpawn(args))
-  );
 
   server.tool(
     "moa_init",
@@ -1324,5 +1634,23 @@ async function startMcp() {
     async (a) => json(await opBindingSave(a))
   );
 
+  let shuttingDown = false;
+  const shutdown = () => {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    if (activeSpawns.size === 0) { process.exit(0); return; }
+    for (const { controller } of activeSpawns.values())
+      controller.abort("MCP server shutting down");
+    // REFERENCED so a stubborn child still gets a chance to be SIGKILLed (runChild owns
+    // its own 1-second grace of SIGTERM→SIGKILL). Only scheduled when there is work to
+    // wait for; a clean test-client exit never pays this delay.
+    setTimeout(() => process.exit(0), 1100);
+  };
+  // Wire shutdown BEFORE transport connect so SIGTERM/SIGINT/stdin-close abort every
+  // active spawn. Without these registrations `srv.kill()` (and process exit) would
+  // orphan every running child and leave nonterminal records behind.
+  process.once("SIGTERM", shutdown);
+  process.once("SIGINT", shutdown);
+  process.stdin.once("end", shutdown);
   await server.connect(new StdioServerTransport());
 }
