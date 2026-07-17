@@ -284,13 +284,13 @@ Next: /moa init  (or re-run your task to pick up the new models).
 ```
 
 ## Using a bound profile at orchestration time <a id="using-a-profile"></a>
-During a run (workflow or adaptive), call `moa_tools` when connected-tool details are needed, then
-resolve the role normally. For a current phase routed to a registered external tool, call
-`moa_spawn(runId, phase, prompt)`. The MCP server selects the registered profile, expands
-`{bin}`, `{model}`, `{promptFile}`, `{cwd}`, and `{maxTime}` as individual argv elements, transports
-the prompt by file or stdin, executes without a shell, enforces timeout/output limits, and returns
-the normalized result. Inspect that result and the actual workspace effects, then call
-`moa_step_report`; spawning never advances the run.
+
+For a current phase routed to a registered external tool, generate one stable request key and call
+`moa_spawn(runId, phase, prompt, requestKey)`. The server persists the job before running the live
+inventory check or launcher, then returns immediately. Poll `moa_spawn_status` to a terminal state;
+if the start response is lost, repeat it with the same key and unchanged prompt. A new attempt uses
+a new key. `moa_spawn_cancel` stops an active job. Inspect the terminal result and actual workspace
+effects before `moa_step_report`; spawn operations never advance the pipeline.
 
 ## Re-learning & staleness <a id="re-learning"></a>
 Re-running `learn-tool` on an already-bound tool re-probes and **overwrites** its profile

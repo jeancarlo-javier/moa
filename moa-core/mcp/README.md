@@ -16,7 +16,9 @@ registered external tools; host-native phases still use the host's own subagent 
 | `moa_resolve` | Second; pass `hostModels` | independently re-runs live discovery across every learned tool, then intersects the live external routes with `.moa.yml`'s model aliases and the `hostModels` you passed; pins every role's model/effort/binding (model-level only — `roles.<name>.binding` is rejected) with a recorded reason, writes `effective-config.json` |
 | `moa_run_start` | Per task | pipeline selection, run store + manifest, the Frame assembled from real data |
 | `moa_step_report` | After every phase | gate verdicts required, REVISE→loopBackTo, `maxGateLoops`, independence grade vs the *actual* producer, mutation floor (`done_unverified` label), terminal states |
-| `moa_spawn` | Current registered-tool phase | re-runs `modelDiscovery` against the bound tool's current inventory; refuses to launch when the frozen model is no longer served (`model_not_served`); exact route, file or stdin prompt transport, `shell: false`, timeout, 4 MiB output bound, normalized result; never advances state |
+| `moa_spawn` | Current registered-tool phase | persists an idempotent job before live discovery/launch and returns immediately; never advances state |
+| `moa_spawn_status` | After external start or session recovery | returns durable progress, terminal result, or structured failure; omitted `spawnId` recovers the latest current-step job |
+| `moa_spawn_cancel` | Active external job | aborts discovery/child execution; terminal cancellation remains pollable |
 | `moa_init` | `/moa init` | overwrite guard, comment-preserving template splice, registry = union of picks (only the aliases roles chose — never the full live inventory), validation before write |
 | `moa_binding_save` | `/moa learn-tool` | refuses profiles without `modelDiscovery` + T1 + T2 + T4 = pass, `promptSafe: true` and `canSelectModel: true`; refuses any `run.argv` placeholder spawn cannot expand; runs the discovery recipe once before persistence to confirm the live model inventory |
 
@@ -78,15 +80,17 @@ surfaces as one of these seven codes; treat the code, not the prose, as the cont
 
 The conductor calls `moa_load`, optionally inspects `moa_tools`, then calls `moa_resolve` and
 `moa_run_start`. For each returned step:
+- Host-native routes are spawned through the host capability; the MCP server never executes them.
+- Registered external routes start with `moa_spawn(runId, phase, prompt, requestKey)`.
+- The conductor polls `moa_spawn_status` until terminal; repeated status reads are safe.
+- A lost start response is retried with the same key, which returns the same job rather than launching twice.
+- The conductor inspects the normalized result and workspace effects, then calls `moa_step_report`.
+- `moa_spawn_cancel` requests termination; status becomes `cancelled` only after the child closes.
 
-- Host-native routes are spawned through the host capability.
-- Registered external routes are executed with `moa_spawn(runId, phase, prompt)`.
-- The conductor inspects the normalized result and actual workspace effects, then calls
-  `moa_step_report`.
-
-`moa_spawn` executes only the current external non-master phase. It never records changed files,
-reports a verdict, or advances the manifest; `moa_step_report` remains the only transition
-operation.
+`moa_spawn` persists an idempotent job for the current external non-master phase before live
+discovery or launch, then returns immediately. `moa_step_report` refuses an active spawn and
+remains the only operation that advances pipeline state; spawn job writes never certify work or
+move `manifest.current`.
 
 ## Register
 

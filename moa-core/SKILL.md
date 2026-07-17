@@ -51,13 +51,11 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
 4. **Execute each step, then `moa_step_report`** — the ONLY way to advance. Per step:
    - `spawn.kind: native` → launch the subagent with your host capability on the step's
      `model`/`effort`, giving it the tools the role's work needs, as far as the host allows.
-   - `spawn.kind: profile` → call `moa_spawn` with the role's prompt; before launch the server
-     re-runs the bound tool's discovery against the tool's *current* inventory and confirms the
-     frozen model still resolves — drift between resolve-time and spawn-time surfaces as
-     `model_not_served`, not as a silent route through a stale assumption.
-     Inspect the normalized result and actual workspace effects, then report the phase. The MCP
-     server owns shell-free process launch, timeout, and output bounds — not what the spawned
-     agent does once running.
+   - `spawn.kind: profile` → call `moa_spawn` with the role prompt and a stable `requestKey`;
+     it durably starts the exact resolved route and returns immediately. Poll `moa_spawn_status`
+     to a terminal state, inspect the normalized result and workspace effects, then report the
+     phase. Reuse the key only to retry the same start request; use `moa_spawn_cancel` to stop an
+     active job. The server owns discovery, shell-free launch, timeout, output bounds, and results.
    - `isMaster: true` → the phase is yours (frame, finalize).
    - Report honestly: gate phases need the verifier's parseable verdict; producing phases need
      `changedFiles` and the **actual** `producerModel` (yourself included, if you authored).

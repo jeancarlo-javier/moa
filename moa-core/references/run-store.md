@@ -1,7 +1,8 @@
 # Run store — durability, resume, determinism, budgets
 
 Every run writes to `runtime.workDir/runs/<run-id>/` (default `.moa/runs/<id>/`).
-The store makes long multi-agent runs resumable, revertible, auditable, and reproducible.
+The store makes long multi-agent runs auditable and reproducible. Phase transitions are
+recorded in the manifest; external executions are recorded separately as spawn records.
 
 ## Effective config (materialized before any subagent runs)
 
@@ -21,16 +22,33 @@ Precedence (highest wins): **per-run override > project config > template defaul
 `blocked_no_binding`, `blocked_no_model`, `verification_unavailable`,
 `blocked_verifier_disagreement`, `max_loops_exceeded`).
 
-## Patches-first execution
+## Spawn records
 
-Coder/verifier subagents work in an **isolated worktree/patch sandbox** and produce a
-**patch** first. Applying that patch to the real workspace is a separate, committed
-transition recorded in the manifest. Consequences:
-- A mid-phase crash or timeout is resumable — replay from the last committed phase using
-  `inputHash` to detect staleness.
-- A bad phase is revertible — the unapplied patch is just discarded.
-- Parallel workers can't corrupt each other: each has its own worktree; undeclared writes
-  are rejected; patches merge serially; conflicts are treated as review failures.
+External executions live at `runs/<run-id>/spawns/<spawn-id>.json`. The record is written before
+model discovery or launch and atomically advances through `queued`, `discovering`, `running`, and
+one terminal state: `completed`, `failed`, `timed_out`, `cancelled`, or `interrupted`. It stores the
+prompt hash, exact resolved route, timestamps, normalized result or structured failure, and child
+PID while running. A stable request key deterministically identifies the job, so retrying a lost
+start response cannot duplicate paid work.
+
+Terminal records survive client disconnects and MCP server restarts. A nonterminal record found
+without a live owning server process becomes `interrupted`; moa does not claim to reattach to a
+child across an MCP server crash. Spawn records are execution evidence, not phase transitions:
+only `moa_step_report` changes pipeline progress or verification state.
+
+Concurrent control of one run by multiple MCP server processes is unsupported: only the owning
+server process drives a nonterminal job. A foreign status reader uses the recorded `ownerPid` as
+the liveness signal: a live owner keeps the record out of `interrupted`, while a dead owner
+promotes it to `interrupted` even if an orphan child PID is still observable — moa does not
+wait on a child whose owning server is gone. Cancellation is cooperative through the MCP
+boundary and forceful at the child boundary (SIGTERM → one-second grace → SIGKILL). A launcher
+timeout surfaces as `timed_out` with failure code `timeout`; a discovery timeout surfaces as
+`failed` with failure code `model_discovery_timeout`.
+
+moa does not implement a patches-first / worktree sandbox layer: workers execute in the manifest's
+project directory and apply changes directly. A phase restart replays the producer from scratch;
+moa does not claim to apply isolated patches on resume, and any earlier prose claiming automatic
+mid-phase patch application or arbitrary resume-after-crash is broader than the code.
 
 ## Budgets & determinism
 
