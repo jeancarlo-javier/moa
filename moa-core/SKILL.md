@@ -53,9 +53,10 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
      `model`/`effort`, giving it the tools the role's work needs, as far as the host allows.
    - `spawn.kind: profile` → call `moa_spawn` with the role prompt and a stable `requestKey`; it
      durably starts the exact resolved route and returns immediately. Loop `moa_spawn_wait` (never
-     a shell sleep or growing backoff) until terminal, inspect the result and workspace effects,
-     then report the phase. Reuse the key only to retry the same start request; `moa_spawn_cancel`
-     stops an active job. The server owns discovery, shell-free launch, timeout, output bounds, and results.
+     a shell sleep or growing backoff; returns just `{status}` while active) until terminal, inspect
+     the result and workspace effects, then report the phase. Reuse the key only to retry the same
+     start request; `moa_spawn_cancel` stops an active job. The server owns discovery, shell-free
+     launch, timeout, output bounds, and results.
    - `isMaster: true` → the phase is yours (frame, finalize).
    - Report honestly: gate phases need the verifier's parseable verdict; producing phases need
      `changedFiles` and the **actual** `producerModel` (yourself included, if you authored).

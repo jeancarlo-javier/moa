@@ -1723,6 +1723,7 @@ await ta("spawn wait: expires within the bounded window with the latest nontermi
   const result = await opSpawnWait({ runId: run.runId, spawnId: start.spawnId, waitMs: 300 });
   const elapsed = Date.now() - startedAt;
   assert.ok(elapsed >= 300 && elapsed < 900, `expiry did not respect waitMs: ${elapsed}ms`);
+  assert.deepEqual(Object.keys(result), ["status"], `expected compact { status } shape: ${JSON.stringify(result)}`);
   assert.ok(["queued", "discovering", "running"].includes(result.status), JSON.stringify(result));
   assert.doesNotThrow(() => process.kill(pid, 0), "worker should still be alive after wait expiry");
 
@@ -1754,6 +1755,7 @@ await ta("spawn wait: aborting only the wait returns promptly and leaves the wor
   const result = await waitPromise;
   const elapsed = Date.now() - startedAt;
   assert.ok(elapsed < 1000, `abort did not return promptly: ${elapsed}ms`);
+  assert.deepEqual(Object.keys(result), ["status"], `expected compact { status } shape: ${JSON.stringify(result)}`);
   assert.ok(["queued", "discovering", "running"].includes(result.status), JSON.stringify(result));
   assert.doesNotThrow(() => process.kill(pid, 0), "worker should still be alive after aborting only the wait");
 
@@ -1875,6 +1877,7 @@ await ta("spawn wait: waitMs 0 is an immediate snapshot", async () => {
   const startedAt = Date.now();
   const result = await opSpawnWait({ runId: run.runId, spawnId: start.spawnId, waitMs: 0 });
   assert.ok(Date.now() - startedAt < 200, "waitMs: 0 should not sleep");
+  assert.deepEqual(Object.keys(result), ["status"], `expected compact { status } shape: ${JSON.stringify(result)}`);
   assert.ok(["queued", "discovering", "running"].includes(result.status), JSON.stringify(result));
   assert.doesNotThrow(() => process.kill(pid, 0));
 
@@ -2242,6 +2245,45 @@ await ta("tools/call: moa_spawn_wait returns on completion", async () => {
     assert.equal(completed.status, "completed", JSON.stringify(completed));
     assert.equal(completed.result, "wire-wait-result");
   } finally { c.stop(); }
+});
+
+await ta("tools/call: moa_spawn_wait returns a compact { status } shape while active over JSON-RPC", async () => {
+  const ready = path.join(TMP, `wire-wait-compact-ready-${crypto.randomUUID()}`);
+  const release = path.join(TMP, `wire-wait-compact-release-${crypto.randomUUID()}`);
+  const profile = runnableProfile({
+    tool: `wire-wait-compact-${crypto.randomUUID()}`,
+    mode: "wait",
+    timeoutSeconds: 5,
+    runArgs: ["--ready-file", ready, "--release-file", release],
+  });
+  await opBindingSave({ profile });
+  const repo = writeRouteRepo(`wire-wait-compact-${crypto.randomUUID()}`, "external", profile.tool);
+  const c = await mcpClient({ cwd: repo });
+  try {
+    const send = (name, args, timeout = 10_000) => c.call(name, args, { requestTimeoutMs: timeout });
+    assert.ok(!(await send("moa_load", { cwd: repo })).error);
+    assert.ok(!(await send("moa_resolve", { hostModels: HOST })).error);
+    const run = await send("moa_run_start", {
+      task: "wire wait compact", steps: [{ phase: "work", role: "worker" }],
+      masterModel: "host/master", masterFamily: "host",
+    });
+    const start = await send("moa_spawn", {
+      runId: run.runId, phase: "work", prompt: "wire-wait-compact-result",
+      requestKey: crypto.randomUUID(),
+    }, 250);
+    assert.equal(start.status, "queued");
+    await waitFor(() => fs.existsSync(ready));
+    // never release the worker — the wait must expire nonterminal.
+    const expired = await send("moa_spawn_wait", {
+      runId: run.runId, spawnId: start.spawnId, waitMs: 300,
+    }, 2000);
+    assert.deepEqual(Object.keys(expired), ["status"], `expected compact { status } shape over the wire: ${JSON.stringify(expired)}`);
+    assert.ok(["queued", "discovering", "running"].includes(expired.status), JSON.stringify(expired));
+    await send("moa_spawn_cancel", { runId: run.runId, spawnId: start.spawnId });
+  } finally {
+    fs.writeFileSync(release, "go");
+    c.stop();
+  }
 });
 // The run path above still left most of the toolset unproven over the wire — including
 // moa_binding_save, the one tool whose schema bug started all this. A handler that throws or

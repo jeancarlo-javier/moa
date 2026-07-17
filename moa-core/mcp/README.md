@@ -17,8 +17,8 @@ registered external tools; host-native phases still use the host's own subagent 
 | `moa_run_start` | Per task | pipeline selection, run store + manifest, the Frame assembled from real data |
 | `moa_step_report` | After every phase | gate verdicts required, REVISE→loopBackTo, `maxGateLoops`, independence grade vs the *actual* producer, mutation floor (`done_unverified` label), terminal states |
 | `moa_spawn` | Current registered-tool phase | persists an idempotent job before live discovery/launch and returns immediately; never advances state |
-| `moa_spawn_wait` | After `moa_spawn`, in a loop | bounded long-poll (0-20000ms, default 20000ms) on the same durable record until terminal; aborting the wait never cancels the spawn |
-| `moa_spawn_status` | Snapshot/recovery only (reconnects, one-off checks) | returns durable progress, terminal result, or structured failure; omitted `spawnId` recovers the latest current-step job |
+| `moa_spawn_wait` | After `moa_spawn`, in a loop | bounded long-poll (0-20000ms, default 20000ms) on the same durable record until terminal, returning only `{status}` while active; aborting the wait never cancels the spawn |
+| `moa_spawn_status` | Snapshot/recovery, or full active metadata | returns durable progress, terminal result, or structured failure; omitted `spawnId` recovers the latest current-step job |
 | `moa_spawn_cancel` | Active external job | aborts discovery/child execution; observe the terminal `cancelled` state via `moa_spawn_wait` |
 | `moa_init` | `/moa init` | overwrite guard, comment-preserving template splice, registry = union of picks (only the aliases roles chose — never the full live inventory), validation before write |
 | `moa_binding_save` | `/moa learn-tool` | refuses profiles without `modelDiscovery` + T1 + T2 + T4 = pass, `promptSafe: true` and `canSelectModel: true`; refuses any `run.argv` placeholder spawn cannot expand; runs the discovery recipe once before persistence to confirm the live model inventory |
@@ -85,7 +85,8 @@ The conductor calls `moa_load`, optionally inspects `moa_tools`, then calls `moa
 - Registered external routes start with `moa_spawn(runId, phase, prompt, requestKey)`.
 - The conductor loops `moa_spawn_wait(runId, spawnId, waitMs)` until terminal — never a shell
   sleep or growing backoff; default/max wait is 20000ms, below the common 30-second MCP request
-  deadline. `moa_spawn_status` is for snapshot/recovery reads only (reconnects, one-off checks).
+  deadline, and returns only `{status}` while active. `moa_spawn_status` is for snapshot/recovery
+  reads and full active metadata only (reconnects, one-off checks).
 - A lost start response is retried with the same key, which returns the same job rather than launching twice.
 - The conductor inspects the normalized result and workspace effects, then calls `moa_step_report`.
 - `moa_spawn_cancel` requests termination; observe the terminal `cancelled` state via

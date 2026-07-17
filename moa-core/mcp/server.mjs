@@ -1452,7 +1452,10 @@ export async function opSpawnWait({ runId, spawnId, waitMs = 20_000 } = {}, { si
     if (signal?.aborted) { job = opSpawnStatus({ runId, spawnId }); break; }
     job = opSpawnStatus({ runId, spawnId });
   }
-  return job;
+  // Terminal results and structured errors stay verbatim — reconnect-safe and complete.
+  // An active (nonterminal, non-error) record is compacted to its status alone; full
+  // metadata for an in-flight spawn remains available via moa_spawn_status.
+  return job.error || JOB_STATUS[job.status] ? job : { status: job.status };
 }
 
 // --- init ------------------------------------------------------------------
@@ -1589,7 +1592,7 @@ async function startMcp() {
 
   server.tool(
     "moa_spawn_wait",
-    "Durably waits on the current external spawn's record and returns as soon as it reaches a terminal state — the normal way to observe a moa_spawn to completion, replacing shell sleeps or manual backoff. Bounded 0-20000ms, default 20000ms (below the common 30-second MCP request deadline); waitMs: 0 is an immediate snapshot. Returns the latest nonterminal state if the window expires or this call is aborted — aborting the wait does NOT cancel the spawn, which keeps running. Loop this call until terminal.",
+    "Durably waits on the current external spawn's record and returns as soon as it reaches a terminal state — the normal way to observe a moa_spawn to completion, replacing shell sleeps or manual backoff. Bounded 0-20000ms, default 20000ms (below the common 30-second MCP request deadline); waitMs: 0 is an immediate snapshot. Returns terminal results in full; an expired or aborted wait on a still-active spawn returns only {status} — aborting the wait does NOT cancel the spawn, which keeps running; use moa_spawn_status for full active metadata. Loop this call until terminal.",
     {
       runId: z.string(),
       spawnId: z.string().regex(SPAWN_ID),
@@ -1600,7 +1603,7 @@ async function startMcp() {
 
   server.tool(
     "moa_spawn_status",
-    "Non-blocking snapshot/recovery read of the latest durable state for an external spawn — for reconnects or a one-off check without waiting. Omit spawnId to recover the latest job for the current step. Terminal results are repeatable and survive reconnects. For the normal completion path, loop moa_spawn_wait instead of polling this.",
+    "Non-blocking snapshot/recovery read of the full durable state for an external spawn — for reconnects, a one-off check, or full active metadata (moa_spawn_wait returns only {status} while active). Omit spawnId to recover the latest job for the current step. Terminal results are repeatable and survive reconnects. For the normal completion path, loop moa_spawn_wait instead of polling this.",
     {
       runId: z.string(),
       spawnId: z.string().regex(SPAWN_ID).optional(),

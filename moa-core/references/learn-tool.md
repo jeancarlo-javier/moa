@@ -288,9 +288,10 @@ Next: /moa init  (or re-run your task to pick up the new models).
 For a current phase routed to a registered external tool, generate one stable request key and call
 `moa_spawn(runId, phase, prompt, requestKey)`. The server persists the job before running the live
 inventory check or launcher, then returns immediately. Loop `moa_spawn_wait(runId, spawnId, waitMs)`
-until terminal — never a shell sleep or growing backoff; default/max wait is 20000ms. If the start
-response is lost, repeat it with the same key and unchanged prompt; a new attempt uses a new key.
-`moa_spawn_cancel` stops an active job — `moa_spawn_status` is for snapshot/recovery reads only.
+until terminal, returning only `{status}` while active — never a shell sleep or growing backoff;
+default/max wait is 20000ms. If the start response is lost, repeat it with the same key and unchanged
+prompt; a new attempt uses a new key. `moa_spawn_cancel` stops an active job; use
+`moa_spawn_status` for snapshot/recovery reads or full active metadata.
 Inspect the terminal result and actual workspace effects before `moa_step_report`; spawn operations
 never advance the pipeline.
 
