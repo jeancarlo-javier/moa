@@ -536,6 +536,53 @@ await ta("resolve: a model binding pin to a missing tool is diagnosed", async ()
   assert.match(result.diagnostics[0].hint, /missingcli/);
 });
 
+await ta("resolve: typo'd registry id → unreachable + degraded diagnostics, role still resolves", async () => {
+  resetBindings();
+  // vendor/gpt-5.1 is raw-edit-distance CLOSER to the typo than the true token-swap
+  // target vendor/gpt-5.6-sol — the suggestion must still pick the token-swap match
+  await opBindingSave({ profile: provenProfile({ tool: "fakecli", inventory: ["vendor/gpt-5.1", "vendor/gpt-5.6-sol"] }) });
+  const repo = path.join(TMP, "typo-id"); fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models:
+  fake: { id: vendor/gpt-sol-5.6, family: fake, tags: [strong] }
+roles:
+  worker: { use: [fake, auto] }
+pipelines: {}
+`);
+  opLoad({ cwd: repo });
+  const r = await opResolve({ hostModels: HOST });
+  const unreachable = r.diagnostics.find((d) => d.state === "unreachable_registry_model");
+  assert.equal(unreachable.model, "fake");
+  assert.match(unreachable.hint, /did you mean 'vendor\/gpt-5\.6-sol'/);
+  const degraded = r.diagnostics.find((d) => d.state === "degraded_resolution");
+  assert.equal(degraded.role, "worker");
+  assert.match(degraded.hint, /'fake' \(no eligible route\)/);
+  assert.ok(r.roles.worker.model); // fell through to auto, but loudly
+});
+
+await ta("resolve: failed 'auto' before an explicit pick is reported as degraded", async () => {
+  const repo = path.join(TMP, "auto-first"); fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models:
+  weak: { id: vendor/weak-1, family: fake }
+roles:
+  gatekeeper: { use: [auto, weak] }
+pipelines:
+  p:
+    steps:
+      - { phase: validate, role: gatekeeper, gate: critical }
+`);
+  opLoad({ cwd: repo });
+  // critical gate demands [strong]; the only model has no tags → auto fails, explicit 'weak' resolves
+  const r = await opResolve({ hostModels: [{ id: "vendor/weak-1", family: "fake" }] });
+  assert.equal(r.roles.gatekeeper.model, "vendor/weak-1");
+  const degraded = r.diagnostics.find((d) => d.state === "degraded_resolution");
+  assert.equal(degraded.role, "gatekeeper");
+  assert.match(degraded.hint, /'auto' \(no eligible candidate\)/);
+});
+
 await ta("resolve: pinned + auto + differentModelFrom honored", async () => {
   opLoad({ cwd: REPO });
   const r = await opResolve({ hostModels: HOST });
@@ -1187,7 +1234,8 @@ pipelines:
 `);
   opLoad({ cwd: repo });
   const resolved = await opResolve({ hostModels: HOST });
-  assert.equal(resolved.diagnostics[0].state, "blocked_no_binding");
+  assert.ok(resolved.diagnostics.some((d) => d.state === "blocked_no_binding"));
+  assert.ok(resolved.diagnostics.some((d) => d.state === "unreachable_registry_model"));
   const run = opRunStart({ task: "blocked role", pipeline: "broken" });
   const result = opSpawn({ runId: run.runId, phase: "work", prompt: "hello", requestKey: crypto.randomUUID() });
   assert.equal(result.code, "role_unresolved");

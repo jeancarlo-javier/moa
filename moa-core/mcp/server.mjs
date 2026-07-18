@@ -466,6 +466,33 @@ function candidatePool(cfg, inventories, hostModels) {
   return pool;
 }
 
+function editDistance(a, b) {
+  let row = Array.from({ length: b.length + 1 }, (_, i) => i);
+  for (let i = 1; i <= a.length; i++) {
+    const next = [i];
+    for (let j = 1; j <= b.length; j++)
+      next[j] = Math.min(next[j - 1] + 1, row[j] + 1, row[j - 1] + (a[i - 1] === b[j - 1] ? 0 : 1));
+    row = next;
+  }
+  return row[b.length];
+}
+
+// token-sorted form first, so swapped-token typos (gpt-sol-5.6 vs gpt-5.6-sol) beat
+// raw-closer decoys (gpt-5.1); raw distance only breaks ties
+const normalizeId = (id) => id.toLowerCase().split(/[^a-z0-9]+/).filter(Boolean).sort().join(" ");
+
+function closestLiveId(id, liveIds) {
+  let best = null;
+  let bestNorm = Infinity;
+  let bestRaw = Infinity;
+  for (const live of liveIds) {
+    const norm = editDistance(normalizeId(id), normalizeId(live));
+    const raw = editDistance(id, live);
+    if (norm < bestNorm || (norm === bestNorm && raw < bestRaw)) { best = live; bestNorm = norm; bestRaw = raw; }
+  }
+  return bestNorm <= Math.ceil(id.length / 3) ? best : null;
+}
+
 // --- session state (also persisted; runs reload from disk) ---------------
 
 const state = { loaded: null, resolved: null };
@@ -568,6 +595,18 @@ export async function opResolve({ hostModels = [], overrides = {} } = {}) {
   const discovered = await discoverBindingInventories(bindings);
   const pool = candidatePool(cfg, discovered.inventories, hostModels);
   const diagnostics = [...discovered.diagnostics];
+  // a registry id no live route serves is a config bug (typo'd id, stale alias) — surface it
+  const liveIds = [...new Set(pool.flatMap((model) => model.routes.map((route) => route.modelId)))];
+  for (const entry of pool) {
+    if (entry.routes.length || !entry.sources.includes("registry")) continue;
+    const near = closestLiveId(entry.id, liveIds);
+    diagnostics.push({
+      state: "unreachable_registry_model",
+      model: entry.shortName,
+      id: entry.id,
+      hint: `no live route serves '${entry.id}'${near ? ` — did you mean '${near}'?` : ""}`,
+    });
+  }
   if (!cfg) {
     state.resolved = { pool, roles: {} };
     return { pool: pool.map(poolRow), roles: {}, diagnostics, note: "no config — staff ad-hoc roles from this pool; pass explicit models in run_start steps" };
@@ -596,6 +635,7 @@ export async function opResolve({ hostModels = [], overrides = {} } = {}) {
     let reason = null;
     let sawModelWithoutRoute = false;
     let lastBindingPin = null;
+    const skipped = [];
     const useList = overrides[rname] ? [overrides[rname]] : role.use;
     for (const use of useList) {
       if (use === "auto") {
@@ -606,6 +646,8 @@ export async function opResolve({ hostModels = [], overrides = {} } = {}) {
           ({ model: pick, route } = selected);
           lastBindingPin = pick.registryBinding ?? null;
           reason = `auto: ${needTags.length ? `tags [${needTags}] ` : ""}lowest-cost/priority pick`;
+        } else {
+          skipped.push(`'auto' (no eligible candidate)`);
         }
       } else {
         const model = pool.find((candidate) =>
@@ -619,9 +661,12 @@ export async function opResolve({ hostModels = [], overrides = {} } = {}) {
             reason = overrides[rname] ? "per-run override" : `pinned '${use}'`;
           } else {
             sawModelWithoutRoute = true;
+            skipped.push(`'${use}' (no eligible route)`);
           }
         } else if (model) {
-          reason = `'${use}' skipped: same model as '${role.differentModelFrom}'`;
+          skipped.push(`'${use}' (same model as '${role.differentModelFrom}')`);
+        } else {
+          skipped.push(`'${use}' (not in pool)`);
         }
       }
       if (pick) break;
@@ -641,6 +686,12 @@ export async function opResolve({ hostModels = [], overrides = {} } = {}) {
       continue;
     }
 
+    if (skipped.length)
+      diagnostics.push({
+        state: "degraded_resolution",
+        role: rname,
+        hint: `resolved to '${pick.shortName}' after skipping ${skipped.join(", ")}`,
+      });
     const effort = role.effort ?? pick.effort ?? ["auto"];
     roles[rname] = {
       model: route.modelId,
@@ -1315,7 +1366,7 @@ export function opSpawn({ runId, phase, prompt, requestKey } = {}, { signal } = 
   const resolved = manifest.resolved[step.role];
   if (!resolved) return errorResult("role_unresolved", `phase '${phase}' has no resolved role '${step.role}'`);
   if (resolved.binding === "host-native")
-    return errorResult("native_spawn_required", "use the host's native subagent capability");
+    return errorResult("native_spawn_required", `role '${step.role}' was bound host-native when the run started (bindings freeze at moa_run_start; a later moa_resolve override only affects new runs) — spawn it with the host's native subagent capability`);
   const { bindings } = loadBindings();
   const profile = bindings.find((item) => item.tool === resolved.binding);
   if (!profile) return errorResult("tool_unavailable", `registered tool '${resolved.binding}' is unavailable`);
