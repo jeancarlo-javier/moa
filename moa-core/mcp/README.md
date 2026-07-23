@@ -20,7 +20,7 @@ registered external tools; host-native phases still use the host's own subagent 
 | `moa_spawn_wait` | After `moa_spawn`, in a loop | bounded long-poll (0-20000ms, default 20000ms) on the same durable record until terminal, returning only `{status}` while active; aborting the wait never cancels the spawn |
 | `moa_spawn_status` | Snapshot/recovery, or full active metadata | returns durable progress, terminal result, or structured failure; omitted `spawnId` recovers the latest current-step job |
 | `moa_spawn_cancel` | Active external job | aborts discovery/child execution; observe the terminal `cancelled` state via `moa_spawn_wait` |
-| `moa_init` | `/moa init` | overwrite guard, comment-preserving template splice, registry = union of picks (only the aliases roles chose — never the full live inventory), validation before write |
+| `moa_init` | `/moa init` (global) / `/moa project` | overwrite guard, comment-preserving template splice, registry = union of picks (only the aliases roles chose — never the full live inventory), validation before write |
 | `moa_binding_save` | `/moa learn-tool` | refuses profiles without `modelDiscovery` + T1 + T2 + T4 = pass, `promptSafe: true` and `canSelectModel: true`; refuses any `run.argv` placeholder spawn cannot expand; runs the discovery recipe once before persistence to confirm the live model inventory |
 
 ## Native vs external

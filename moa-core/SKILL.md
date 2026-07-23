@@ -3,10 +3,10 @@ name: moa
 version: 1.0.0
 allowed-tools: mcp__moa__*
 description: |
-  Master of Agents (moa) — per-project, runtime-AGNOSTIC multi-agent orchestration. Become the
-  conductor: load the workflow config (adaptive if no `.moa.yml`), resolve each role's model to
-  what exists on THIS machine, drive through a GATED pipeline of role×model subagents, loop on
-  gates until the framed done-criteria are met.
+  Master of Agents (moa) — runtime-AGNOSTIC multi-agent orchestration. Become the conductor:
+  `moa_load` combines global `~/.moa/config.yml` (machine-level role→model picks) with optional
+  project `.moa.yml` (pipelines, role instructions, overrides; project wins). With neither, run
+  adaptive; otherwise resolve roles to what exists on THIS machine and drive their GATED pipeline.
   Name NO CLI or command — "spawn a role×model subagent" is the only concept; HOW it runs is
   runtime data (host-native or a CLI taught via `learn-tool`).
   HARD RULE — deliberately not the strongest model: route and synthesize; NEVER self-certify
@@ -15,8 +15,10 @@ description: |
   Use for feature, refactor, migration, research, multi-file/multi-phase work — or when the user says
   "moa", "master of agents", "run my workflow", "orchestrate this", or invokes /skill:moa.
   Skip trivial one-liners (answer inline).
-  Modes: `/moa init` writes `.moa.yml`; `/moa learn-tool` connects another CLI; otherwise →
-  adaptive (forks on `.moa.yml` presence). See references/.
+  Modes: `/moa init` picks the default models and writes `~/.moa/config.yml`;
+  `/moa project [<template>]` writes this project's `.moa.yml` (offers to save the defaults first
+  when none exist); `/moa learn-tool` connects another CLI;
+  otherwise `moa_load` dispatches (no config anywhere → adaptive). See references/.
 ---
 
 # Master of Agents — the conductor's playbook
@@ -29,7 +31,9 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
 1. **`moa_load`** before ANY reasoning about the task — even to judge it trivial ("small" is judged
    *from* the config). It returns the validated config, dispatch mode, roles, pipelines, and
    connected tools as data. Then dispatch:
-   - first arg `init` → `references/init.md` (detection, picks, confirmation; `moa_init` writes).
+   - first arg `init` or `project` → `references/init.md` (picks, detection, confirmation;
+     `moa_init` writes) — route there even when `moa_load` returned config errors, so a broken
+     file can be regenerated.
    - first arg `learn-tool` → `references/learn-tool.md` (probe + prove; `moa_binding_save` binds).
    - otherwise → orchestrate (workflow if a `default` pipeline exists; adaptive if not — see
      `references/adaptive.md` for the config-absent fork and its arc).
@@ -39,9 +43,9 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
    tools serve *now*; it never reports them as native, and never persists a stored list.
 2. **`moa_resolve`** — pass the models YOUR host can spawn subagents on (only you know them) as
    `hostModels`. The server performs its own live discovery (the same `modelDiscovery` recipe each
-   tool was bound with), then intersects those live external routes with the `models` aliases in
-   `.moa.yml` and the `hostModels` you passed, pins every role's model/effort/binding with a
-   recorded reason, and writes `effective-config.json`. The `binding` field lives only on
+   tool was bound with), then intersects those live external routes with the `models` aliases in the
+   config loaded by `moa_load` and the `hostModels` you passed, pins every role's model/effort/binding
+   with a recorded reason, and writes `effective-config.json`. The `binding` field lives only on
    `models.<alias>` entries, never on a role; roles select through `use`. Surface its diagnostics
    plainly (`blocked_no_model` → offer to adjust the registry or `/moa learn-tool`).
 3. **`moa_run_start`** — pass the task plus a named pipeline, or ad-hoc `steps` you composed
@@ -104,7 +108,7 @@ verifier must differ from (that's why `masterModel` is passed).
   reporting makes the grade real. A gate's REVISE is never advisory; you don't overrule it.
 
 ## Anti-patterns
-- Writing `.moa.yml` by hand (that's `moa_init`'s job, and only in `init` mode).
+- Writing either config by hand (`moa_init` writes the global target in `init` mode, the project target in `project` mode).
 - Acting before `moa_load`; deciding the next phase yourself instead of obeying `moa_step_report`.
 - Reporting a wrong/absent `producerModel` — it silently corrupts the independence check.
 - Narrowing/refusing a non-code task — map it to produce/verify roles.
@@ -136,10 +140,10 @@ exists. Roles pick through `use`; tools are picked through `binding`, which belo
 
 If the `mcp__moa__*` tools don't exist or fail, orchestrate by prose: follow `references/` as the
 procedure (`init.md`, `learn-tool.md`, `adaptive.md`, `anti-self-certification.md`,
-`run-store.md`) with `schema/config.schema.json` as the config contract — read `.moa.yml`
-yourself, resolve and sequence by hand, and hold every rule above with extra care (the gate
-floor, mutation floor, and independence checks are then discipline only). Register
-the server when convenient: `moa-core/mcp/` (see its README).
+`run-store.md`) with `schema/config.schema.json` as the effective config contract — read the global
+config and optional project overrides yourself, resolve and sequence by hand, and hold every rule
+above with extra care (the gate floor, mutation floor, and independence checks are discipline only).
+Register the server when convenient: `moa-core/mcp/` (see its README).
 
 See also: `references/`, `schema/config.schema.json`, `templates/`, `mcp/` (the server, including
 how it spawns a bound external tool — live profile data, never a parked binding model),

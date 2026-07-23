@@ -1,9 +1,12 @@
-# `init` — generate a project's `.moa.yml`
+# `init` / `project` — configure default model choices or a project
 
-Reached when the skill is invoked as `init` (see SKILL.md → *Mode dispatch*).
-Your job here is narrow: **produce one valid `.moa.yml` at the repo root, then
-stop.** You do not run the pipeline, create a run-store, or resolve routing — those
-are orchestration-time concerns.
+Reached when the skill is invoked as `init` or `project` (see `SKILL.md` step 1).
+Your job here is narrow: **write only valid init targets, then stop.** `init`
+writes the machine defaults, `~/.moa/config.yml`; `project` writes the repo-root
+`.moa.yml` — and on a machine with no default setup yet, `project` **offers to save
+the confirmed choices as `~/.moa/config.yml` too** (one confirmation, two writes —
+the default setup should exist from the first setup, not stay an expert feature).
+You do not run a pipeline, create a run-store, or resolve routing — those happen later.
 
 You stay CLI-agnostic the whole way: you never name a runtime or command. Models come from
 the host-native capability plus any **learned tool profiles** in `~/.moa/bindings/` — a profile
@@ -20,6 +23,7 @@ parked model)"* will just ask "what's a binding?"). Translate at the boundary:
 |---|---|
 | binding / profile / adapter | "a connected AI tool" or just "model" |
 | models registry | "the AI models moa can use here" |
+| layer / overlay / merge / staffing | "your default AI setup" / "this project's custom rules" |
 | model family / independence / verifier | "a second, different AI to double-check the work" |
 | host-native | "the AI I'm already running on" |
 | parked · symlink · `serves()` · registry | *don't mention — internal* |
@@ -47,21 +51,35 @@ parked model)"* will just ask "what's a binding?"). Translate at the boundary:
 Both say the same thing; the second hides nothing that matters and never sends the user to Google.
 
 ## Invocation forms
-- `init` — detect the project type, propose a template, confirm, write.
-- `init <template>` — use that template directly (`solo-research`, `research-synth`,
+- `init` — choose the default AI setup for every project (`~/.moa/config.yml`); no
+  project detection or template.
+- `init --force` — regenerate `~/.moa/config.yml` if it exists.
+- `project` — detect the project type, propose a template, confirm, write `.moa.yml`
+  (offering to save `~/.moa/config.yml` first on a machine with no defaults — see step 5).
+- `project <template>` — use that template directly (`solo-research`, `research-synth`,
   `lite-build`, `full-engineering`, `design`). Skips detection.
-- `init --force` / `init <template> --force` — regenerate even if `.moa.yml` exists.
+- `project --force` / `project <template> --force` — regenerate `.moa.yml` if it exists.
+  `--force` never crosses commands: `project --force` authorizes only `.moa.yml`,
+  `init --force` only `~/.moa/config.yml`.
+- **Legacy forms** (from before the split): `init global` → treat as `init`.
+  `init <template>` → say plainly that project setup moved to `/moa project <template>`
+  and stop — do **not** write anything (bare `init --force` now regenerates the machine
+  defaults, not the project file, so a stale habit must never overwrite the wrong target).
 
 ## Procedure
 
-1. **Parse args** — an optional template name and an optional `--force` flag.
+1. **Parse args** — the command selects the target: `init` → global, `project` → project
+   with an optional template name. Either command accepts `--force` (for its own target
+   only); `init` rejects a template (see legacy forms above).
 
-2. **Guard.** If `.moa.yml` already exists and `--force` was not given: read its
-   `template` and `models`, show them, tell the user to re-run with `--force` or edit
-   the file directly, and **stop**. Never silently overwrite a committed,
-   team-shared config.
+2. **Guard the selected target.** `project` guards `.moa.yml`; `init` guards
+   `~/.moa/config.yml`. If that target exists and `--force` was not given, read it,
+   summarize the current AI choices plainly, tell the user how to regenerate or edit
+   it, and **stop**. Never silently overwrite either a team-shared project file or
+   machine-wide defaults. The `project` guard runs **before** any global work — an
+   already-configured project must stop here, never reach the step-5 default-setup offer.
 
-3. **Resolve the template.**
+3. **Resolve the template (`project` only; `init` skips this step).**
    - If a template arg was given and is one of the five known names → use it.
    - If it was given but is unknown → list the five valid names and stop.
    - Otherwise run **coarse detection** (one suggestion, not a taxonomy):
@@ -75,10 +93,12 @@ Both say the same thing; the second hides nothing that matters and never sends t
      Show the proposal **and the signal that triggered it**, and ask the user to
      confirm or name another template. `lite-build`, `research-synth`, and `design`
      are never auto-proposed — they are reachable only via an explicit arg.
+     In a non-interactive `project` run, accept the detected proposal without prompting and
+     flag the unconfirmed detection in the report.
 
-4. **Discover the candidate model set — a working set in memory, NOT the registry** (fail-soft —
-   never block a write). Get the live inventory through the MCP server, not by reading profile
-   files by hand:
+4. **Discover the candidate model set — a working set in memory, NOT the registry** (both targets;
+   fail-soft — a failed source alone never blocks a write). Get the live inventory through the
+   MCP server, not by reading profile files by hand:
    0. **Call `moa_tools`** — the server runs the registered `modelDiscovery` recipe for every
       bound tool and returns the *current* inventory each learned tool serves now. This is the
       **only** read of external inventory you need: there is no stored `models`/`listModels`
@@ -96,27 +116,28 @@ Both say the same thing; the second hides nothing that matters and never sends t
    the source reports: top-tier → `strong` · volume/cheap → `cheap` · fast/triage → `fast`;
    add `vision` to a vision-capable model. Capability labels live in `tags`, never in the key.
 
-   **This set is your candidate pool, not the file.** Do NOT emit one registry entry per discovered
+   **This set is your candidate pool, not the file.** Do NOT emit one model entry per discovered
    model — that full dump (often 50–70 models) is exactly the bloat to avoid; it costs the team
-   tokens on every run and buries the few models that matter. The written `models` registry is
-   assembled in step 7 from **only the models the roles actually pick** (step 5).
+   tokens on every run and buries the few models that matter. The written `models` section is
+   assembled in step 7 from **only the models selected in step 5**.
 
    If a learned tool's `moa_tools` row came back with a non-`ok` discovery status (stale,
    unparseable, or the binary is gone) — **quietly skip it.** Do not stop, and do not surface the
    raw failure to the user as a question (no "binding broken", no "symlink", no "registry"). At
    most, mention it in plain language *as an aside* with a fix offer: *"One tool you'd connected
    earlier isn't reachable anymore — I'll leave it out. You can reconnect it later."* The missing
-   connection is never a blocker; host-native always works, and one failed learned tool never
-   takes the healthy live/native routes down with it.
+   connection never removes healthy candidates; host-native remains available, and one failed
+   learned tool never takes the healthy live/native routes down with it. The global target still
+   must satisfy the checker constraint in step 5.
 
-   If host-native is the only source, there is one family and nothing to route between, so roles stay
-   `[auto]` (the host resolves them live at run time) — the union of picks is empty and the registry
-   stays `{}`, with the comment:
+   For the `project` command without a global file, if host-native is the only source, there is one family and nothing to route
+   between, so roles stay `[auto]` (the host resolves them live at run time) — the union of picks
+   is empty and `models` stays `{}`, with the comment:
    `# only host-native models at init — connect more with /moa learn-tool, or they resolve live at run time`.
 
 4b. **Offer to bind more tools (the on-ramp — this is where moa "finds" your other CLIs).**
     Discovery reports what is *already* connected; it cannot *connect* anything. So, before
-    resolving roles, look at what you found and decide whether to offer `learn-tool`:
+    choosing models, look at what you found and decide whether to offer `learn-tool`:
     - **Only one model family is available** (e.g. just the host) — gates still work when it
       serves several models (independence = a different *model*), but a **cross-family** verifier —
       the preferred grade — is impossible in this state; say so plainly and offer the upgrade.
@@ -129,12 +150,38 @@ Both say the same thing; the second hides nothing that matters and never sends t
       so moa can use its models? It takes a minute."* (Behind the scenes that runs
       `/moa learn-tool <cli>`; you don't need to say "bind" or "profile" to the user.)
     - On accept, hand off to `references/learn-tool.md` (probe → prove → bind globally), then
-      **re-run discovery** so the new models enter the candidate pool before you resolve roles. On
+      **re-run discovery** so the new models enter the candidate pool before you make the picks. On
       skip, continue with what you have and note the weaker independence grade in the report.
-    In a non-interactive `init`, don't prompt — just record in the report which candidates were
+    In a non-interactive run, don't prompt — just record in the report which candidates were
     detected-but-unbound and that `/moa learn-tool` would connect them.
 
-5. **Resolve each role's `use` list — one capable, current pick per role.** Pick *per role* from the
+5. **Choose model assignments.**
+   **`init` (the default setup):** make three assignments (2–3 distinct models):
+   - **Main reasoning AI** → `planner`, `design-consult`, `synthesizer`, `researcher`.
+   - **AI that carries out the work** → `coder`, `builder`, `gatherer`.
+   - **A second, different AI to double-check the work** → `plan-reviewer`, `code-reviewer`,
+     `design-reviewer`, `verifier`.
+
+   The checker **must be a different model from both other choices**; prefer a different
+   family when available. The reasoning and implementation choices may be the same model.
+   If no candidate can satisfy the checker constraint, explain plainly that one more AI is
+   needed and stop before writing. Do not assign `differentModelFrom` here; those relationships
+   come from each project's rules.
+
+   **`project` with no global file (the machine's first setup):** make the **three global
+   choices above first** — they become the default AI setup, and this template's roles are a
+   subset of the roles they cover. If the checker constraint cannot be satisfied, or the pool
+   is host-native-only with nothing to route between (the `[auto]`/`models: {}` case below),
+   **skip the default-setup save** — never block or weaken the project write for it — and
+   fall back to the self-contained emission in step 7. In a **non-interactive** run, skip the
+   default-setup save too — machine defaults are never written without an explicit `init`
+   invocation or an in-conversation confirmation — and put the `/moa init` tip in the report.
+   Otherwise continue below as if the default setup existed, treating the three choices as its
+   role choices.
+
+   **`project`:** use a matching choice from the default AI setup when one exists, and run
+   the existing process below only for roles without one or for an explicit project-specific
+   choice. Resolve each remaining role's `use` list — one capable, current pick per role. Pick *per role* from the
    candidate pool; never blanket every role with `[auto]`. Match the role's purpose
    (`description`/`instructions`) and its criticality — derived from whether any phase running it has
    `gate: critical` (criticality lives on the phase, not the role) — against the
@@ -164,9 +211,9 @@ Both say the same thing; the second hides nothing that matters and never sends t
   resolve-time; do not normalize or coerce — drop it and tell the user in plain language that
   one inventory returned display names only and was not used.
 
-### Pick few, pick current (what keeps `.moa.yml` lean)
-The registry is the **union of the per-role picks**, nothing more — so fewer, newer models is the
-whole game.
+### Project picks: few and current
+The project's saved models are the **union of its explicit per-role picks**, nothing more — so
+fewer, newer models is the whole game.
 - **Pick current.** Among models that clear a role's bar, take the **latest in its line**
   (`claude-opus-4-8` over `…-4-7`; `gpt-5.5` over `gpt-5.2`; `code/MiniMax-M3` over `MiniMax-M2.x`).
   Pin an older/smaller one only with a one-line **Why** (cost, context, independence).
@@ -179,63 +226,112 @@ whole game.
 verifier `gpt-5.5` (family ≠ coder) — each `[<pick>, auto]`. **Registry = 3 models**; add a fast web
 model only if a research role exists. Everything else the host serves stays out of the file.
 
-6. **Confirm the picks — before any write.** Tags are a *heuristic* the source infers (price rank
+6. **Confirm the choices before any write.** Tags are a *heuristic* the source infers (price rank
    within the catalog plus reasoning support, not ground truth), and they steer routing, so show
-   your work first — but show only the **shortlist**, never the whole candidate pool:
-   - the **per-role assignment** from step 5 — each role, its picked model(s), the one-line reason,
-     and (when you took an older/smaller model) its **Why**;
-   - the **resulting registry** — the small union of those picks with each model's seeded tags, so an
-     obvious mislabel jumps out.
+   only the **shortlist**, never the whole candidate pool:
+   - **`init`:** show the three choices under the plain-language labels in step 5 and state
+     that the checker differs from both other choices.
+   - **`project`:** show every role's chosen model(s), the one-line reason, and any **Why**
+     for an older/smaller choice; then show the small set of AI models this project will save with
+     their seeded tags. If defaults exist, distinguish them from this project's custom choices.
+     On the machine's first `project` run, also state plainly: *"I'll save these choices as your
+     default AI setup, so every project can reuse them — this project keeps its own rules in
+     `.moa.yml`."* — one confirmation covers both writes.
+     If the user declines the default-setup save, respect it: write only the self-contained
+     project file (step 7).
 
-   Ask the user to confirm or correct, and apply any override — retag a model, or repin a role to a
-   different model — before writing. The user's choice always wins over the heuristic. In a
-   non-interactive `init`, skip the prompt but flag in the report that the tags are unconfirmed.
+   Ask the user to confirm or correct the choices before writing. Their correction always wins —
+   with one exception: a correction that makes the checker the same model as another choice.
+   Explain plainly that the double-check must be a different AI; if they insist, honor their
+   choices **for this project only** and skip the default-setup save (under `init`, write
+   nothing) — a default without an independent checker would quietly weaken every project.
+   In a non-interactive run, skip the prompt but flag in the report that tags are unconfirmed.
+   Non-interactive `init` still writes the defaults — invoking `init` is itself the
+   authorization. A non-interactive `project` run never writes them (see step 5): it emits
+   the self-contained project file and notes the `/moa init` tip in the report.
 
-7. **Render and write `.moa.yml`** at the repo root.
+7. **Render and write the selected target via `moa_init`.**
+
+   **`init`:**
+   - Call `moa_init` with `scope: "global"`. Pass only the 2–3 selected models and all 11 role
+     names from step 5, each with one `use: [<pick>, auto]` entry.
+   - Emit only `schemaVersion`, `models`, and `roles`: no `differentModelFrom`, template,
+     instructions, or pipelines. Do not detect or splice a template.
+   - `moa_init` validates the complete global result before writing. If invalid, it reports the
+     problem and writes nothing.
+
+   **`project`:**
+   - **First-run default save (when step 5 made the three global choices):** call `moa_init`
+     with `scope: "global"` first, exactly as `init` above — and **without** force semantics,
+     even when the user passed `project --force` (that flag authorizes regenerating `.moa.yml`
+     only). If it fails **for any reason** — validation, an existing-file guard, or the write
+     itself (e.g. an unwritable home directory) — say so plainly, skip the default setup, and
+     continue with the self-contained emission below; the project write never fails or weakens
+     because the default save did. On success, the global file now exists: use the *"global
+     file exists"* emission. If the global save succeeds but the project write then fails,
+     report exactly that — defaults saved, project file not written — never a blanket success.
    - Start from `templates/<name>.yml` **verbatim** — its comments are the in-file
      docs and must survive.
-- **Assemble the registry** = the union of every model any role picked in step 5, one entry each
-  (`id`, `family`, `context` if known, seeded `tags`, optional `binding`) — and *nothing the
-  roles don't reference*. Fill the template's `models: {}` with it, and replace each role's
-  `use: [auto]` placeholder with its step-5 assignment. **`.moa.yml` contains only the
-  aliases roles selected, never the full live inventory** — anything `moa_tools` reported but
-  no role picked stays out of the file. When the user pinned a route in step 5, the
-  `binding:` key lives on the `models.<alias>` entry — never on a `roles.<name>` field.
+   - **No global file (and none was just created):** emit today's full self-contained project file. Assemble `models` from
+     every explicit role choice in step 5, one entry each (`id`, `family`, `context` if known,
+     seeded `tags`, optional `binding`) and nothing else; replace each role's `use: [auto]`
+     placeholder with its assignment.
+   - **Global file exists:** emit this project's custom rules. Omit `use` for roles whose global
+     choice is accepted. For every role without a global choice or with an explicit project
+     override, keep `use` and the minimal model entries it references. Preserve project
+     `differentModelFrom`, `instructions`, `pipelines`, and `template`.
+   - A user-pinned route remains `models.<alias>.binding`; never emit `roles.<name>.binding`.
    - **Keep pipelines named; never emit a `default`.** Templates ship **named** pipeline(s) — e.g.
      full-engineering's `engineering`+`quick` — and no `default`, so a fresh config runs in **adaptive
      mode** (config-present fork: the master picks the approach per task); don't rewrite, rename, or prune them. Emit a
      pipeline's `description:` **only when the config has ≥2 pipelines** (a single-pipeline config
      selects by name). Omit `runtime.subagents` (default `auto`); write it only to pin.
-   - Before writing, confirm the result round-trips through the YAML safe subset and
-     validates against `schema/config.schema.json`. If you cannot guarantee it is
-     valid, write the **untouched template** (with `models: {}` and `use: [auto]` roles) rather than
-     emit a broken file.
+   - Call `moa_init` with `scope: "project"`. When global defaults exist, it combines the rendered
+     project file with the actual global file and validates the effective result before writing;
+     otherwise it validates the self-contained file. On failure it reports the problem and writes
+     nothing.
 
-8. **Report.** Print the written path, the chosen template, the resolved registry, the **per-role
-   model assignment** (and any roles left `auto`, with the reason), the **independence grade**
-   reachable here (cross-family vs single-family, per step 4b), and any candidate CLIs
-   detected-but-unbound. Then say plainly that **moa picks the right approach per task** (this config
-   sets no `default`), and that **to always run one workflow exactly, make it the default** — showing
-   the exact one-line key rename (keep `pipelines:`; rename the pipeline's own key):
+8. **Report.**
+   - **`init`:** print the written path and the three confirmed choices under the
+     plain-language labels from step 5, including that the checker differs from both others.
+   - **`project`:** print the path, template, per-role AI choices (including any left
+     automatic and why), the reachable double-check grade, and any installed AI tools offered
+     for connection. Say plainly that **moa picks the right approach per task** because this
+     project sets no `default`, and that **to always run one workflow exactly, make it the
+     default** — showing the exact one-line key rename:
 
    ```
    pipelines:            pipelines:
      engineering:   →      default:
    ```
 
-   End with the next step: run `/moa <task>` to orchestrate, `/moa learn-tool <cli>` to connect
-   another model, or edit `.moa.yml` first.
+   End with the next action: run `/moa <task>`, connect another AI tool, or edit `.moa.yml`.
+   If a first-run `project` command also saved the default setup, say so in one line: *"Saved
+   these AI choices as your default — new projects will reuse them automatically."* If it
+   instead wrote a self-contained file (user declined, non-interactive run, or the default
+   save was skipped), append exactly one closing tip: *"Run `/moa init` once to make these AI
+   choices your default for every project."*
 
 ## Edge cases
-- Only host-native models available → one family, nothing to route: roles stay `[auto]`, so the
-  union of picks is empty and the registry is `{}` + comment; success — gates stay independent
-  across the host's models — but flag that the preferred cross-family grade needs a second tool
-  bound via `learn-tool`.
+- `project` without a global file and with only host-native models available → one family, nothing to route: roles stay
+  `[auto]`, so the union of picks is empty and `models` is `{}` + comment; success — gates can
+  still use different host models — but say plainly that stronger cross-family double-checking
+  needs another connected AI tool. The first-run default save is skipped in this state (there
+  are no picks to save); connecting another AI tool and re-running `/moa init` enables it.
+- First-run `project` where the checker constraint cannot be satisfied → skip the default
+  save, write the self-contained project file, and say plainly that one more AI enables both
+  the stronger double-check and the shared default setup.
+- `init` without a checker model different from both other picks → report that a second AI
+  is needed and write nothing.
+- A broken `~/.moa/config.yml` (load reports it invalid) → still route here: `init --force`
+  regenerates it; never fall back to project-only picks while the defaults stay broken.
+- Legacy `init <template>` → point to `/moa project <template>`, write nothing;
+  legacy `init global` → same as `init`.
 - A learned tool that fails live discovery during step 4 → that tool is skipped; register the
   rest of the inventory and tell the user in plain language which tool to re-learn. Healthy
   live and host-native routes keep working; one failed tool never takes the rest down.
-- A learned profile that won't parse / is stale → register what's usable, skip the rest, say
-  which models resolved and which profile to re-learn.
+- A learned profile that won't parse / is stale → use what remains, skip it, and tell the user
+  which connected AI tool they can reconnect.
 - Unknown template arg → list the five names, stop.
 - Unrecognizable project → detection falls to `full-engineering`; user confirms.
 - Discovery returns display-name or otherwise noncanonical ids → reject that tool's rows,

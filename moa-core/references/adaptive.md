@@ -20,8 +20,8 @@ changes only four things:
   and declared role names — values you cannot echo without reading the file).
   *Config absent*: the Frame is a **discipline** (restate goal, constraints, non-goals,
   done-criteria + evidence; surface ambiguity), not a hard proof-of-read.
-- **(d) the `/moa init` nudge** — offered **only when no `.moa.yml` exists** (see *When to suggest
-  `init`*). The config-present fork already has a config; never nudge it.
+- **(d) the `/moa project` nudge** — offered **only when no `.moa.yml` exists** (see *When to suggest
+  `project`*). The config-present fork already has a config; never nudge it.
 
 The verification floor is the **same** for both forks — see *The verification floor* below.
 
@@ -140,16 +140,16 @@ writes no config to pin another). Independence keys on the **model** — the ver
 - **Self-check** — `blocked`, or no different model spawnable: do your best check (a fresh-context
   same-model pass helps, but it is still the producer's own model — never independent), label the
   result *"unverified — no independent model,"* and recommend a user review or, when no config
-  exists, `/moa init`.
+  exists, `/moa project`.
 
 Adaptive mode **does not halt** on a weak grade (either fork) — it proceeds and names the grade.
 What a `.moa.yml` buys is pinned models and declared independence, **not** a harder halt. Only
 `master.mode: strict` (workflow mode) keeps the hard floor — a `critical` gate with no
 different-model verifier halts at `verification_unavailable`.
 
-## When to suggest `init`
+## When to suggest `project`
 After substantial work, if the user is clearly doing repeated heavy engineering in this project,
-mention **once** that `/moa init` would pin roles/models and run the gates the config-absent fork
+mention **once** that `/moa project` would pin roles/models and run the gates the config-absent fork
 only approximates. Never push it for one-off or light tasks — zero-setup is the point. (Config-absent
 fork only; single-family runs may also mention `/moa learn-tool` once — it upgrades gates from
 cross-model to cross-family.)
