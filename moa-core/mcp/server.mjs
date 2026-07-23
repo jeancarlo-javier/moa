@@ -20,6 +20,7 @@ import { z } from "zod";
 const SKILL_DIR = path.join(path.dirname(fileURLToPath(import.meta.url)), "..");
 const MOA_HOME = () => process.env.MOA_HOME ?? os.homedir();
 const BINDINGS_DIR = () => path.join(MOA_HOME(), ".moa", "bindings");
+const GLOBAL_CONFIG = () => path.join(MOA_HOME(), ".moa", "config.yml");
 const TEMPLATES = ["solo-research", "research-synth", "lite-build", "full-engineering", "design"];
 
 // --- config schema (zod mirror of schema/config.schema.json) -------------
@@ -108,6 +109,25 @@ const zConfig = z.object({
   pipelines: z.record(z.string(), zPipeline).optional(),
 }).strict();
 
+// Layer validators stay derived from the effective-config contract: the global
+// file narrows it to staffing, while a project overlay only relaxes role.use.
+const zGlobalRole = zRole.pick({ use: true, differentModelFrom: true }).strict();
+const zGlobalConfig = zConfig.pick({
+  schemaVersion: true,
+  models: true,
+  roles: true,
+}).extend({
+  roles: z.record(z.string(), zGlobalRole).refine((r) => Object.keys(r).length > 0, {
+    message: "must declare at least one role",
+  }).optional(),
+}).strict();
+const zProjectRole = zRole.extend({ use: zRole.shape.use.optional() }).strict();
+const zProjectOverlay = zConfig.extend({
+  roles: z.record(z.string(), zProjectRole).refine((r) => Object.keys(r).length > 0, {
+    message: "must declare at least one role",
+  }).optional(),
+}).strict();
+
 const PLACEHOLDER = /\{[^{}]+\}/;
 // The only placeholders opSpawn expands in a profile's run.argv.
 const RUN_PLACEHOLDERS = new Set(["{bin}", "{model}", "{promptFile}", "{cwd}", "{maxTime}"]);
@@ -176,6 +196,45 @@ function parseYamlStrict(src, label) {
   return { value: doc.toJS() };
 }
 
+function schemaErrors(result, label) {
+  return result.error.issues.map((issue) =>
+    `${label}: ${issue.path.length ? `${issue.path.join(".")}: ` : ""}${issue.message}`);
+}
+
+function readConfigLayer(file, schema) {
+  const parsed = parseYamlStrict(fs.readFileSync(file, "utf8"), file);
+  if (parsed.errors) return { errors: parsed.errors };
+  const validated = schema.safeParse(parsed.value);
+  return validated.success
+    ? { value: validated.data }
+    : { errors: schemaErrors(validated, file) };
+}
+
+function roleGraph(roles = {}) {
+  const marks = new Map();
+  const stack = [];
+  const order = [];
+  const cycles = [];
+  const visit = (name) => {
+    if (marks.get(name) === "done") return;
+    if (marks.get(name) === "visiting") {
+      const start = stack.indexOf(name);
+      cycles.push([...stack.slice(start), name]);
+      return;
+    }
+    marks.set(name, "visiting");
+    stack.push(name);
+    const target = roles[name]?.differentModelFrom;
+    if (target && roles[target]) visit(target);
+    stack.pop();
+    marks.set(name, "done");
+    order.push(name);
+  };
+  for (const name of Object.keys(roles)) visit(name);
+  return { order, cycles };
+}
+
+
 function crossCheck(cfg) {
   const errs = [];
   const modelNames = new Set(Object.keys(cfg.models ?? {}));
@@ -187,6 +246,8 @@ function crossCheck(cfg) {
     if (role.differentModelFrom && !roleNames.has(role.differentModelFrom))
       errs.push(`role '${rname}': differentModelFrom names unknown role '${role.differentModelFrom}'`);
   }
+  for (const cycle of roleGraph(cfg.roles).cycles)
+    errs.push(`roles: differentModelFrom cycle '${cycle.join("' -> '")}'`);
   for (const [mname, entry] of Object.entries(cfg.models ?? {})) {
     if (mname === "auto") continue;
     const id = entry.id ?? mname;
@@ -218,6 +279,21 @@ function findConfig(cwd) {
     if (parent === dir) return null;
     dir = parent;
   }
+}
+
+function mergeConfigLayers(globalConfig, projectConfig) {
+  if (!projectConfig) return globalConfig;
+  if (!globalConfig) return projectConfig;
+  const merged = { ...projectConfig };
+  if (globalConfig.models || projectConfig.models)
+    merged.models = { ...(globalConfig.models ?? {}), ...(projectConfig.models ?? {}) };
+  if (projectConfig.roles) {
+    merged.roles = Object.fromEntries(Object.entries(projectConfig.roles).map(([name, role]) =>
+      [name, { ...(globalConfig.roles?.[name] ?? {}), ...role }]));
+  } else {
+    delete merged.roles;
+  }
+  return merged;
 }
 
 function resolveExecutable(bin, envPath = process.env.PATH ?? "") {
@@ -505,42 +581,82 @@ function workDirOf(loaded) {
 // --- operations -----------------------------------------------------------
 
 export function opLoad({ cwd = process.cwd() } = {}) {
-  const configPath = findConfig(cwd);
+  // Loading is transactional: no prior config or resolution survives any failure.
+  state.loaded = null;
+  state.resolved = null;
+
+  const globalCandidate = GLOBAL_CONFIG();
+  const globalPath = fs.existsSync(globalCandidate) ? globalCandidate : null;
+  const projectPath = findConfig(cwd);
+  const configPaths = { global: globalPath, project: projectPath };
   const { bindings, tools, skipped } = loadBindings();
-  if (!configPath) {
+
+  let globalConfig = null;
+  if (globalPath) {
+    const layer = readConfigLayer(globalPath, zGlobalConfig);
+    const globalHint = "fix the file by hand or regenerate the defaults with /moa init --force";
+    if (layer.errors)
+      return { configPath: globalPath, configPaths, errors: layer.errors, hint: globalHint };
+    const errors = crossCheck(layer.value).map((error) => `${globalPath}: ${error}`);
+    if (errors.length)
+      return { configPath: globalPath, configPaths, errors, hint: globalHint };
+    globalConfig = layer.value;
+  }
+
+  let projectConfig = null;
+  if (projectPath) {
+    const parsed = parseYamlStrict(fs.readFileSync(projectPath, "utf8"), projectPath);
+    if (parsed.errors)
+      return { configPath: projectPath, configPaths, errors: parsed.errors };
+    if (globalConfig && parsed.value?.schemaVersion !== globalConfig.schemaVersion) {
+      return {
+        configPath: projectPath,
+        configPaths,
+        errors: [`schemaVersion mismatch: ${globalPath} has ${globalConfig.schemaVersion}, ${projectPath} has ${parsed.value?.schemaVersion}`],
+      };
+    }
+    const validated = zProjectOverlay.safeParse(parsed.value);
+    if (!validated.success)
+      return { configPath: projectPath, configPaths, errors: schemaErrors(validated, projectPath) };
+    projectConfig = validated.data;
+  }
+
+  if (!globalConfig && !projectConfig) {
     const projectDir = path.resolve(cwd);
     state.loaded = {
       config: null,
       configPath: null,
+      configPaths,
       projectDir,
       dispatch: "adaptive-bare",
       bindings,
     };
-    state.resolved = null;
     return {
       config: null,
       configPath: null,
+      configPaths,
       dispatch: "adaptive-bare",
       mode: "auto",
       bindings: tools.filter((tool) => tool.available),
       skippedBindings: skipped,
-      note: "no .moa.yml from cwd to root — adaptive mode, write nothing; offer /moa init after substantial work",
+      note: "no .moa.yml from cwd to root — adaptive mode, write nothing; offer /moa project after substantial work",
     };
   }
-  const parsed = parseYamlStrict(fs.readFileSync(configPath, "utf8"), path.basename(configPath));
-  if (parsed.errors) return { configPath, errors: parsed.errors };
-  const v = zConfig.safeParse(parsed.value);
-  if (!v.success)
-    return { configPath, errors: v.error.issues.map((i) => `${i.path.join(".")}: ${i.message}`) };
-  const errs = crossCheck(v.data);
-  if (errs.length) return { configPath, errors: errs };
-  const cfg = v.data;
-  const dispatch = cfg.pipelines?.default ? "workflow" : "adaptive-config";
-  const projectDir = path.dirname(configPath);
-  state.loaded = { config: cfg, configPath, projectDir, dispatch, bindings };
-  state.resolved = null;
+
+  const merged = mergeConfigLayers(globalConfig, projectConfig);
+  const validated = zConfig.safeParse(merged);
+  const configPath = projectPath ?? globalPath;
+  if (!validated.success)
+    return { configPath, configPaths, errors: schemaErrors(validated, configPath) };
+  const errors = crossCheck(validated.data).map((error) => `${configPath}: ${error}`);
+  if (errors.length) return { configPath, configPaths, errors };
+
+  const cfg = validated.data;
+  const dispatch = projectPath && cfg.pipelines?.default ? "workflow" : "adaptive-config";
+  const projectDir = projectPath ? path.dirname(projectPath) : path.resolve(cwd);
+  state.loaded = { config: cfg, configPath, configPaths, projectDir, dispatch, bindings };
   return {
-    configPath, dispatch, mode: cfg.master?.mode ?? "auto",
+    configPath, configPaths, dispatch, mode: cfg.master?.mode ?? "auto",
     schemaVersion: cfg.schemaVersion,
     roles: Object.fromEntries(Object.entries(cfg.roles ?? {}).map(([n, r]) => [n, {
       use: r.use, differentModelFrom: r.differentModelFrom,
@@ -618,17 +734,24 @@ export async function opResolve({ hostModels = [], overrides = {} } = {}) {
     for (const step of pipeline.steps)
       if (step.gate === "critical") criticalRoles.add(step.role);
 
-  // resolve in dependency order: roles without differentModelFrom first
-  const names = Object.keys(cfg.roles ?? {});
-  names.sort((a, b) =>
-    (cfg.roles[a].differentModelFrom ? 1 : 0) - (cfg.roles[b].differentModelFrom ? 1 : 0));
+  // A role's independence target must be fixed before the dependent is picked.
+  const names = roleGraph(cfg.roles ?? {}).order;
   const roles = {};
   const subagents = cfg.runtime?.subagents ?? "auto";
   for (const rname of names) {
     const role = cfg.roles[rname];
+    const dependency = role.differentModelFrom;
+    if (dependency && !roles[dependency]) {
+      diagnostics.push({
+        state: "blocked_dependency",
+        role: rname,
+        dependsOn: dependency,
+        hint: `differentModelFrom target '${dependency}' did not resolve`,
+      });
+      continue;
+    }
     const notGroups = new Set();
-    if (role.differentModelFrom && roles[role.differentModelFrom])
-      notGroups.add(roles[role.differentModelFrom].group);
+    if (dependency) notGroups.add(roles[dependency].group);
     const needTags = criticalRoles.has(rname) ? hardTags : [];
     let pick = null;
     let route = null;
@@ -697,6 +820,7 @@ export async function opResolve({ hostModels = [], overrides = {} } = {}) {
       model: route.modelId,
       shortName: pick.shortName,
       family: pick.family ?? null,
+      tags: pick.tags ?? [],
       group: pick.group,
       binding: route.binding,
       effort,
@@ -709,7 +833,12 @@ export async function opResolve({ hostModels = [], overrides = {} } = {}) {
   const wd = workDirOf(state.loaded);
   fs.mkdirSync(wd, { recursive: true });
   fs.writeFileSync(path.join(wd, "effective-config.json"),
-    JSON.stringify({ resolvedAt: new Date().toISOString(), configPath: state.loaded.configPath, roles }, null, 2) + "\n");
+    JSON.stringify({
+      resolvedAt: new Date().toISOString(),
+      configPath: state.loaded.configPath,
+      configPaths: state.loaded.configPaths,
+      roles,
+    }, null, 2) + "\n");
   return {
     roles, diagnostics,
     pool: pool.map(poolRow),
@@ -1048,7 +1177,7 @@ function describeStep(manifest, i) {
 export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } = {}) {
   if (!state.loaded) return { error: "call moa_load first" };
   if (!state.resolved) return { error: "call moa_resolve first (pass the host-native model list)" };
-  const { config: cfg, dispatch, configPath } = state.loaded;
+  const { config: cfg, dispatch, configPath, configPaths } = state.loaded;
   let chosen, name;
   if (steps) {
     const v = z.array(zStep).min(1).safeParse(steps);
@@ -1062,6 +1191,16 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } 
     for (const s of steps)
       if (s.role !== "master" && !state.resolved.roles[s.role])
         return { error: `steps name unresolved role '${s.role}' — declare it in .moa.yml or resolve it first` };
+    const hardTags = state.resolved.hardTags ?? ["strong"];
+    for (const s of steps) {
+      if (s.gate !== "critical" || s.role === "master") continue;
+      const resolved = state.resolved.roles[s.role];
+      const missing = hardTags.filter((tag) => !(resolved.tags ?? []).includes(tag));
+      if (missing.length)
+        return {
+          error: `ad-hoc critical role '${s.role}' lacks required model tags [${missing.join(", ")}] — call moa_resolve again with an override to a qualifying model`,
+        };
+    }
     chosen = steps; name = "ad-hoc";
   } else if (cfg) {
     name = pipeline ?? (dispatch === "workflow" ? "default" : null);
@@ -1090,7 +1229,9 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } 
   saveRun(manifest);
   const gates = chosen.filter((s) => (s.gate ?? "none") !== "none").map((s) => `${s.phase}(${s.gate})`);
   const frame = {
-    config: configPath ? `${configPath} · schemaVersion ${cfg.schemaVersion} · roles: ${Object.keys(cfg.roles ?? {}).join(",")}` : "none",
+    config: configPath
+      ? `${configPaths.global && configPaths.project ? `${configPaths.global} + ${configPaths.project}` : configPath} · schemaVersion ${cfg.schemaVersion} · roles: ${Object.keys(cfg.roles ?? {}).join(",")}`
+      : "none",
     mode: manifest.mode, dispatch: name === "ad-hoc" ? "adaptive→composed" : dispatch === "workflow" ? "workflow:default" : `adaptive→named:${name}`,
     pipeline: chosen.map((s) => s.phase).join("→"),
     gates: gates.join(", ") || "none",
@@ -1511,7 +1652,55 @@ export async function opSpawnWait({ runId, spawnId, waitMs = 20_000 } = {}, { si
 
 // --- init ------------------------------------------------------------------
 
-export function opInit({ template, registry = {}, roles = {}, force = false, cwd = process.cwd() } = {}) {
+function normalizeInitRoles(roles) {
+  const normalized = {};
+  for (const [name, value] of Object.entries(roles)) {
+    const role = Array.isArray(value) ? { use: value } : value;
+    if (!role || typeof role !== "object" || !Array.isArray(role.use))
+      return { error: `role '${name}' must provide a use list` };
+    normalized[name] = { use: role.use };
+    if (role.differentModelFrom !== undefined)
+      normalized[name].differentModelFrom = role.differentModelFrom;
+  }
+  return { value: normalized };
+}
+
+export function opInit({
+  scope = "project", template, registry = {}, roles = {}, force = false, cwd = process.cwd(),
+} = {}) {
+  if (!["global", "project"].includes(scope))
+    return { error: "scope must be 'global' or 'project'" };
+  if (scope === "global" && template !== undefined)
+    return { error: "global init does not accept a template" };
+
+  const normalizedRoles = normalizeInitRoles(roles);
+  if (normalizedRoles.error) return normalizedRoles;
+
+  if (scope === "global") {
+    const target = GLOBAL_CONFIG();
+    if (fs.existsSync(target) && !force)
+      return { error: `${target} already exists — pass force:true to regenerate, or edit it directly` };
+    const composed = {
+      schemaVersion: 1,
+      models: registry,
+      roles: normalizedRoles.value,
+    };
+    const validated = zGlobalConfig.safeParse(composed);
+    const errors = validated.success
+      ? crossCheck(validated.data).map((error) => `${target}: ${error}`)
+      : schemaErrors(validated, target);
+    if (errors.length)
+      return { error: `invalid global config: ${errors.join("; ")}` };
+    fs.mkdirSync(path.dirname(target), { recursive: true });
+    fs.writeFileSync(target, YAML.stringify(validated.data));
+    return {
+      written: target,
+      scope,
+      registry: Object.keys(registry),
+      roles: Object.keys(normalizedRoles.value),
+    };
+  }
+
   if (!TEMPLATES.includes(template))
     return { error: `unknown template '${template}' — one of: ${TEMPLATES.join(", ")}` };
   const target = path.join(path.resolve(cwd), ".moa.yml");
@@ -1522,28 +1711,96 @@ export function opInit({ template, registry = {}, roles = {}, force = false, cwd
       existing: { template: cur.value?.template ?? null, models: Object.keys(cur.value?.models ?? {}) },
     };
   }
+
+  const hasSpliceInput =
+    Object.keys(registry).length > 0 || Object.keys(normalizedRoles.value).length > 0;
   const tplSrc = fs.readFileSync(path.join(SKILL_DIR, "templates", `${template}.yml`), "utf8");
   const doc = YAML.parseDocument(tplSrc);
-  // splice registry (union of per-role picks only) + role use lists; comments survive
-  if (Object.keys(registry).length) {
-    const node = doc.createNode(registry);
-    doc.setIn(["models"], node);
-  }
-  for (const [rname, use] of Object.entries(roles)) {
+  if (Object.keys(registry).length)
+    doc.setIn(["models"], doc.createNode(registry));
+  for (const [rname, role] of Object.entries(normalizedRoles.value)) {
     if (!doc.hasIn(["roles", rname])) return { error: `template '${template}' has no role '${rname}'` };
-    const arr = doc.createNode(use);
+    const arr = doc.createNode(role.use);
     arr.flow = true;
     doc.setIn(["roles", rname, "use"], arr);
+    if (role.differentModelFrom !== undefined)
+      doc.setIn(["roles", rname, "differentModelFrom"], role.differentModelFrom);
   }
-  let out = doc.toString();
-  const check = parseYamlStrict(out, ".moa.yml");
-  const valid = !check.errors && zConfig.safeParse(check.value).success && !crossCheck(check.value ?? {}).length;
-  if (!valid) { out = tplSrc; } // fall back to the untouched template rather than write a broken file
+
+  const globalPath = GLOBAL_CONFIG();
+  if (!fs.existsSync(globalPath)) {
+    if (!hasSpliceInput) {
+      fs.writeFileSync(target, tplSrc);
+      return {
+        written: target, template, spliced: false, registry: [],
+        tip: "Run /moa init once to make these model picks the default for every project.",
+      };
+    }
+    const out = doc.toString();
+    const check = parseYamlStrict(out, ".moa.yml");
+    const validated = check.errors ? null : zConfig.safeParse(check.value);
+    const errors = check.errors ??
+      (validated.success ? crossCheck(validated.data) : schemaErrors(validated, ".moa.yml"));
+    if (errors.length)
+      return { error: `invalid project config: ${errors.join("; ")}` };
+    fs.writeFileSync(target, out);
+    return {
+      written: target, template, spliced: true,
+      registry: Object.keys(registry),
+      tip: "Run /moa init once to make these model picks the default for every project.",
+    };
+  }
+
+  const globalLayer = readConfigLayer(globalPath, zGlobalConfig);
+  if (globalLayer.errors)
+    return { error: `invalid global config: ${globalLayer.errors.join("; ")}` };
+  const globalErrors = crossCheck(globalLayer.value).map((error) => `${globalPath}: ${error}`);
+  if (globalErrors.length)
+    return { error: `invalid global config: ${globalErrors.join("; ")}` };
+
+  for (const rname of Object.keys(doc.toJS().roles ?? {})) {
+    const globalUse = globalLayer.value.roles?.[rname]?.use;
+    const explicitUse = normalizedRoles.value[rname]?.use;
+    if (globalUse && (!explicitUse ||
+      (explicitUse.length === globalUse.length &&
+        explicitUse.every((name, index) => name === globalUse[index]))))
+      doc.deleteIn(["roles", rname, "use"]);
+  }
+  const overlayRoles = doc.toJS().roles ?? {};
+  const referenced = new Set(Object.values(overlayRoles)
+    .flatMap((role) => role.use ?? [])
+    .filter((name) => name !== "auto"));
+  const minimalRegistry = Object.fromEntries(Object.entries(registry)
+    .filter(([name]) => referenced.has(name)));
+  if (Object.keys(minimalRegistry).length)
+    doc.setIn(["models"], doc.createNode(minimalRegistry));
+  else
+    doc.deleteIn(["models"]);
+
+  const out = doc.toString();
+  const parsed = parseYamlStrict(out, target);
+  if (parsed.errors)
+    return { error: `invalid project overlay: ${parsed.errors.join("; ")}` };
+  const overlay = zProjectOverlay.safeParse(parsed.value);
+  if (!overlay.success)
+    return { error: `invalid project overlay: ${schemaErrors(overlay, target).join("; ")}` };
+  if (overlay.data.schemaVersion !== globalLayer.value.schemaVersion)
+    return { error: `schemaVersion mismatch: ${globalPath} has ${globalLayer.value.schemaVersion}, ${target} has ${overlay.data.schemaVersion}` };
+  const merged = zConfig.safeParse(mergeConfigLayers(globalLayer.value, overlay.data));
+  if (!merged.success)
+    return { error: `invalid merged config: ${schemaErrors(merged, target).join("; ")}` };
+  const mergedErrors = crossCheck(merged.data).map((error) => `${target}: ${error}`);
+  if (mergedErrors.length)
+    return { error: `invalid merged config: ${mergedErrors.join("; ")}` };
+
   fs.writeFileSync(target, out);
   return {
-    written: target, template, spliced: valid,
-    ...(valid ? {} : { note: "splice failed validation — wrote the untouched template (models: {} / use: [auto]); edit by hand" }),
-    registry: valid ? Object.keys(registry) : [],
+    written: target,
+    template,
+    scope,
+    overlay: true,
+    globalConfig: globalPath,
+    registry: Object.keys(minimalRegistry),
   };
 }
 
@@ -1603,7 +1860,7 @@ async function startMcp() {
 
   server.tool(
     "moa_load",
-    "FIRST CALL of every moa run. Locates .moa.yml (cwd→root), parses + validates it, reads learned tool profiles (~/.moa/bindings) as metadata only. Returns the normalized config, dispatch mode (workflow|adaptive-config|adaptive-bare), roles, pipelines, and connected tools. Replaces reading the config by hand. Never runs an inventory subprocess — model inventory is fetched live through moa_tools / moa_resolve / moa_spawn.",
+    "FIRST CALL of every moa run. Loads ~/.moa/config.yml staffing plus the nearest .moa.yml project overlay and validates their merge; either layer is optional. Reads learned tool profiles (~/.moa/bindings) as metadata only. Returns the normalized config, dispatch mode (workflow|adaptive-config|adaptive-bare), roles, pipelines, and connected tools. Never runs an inventory subprocess — model inventory is fetched live through moa_tools / moa_resolve / moa_spawn.",
     { cwd: z.string().optional().describe("directory to search from; defaults to the server's cwd") },
     async (a) => json(opLoad(a))
   );
@@ -1712,18 +1969,25 @@ async function startMcp() {
 
   server.tool(
     "moa_init",
-    "Write .moa.yml from a bundled template (comments preserved), splicing in the models registry (union of per-role picks ONLY — never the full discovered pool) and each role's use list. Guards an existing config unless force. You still do detection, picks, and user confirmation first.",
+    "Write global staffing or a project .moa.yml overlay. Project scope preserves template comments; both scopes guard an existing target unless force. You still do detection, picks, and user confirmation first.",
     {
-      template: z.enum(["solo-research", "research-synth", "lite-build", "full-engineering", "design"]),
+      scope: z.enum(["global", "project"]).optional().describe("write global staffing or a project overlay; defaults to project"),
+      template: z.enum(["solo-research", "research-synth", "lite-build", "full-engineering", "design"]).optional(),
       registry: z.record(z.string(), z.object({
         id: z.string().regex(CANONICAL_MODEL_ID).optional(), family: z.string().optional(),
         tags: z.array(z.string()).optional(), context: z.number().int().optional(),
         effort: z.array(z.string()).optional(),
         binding: z.string().optional().describe("optional exact route pin: host-native or learned tool name"),
       })).optional().describe("models map — only models some role actually uses"),
-      roles: z.record(z.string(), z.array(z.string())).optional().describe("role name → use list, e.g. {planner: ['opus','auto']}"),
+      roles: z.record(z.string(), z.union([
+        z.array(z.string()),
+        z.object({
+          use: z.array(z.string()),
+          differentModelFrom: z.string().optional(),
+        }).strict(),
+      ])).optional().describe("role name → use list, optionally with an explicit independence target"),
       force: z.boolean().optional(),
-      cwd: z.string().optional().describe("repo root to write into; defaults to server cwd"),
+      cwd: z.string().optional().describe("repo root for project scope; defaults to server cwd"),
     },
     async (a) => json(opInit(a))
   );

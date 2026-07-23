@@ -10,6 +10,12 @@ const TMP = fs.mkdtempSync(path.join(os.tmpdir(), "moa-test-"));
 process.env.MOA_HOME = path.join(TMP, "home");
 const REPO = path.join(TMP, "repo");
 fs.mkdirSync(REPO, { recursive: true });
+const GLOBAL_CONFIG = path.join(process.env.MOA_HOME, ".moa", "config.yml");
+const writeGlobal = (source) => {
+  fs.mkdirSync(path.dirname(GLOBAL_CONFIG), { recursive: true });
+  fs.writeFileSync(GLOBAL_CONFIG, source);
+};
+const clearGlobal = () => fs.rmSync(GLOBAL_CONFIG, { force: true });
 
 const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opSpawnStatus, opSpawnCancel, opSpawnWait, opInit, opBindingSave } =
   await import("./server.mjs");
@@ -235,6 +241,213 @@ t("load: YAML anchors rejected (safe subset)", () => {
   const bad = path.join(TMP, "anchors"); fs.mkdirSync(bad, { recursive: true });
   fs.writeFileSync(path.join(bad, ".moa.yml"), "schemaVersion: 1\nx: &a 1\ny: *a\n");
   assert.ok(opLoad({ cwd: bad }).errors.some((e) => e.includes("safe subset")));
+});
+
+await ta("load: global-only config anchors adaptive mode to cwd", async () => {
+  const cwd = path.join(TMP, "global-only");
+  fs.mkdirSync(cwd, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  g: { id: openai/gpt-5.5, tags: [strong] }
+roles:
+  planner: { use: [g] }
+`);
+  try {
+    const loaded = opLoad({ cwd });
+    assert.equal(loaded.dispatch, "adaptive-config");
+    assert.equal(loaded.configPath, GLOBAL_CONFIG);
+    assert.deepEqual(loaded.configPaths, { global: GLOBAL_CONFIG, project: null });
+    assert.deepEqual(Object.keys(loaded.roles), ["planner"]);
+    const resolved = await opResolve({ hostModels: HOST });
+    assert.equal(resolved.effectiveConfig, path.join(cwd, ".moa", "effective-config.json"));
+  } finally {
+    clearGlobal();
+  }
+});
+
+t("load: global boundary rejects project policy keys with its path", () => {
+  const cases = [
+    ["pipelines", "pipelines: {}\n"],
+    ["template", "template: { base: custom }\n"],
+    ["master", "master: { mode: auto }\n"],
+    ["runtime", "runtime: { subagents: auto }\n"],
+    ["instructions", "roles:\n  planner: { use: [g], instructions: no }\n"],
+  ];
+  try {
+    for (const [key, extra] of cases) {
+      const roles = key === "instructions" ? "" : "roles:\n  planner: { use: [g] }\n";
+      writeGlobal(`schemaVersion: 1\nmodels:\n  g: { id: openai/gpt-5.5 }\n${roles}${extra}`);
+      const errors = opLoad({ cwd: path.join(TMP, "no-project") }).errors;
+      assert.ok(errors, `${key} loaded in the global layer`);
+      assert.match(errors.join("\n"), new RegExp(key));
+      assert.ok(errors.every((error) => error.includes(GLOBAL_CONFIG)), JSON.stringify(errors));
+    }
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("load: project roles inherit global staffing without role union", async () => {
+  const repo = path.join(TMP, "layered");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  g: { id: openai/gpt-5.5, family: gpt }
+  shared: { id: anthropic/claude-opus-4-8, family: global, tags: [strong] }
+roles:
+  instructed: { use: [g], differentModelFrom: empty }
+  empty: { use: [shared] }
+  globalOnly: { use: [g] }
+`);
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models:
+  shared: { id: minimax/MiniMax-M3 }
+roles:
+  instructed: { instructions: project-only }
+  empty: {}
+  direct: { use: [g] }
+`);
+  try {
+    const loaded = opLoad({ cwd: repo });
+    assert.ok(!loaded.errors, JSON.stringify(loaded.errors));
+    assert.deepEqual(loaded.roles.instructed, {
+      use: ["g"],
+      differentModelFrom: "empty",
+      instructions: "project-only",
+    });
+    assert.deepEqual(loaded.roles.empty.use, ["shared"]);
+    assert.deepEqual(loaded.roles.direct.use, ["g"]);
+    assert.equal(loaded.roles.globalOnly, undefined);
+    assert.deepEqual(loaded.models.shared, { id: "minimax/MiniMax-M3" });
+    assert.deepEqual(loaded.configPaths, { global: GLOBAL_CONFIG, project: path.join(repo, ".moa.yml") });
+    const resolved = await opResolve({ hostModels: HOST });
+    assert.ok(!resolved.error, JSON.stringify(resolved));
+    const run = opRunStart({ task: "layered", steps: [{ phase: "work", role: "direct" }] });
+    assert.ok(run.frame.config.includes(GLOBAL_CONFIG));
+    assert.ok(run.frame.config.includes(path.join(repo, ".moa.yml")));
+  } finally {
+    clearGlobal();
+  }
+});
+
+t("load: a merged role with no use fails full validation", () => {
+  const repo = path.join(TMP, "missing-use");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  g: { id: openai/gpt-5.5 }
+roles:
+  staffed: { use: [g] }
+`);
+  fs.writeFileSync(path.join(repo, ".moa.yml"), "schemaVersion: 1\nroles:\n  orphan: {}\n");
+  try {
+    const errors = opLoad({ cwd: repo }).errors;
+    assert.ok(errors);
+    assert.match(errors.join("\n"), /roles\.orphan\.use/);
+    assert.ok(errors.every((error) => error.includes(path.join(repo, ".moa.yml"))));
+  } finally {
+    clearGlobal();
+  }
+});
+
+t("load: global and project schema versions must match", () => {
+  const repo = path.join(TMP, "version-mismatch");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal("schemaVersion: 1\nroles:\n  staffed: { use: [auto] }\n");
+  fs.writeFileSync(path.join(repo, ".moa.yml"), "schemaVersion: 2\nroles:\n  staffed: { use: [auto] }\n");
+  try {
+    const errors = opLoad({ cwd: repo }).errors;
+    assert.match(errors.join("\n"), /schemaVersion mismatch/);
+    assert.match(errors.join("\n"), new RegExp(GLOBAL_CONFIG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    clearGlobal();
+  }
+});
+
+t("load: invalid global YAML masks a valid project", () => {
+  const repo = path.join(TMP, "global-yaml-mask");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), "schemaVersion: 1\nroles:\n  local: { use: [auto] }\n");
+  writeGlobal("schemaVersion: [\n");
+  try {
+    const result = opLoad({ cwd: repo });
+    assert.equal(result.configPath, GLOBAL_CONFIG);
+    assert.match(result.errors.join("\n"), new RegExp(GLOBAL_CONFIG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match(result.hint, /\/moa init --force/);
+  } finally {
+    clearGlobal();
+  }
+});
+
+t("load: standalone global cycle cannot be masked by project overrides", () => {
+  const repo = path.join(TMP, "global-cycle-mask");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  g: { id: openai/gpt-5.5 }
+roles:
+  a: { use: [g], differentModelFrom: b }
+  b: { use: [g], differentModelFrom: a }
+`);
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+roles:
+  a: { use: [g], differentModelFrom: c }
+  b: { use: [g] }
+  c: { use: [g] }
+`);
+  try {
+    const result = opLoad({ cwd: repo });
+    assert.equal(result.configPath, GLOBAL_CONFIG);
+    assert.match(result.errors.join("\n"), /differentModelFrom cycle/);
+    assert.match(result.errors.join("\n"), new RegExp(GLOBAL_CONFIG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("load: errors clear prior loaded and resolved state", async () => {
+  opLoad({ cwd: REPO });
+  assert.ok(!(await opResolve({ hostModels: HOST })).error);
+  writeGlobal("schemaVersion: [\n");
+  try {
+    assert.ok(opLoad({ cwd: REPO }).errors);
+    assert.equal((await opResolve({ hostModels: HOST })).error, "call moa_load first");
+    assert.equal(opRunStart({ task: "stale", steps: [{ phase: "x", role: "master" }] }).error, "call moa_load first");
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("load: project-only provenance reaches effective config", async () => {
+  clearGlobal();
+  const projectPath = path.join(REPO, ".moa.yml");
+  const loaded = opLoad({ cwd: REPO });
+  assert.equal(loaded.configPath, projectPath);
+  assert.deepEqual(loaded.configPaths, { global: null, project: projectPath });
+  assert.equal("projectDir" in loaded, false);
+  const result = await opResolve({ hostModels: HOST });
+  const effective = JSON.parse(fs.readFileSync(result.effectiveConfig, "utf8"));
+  assert.equal(effective.configPath, projectPath);
+  assert.deepEqual(effective.configPaths, { global: null, project: projectPath });
+});
+
+t("load: project differentModelFrom cycles are rejected", () => {
+  clearGlobal();
+  const repo = path.join(TMP, "project-cycle");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+roles:
+  a: { use: [auto], differentModelFrom: b }
+  b: { use: [auto], differentModelFrom: a }
+`);
+  assert.match(opLoad({ cwd: repo }).errors.join("\n"), /differentModelFrom cycle/);
 });
 
 // --- registered tool discovery ----------------------------------------------
@@ -621,6 +834,47 @@ pipelines: {}
   assert.equal(r.roles.a.model, "nowhere/ghost-1");
   assert.equal(r.diagnostics[0].state, "blocked_no_model");
   assert.equal(r.diagnostics[0].role, "b");
+});
+
+await ta("resolve: dependency chains use topological role order", async () => {
+  const repo = path.join(TMP, "dependency-chain");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models:
+  one: { id: anthropic/claude-opus-4-8, cost: cheap }
+  two: { id: openai/gpt-5.5, cost: standard }
+  three: { id: minimax/MiniMax-M3, cost: premium }
+roles:
+  A: { use: [auto], differentModelFrom: B }
+  B: { use: [auto], differentModelFrom: C }
+  C: { use: [auto] }
+`);
+  assert.ok(!opLoad({ cwd: repo }).errors);
+  const result = await opResolve({ hostModels: HOST });
+  assert.deepEqual(Object.keys(result.roles), ["C", "B", "A"]);
+  assert.notEqual(result.roles.C.model, result.roles.B.model);
+  assert.notEqual(result.roles.B.model, result.roles.A.model);
+});
+
+await ta("resolve: failed independence target blocks its dependent", async () => {
+  const repo = path.join(TMP, "failed-dependency");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models:
+  ghost: { id: nowhere/ghost-1 }
+roles:
+  producer: { use: [ghost] }
+  verifier: { use: [auto], differentModelFrom: producer }
+`);
+  assert.ok(!opLoad({ cwd: repo }).errors);
+  const result = await opResolve({ hostModels: HOST });
+  assert.equal(result.roles.producer, undefined);
+  assert.equal(result.roles.verifier, undefined);
+  const blocked = result.diagnostics.find((diagnostic) => diagnostic.role === "verifier");
+  assert.equal(blocked.state, "blocked_dependency");
+  assert.equal(blocked.dependsOn, "producer");
 });
 
 await ta("resolve: invalid host model id is rejected before discover runs", async () => {
@@ -1087,6 +1341,32 @@ await ta("ad-hoc steps validated against resolved roles", async () => {
     { phase: "check", role: "verifier", gate: "critical", loopBackTo: "produce" },
   ]});
   assert.equal(ok.next.phase, "produce");
+});
+
+await ta("run_start: ad-hoc critical roles enforce hard verification tags", async () => {
+  const repo = path.join(TMP, "critical-floor");
+  fs.mkdirSync(repo, { recursive: true });
+  const configPath = path.join(repo, ".moa.yml");
+  const writeConfig = (tags) => fs.writeFileSync(configPath, `
+schemaVersion: 1
+models:
+  checker: { id: vendor/checker-1${tags ? `, tags: [${tags}]` : ""} }
+roles:
+  verifier: { use: [checker] }
+`);
+  const steps = [{ phase: "verify", role: "verifier", gate: "critical" }];
+
+  writeConfig("");
+  opLoad({ cwd: repo });
+  await opResolve({ hostModels: [{ id: "vendor/checker-1" }] });
+  const rejected = opRunStart({ task: "weak", steps });
+  assert.match(rejected.error, /verifier/);
+  assert.match(rejected.error, /override/);
+
+  writeConfig("strong");
+  opLoad({ cwd: repo });
+  await opResolve({ hostModels: [{ id: "vendor/checker-1" }] });
+  assert.ok(opRunStart({ task: "strong", steps }).runId);
 });
 
 // --- external spawn ----------------------------------------------------------
@@ -2007,6 +2287,210 @@ await ta("init: preserves a model binding through load", async () => {
 await ta("init: unknown template rejected", async () => {
   const r = await opInit({ template: "nope", cwd: TMP });
   assert.ok(r.error.includes("unknown template"));
+});
+
+await ta("init: invalid project splice writes nothing and does not guard retry", async () => {
+  clearGlobal();
+  const repo = path.join(TMP, "invalid-project-splice");
+  const target = path.join(repo, ".moa.yml");
+  fs.mkdirSync(repo, { recursive: true });
+  try {
+    const args = {
+      scope: "project",
+      template: "lite-build",
+      cwd: repo,
+      roles: { missing: ["auto"] },
+    };
+    const first = await opInit(args);
+    assert.match(first.error, /template 'lite-build' has no role 'missing'/);
+    assert.equal(fs.existsSync(target), false);
+    const retry = await opInit(args);
+    assert.equal(retry.error, first.error);
+    assert.doesNotMatch(retry.error, /already exists/);
+    assert.equal(fs.existsSync(target), false);
+
+    const invalidRepo = path.join(TMP, "invalid-project-model");
+    fs.mkdirSync(invalidRepo, { recursive: true });
+    const invalid = await opInit({
+      scope: "project",
+      template: "lite-build",
+      cwd: invalidRepo,
+      registry: { broken: { id: "not-canonical" } },
+      roles: { planner: ["broken", "auto"] },
+    });
+    assert.match(invalid.error, /models\.broken\.id/);
+    assert.equal(fs.existsSync(path.join(invalidRepo, ".moa.yml")), false);
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("init: empty picks write the untouched host-native template", async () => {
+  clearGlobal();
+  const repo = path.join(TMP, "host-native-init");
+  fs.mkdirSync(repo, { recursive: true });
+  try {
+    const result = await opInit({
+      scope: "project",
+      template: "lite-build",
+      cwd: repo,
+      registry: {},
+      roles: {},
+    });
+    assert.equal(result.spliced, false);
+    const source = fs.readFileSync(path.join(repo, ".moa.yml"), "utf8");
+    const templateSource = fs.readFileSync(
+      path.join(import.meta.dirname, "..", "templates", "lite-build.yml"), "utf8");
+    assert.equal(source, templateSource);
+    const config = YAML.parse(source);
+    assert.deepEqual(config.models, {});
+    assert.deepEqual(config.roles.planner.use, ["auto"]);
+    assert.deepEqual(config.roles.coder.use, ["auto"]);
+    assert.deepEqual(config.roles.verifier.use, ["auto"]);
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("init: global scope writes staffing, guards, and rejects templates", async () => {
+  clearGlobal();
+  try {
+    const result = await opInit({
+      scope: "global",
+      registry: { g: { id: "openai/gpt-5.5", tags: ["strong"] } },
+      roles: { planner: ["g", "auto"], verifier: ["g", "auto"] },
+    });
+    assert.equal(result.written, GLOBAL_CONFIG);
+    const config = YAML.parse(fs.readFileSync(GLOBAL_CONFIG, "utf8"));
+    assert.deepEqual(Object.keys(config), ["schemaVersion", "models", "roles"]);
+    assert.deepEqual(config.roles.planner.use, ["g", "auto"]);
+    assert.equal(config.roles.verifier.differentModelFrom, undefined);
+    const guarded = await opInit({ scope: "global", roles: { planner: ["auto"] } });
+    assert.match(guarded.error, new RegExp(GLOBAL_CONFIG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
+    assert.match((await opInit({ scope: "global", template: "lite-build", force: true })).error, /does not accept a template/);
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("init: invalid global staffing never writes", async () => {
+  clearGlobal();
+  try {
+    const result = await opInit({
+      scope: "global",
+      registry: {},
+      roles: { planner: ["missing"] },
+    });
+    assert.match(result.error, /missing/);
+    assert.equal(fs.existsSync(GLOBAL_CONFIG), false);
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("init: global-backed project emits a minimal loadable overlay", async () => {
+  const repo = path.join(TMP, "overlay-init");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  reasoner: { id: anthropic/claude-opus-4-8, tags: [strong] }
+  implementer: { id: minimax/MiniMax-M3, tags: [strong] }
+roles:
+  planner: { use: [reasoner, auto] }
+  coder: { use: [implementer, auto] }
+`);
+  try {
+    const result = await opInit({
+      scope: "project",
+      template: "lite-build",
+      cwd: repo,
+      registry: {
+        reasoner: { id: "anthropic/claude-opus-4-8", tags: ["strong"] },
+        implementer: { id: "minimax/MiniMax-M3", tags: ["strong"] },
+        checker: { id: "openai/gpt-5.5", tags: ["strong"] },
+      },
+      roles: {
+        planner: ["reasoner", "auto"],
+        coder: ["implementer", "auto"],
+        verifier: ["checker", "auto"],
+      },
+    });
+    assert.equal(result.overlay, true);
+    const overlay = YAML.parse(fs.readFileSync(path.join(repo, ".moa.yml"), "utf8"));
+    assert.equal(Object.hasOwn(overlay.roles.planner, "use"), false);
+    assert.equal(Object.hasOwn(overlay.roles.coder, "use"), false);
+    assert.deepEqual(overlay.roles.verifier.use, ["checker", "auto"]);
+    assert.deepEqual(Object.keys(overlay.models), ["checker"]);
+    const loaded = opLoad({ cwd: repo });
+    assert.ok(!loaded.errors, JSON.stringify(loaded.errors));
+    assert.deepEqual(loaded.roles.planner.use, ["reasoner", "auto"]);
+    assert.deepEqual(loaded.roles.coder.use, ["implementer", "auto"]);
+    assert.deepEqual(loaded.roles.verifier.use, ["checker", "auto"]);
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("init: explicit project staffing overrides global defaults", async () => {
+  const repo = path.join(TMP, "overlay-override-init");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  reasoner: { id: anthropic/claude-opus-4-8, tags: [strong] }
+  implementer: { id: minimax/MiniMax-M3, tags: [strong] }
+roles:
+  planner: { use: [reasoner, auto] }
+  coder: { use: [implementer, auto] }
+`);
+  try {
+    const result = await opInit({
+      scope: "project",
+      template: "lite-build",
+      cwd: repo,
+      registry: {
+        reasoner: { id: "anthropic/claude-opus-4-8", tags: ["strong"] },
+        implementer: { id: "minimax/MiniMax-M3", tags: ["strong"] },
+        override: { id: "openai/gpt-5.5", tags: ["strong"] },
+      },
+      roles: {
+        planner: ["override", "auto"],
+        coder: ["implementer", "auto"],
+      },
+    });
+    assert.equal(result.overlay, true);
+    const overlay = YAML.parse(fs.readFileSync(path.join(repo, ".moa.yml"), "utf8"));
+    assert.deepEqual(overlay.roles.planner.use, ["override", "auto"]);
+    assert.equal(Object.hasOwn(overlay.roles.coder, "use"), false);
+    assert.deepEqual(Object.keys(overlay.models), ["override"]);
+    assert.equal(overlay.models.override.id, "openai/gpt-5.5");
+    const loaded = opLoad({ cwd: repo });
+    assert.ok(!loaded.errors, JSON.stringify(loaded.errors));
+    assert.deepEqual(loaded.roles.planner.use, ["override", "auto"]);
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("init: invalid global-overlay merge never writes", async () => {
+  const repo = path.join(TMP, "invalid-overlay-init");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  g: { id: openai/gpt-5.5, tags: [strong] }
+roles:
+  coder: { use: [g], differentModelFrom: verifier }
+  verifier: { use: [g] }
+`);
+  try {
+    const result = await opInit({ scope: "project", template: "lite-build", cwd: repo });
+    assert.match(result.error, /differentModelFrom cycle/);
+    assert.equal(fs.existsSync(path.join(repo, ".moa.yml")), false);
+  } finally {
+    clearGlobal();
+  }
 });
 
 // Every check above calls the ops in-process, so none of them sees the tool boundary:
