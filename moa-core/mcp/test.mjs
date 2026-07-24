@@ -273,7 +273,6 @@ t("load: global boundary rejects project policy keys with its path", () => {
     ["master", "master: { mode: auto }\n"],
     ["runtime", "runtime: { subagents: auto }\n"],
     ["instructions", "roles:\n  planner: { use: [g], instructions: no }\n"],
-    ["effort", "roles:\n  planner: { use: [g], effort: [xhigh] }\n"],
   ];
   try {
     for (const [key, extra] of cases) {
@@ -300,8 +299,8 @@ models:
   g: { id: openai/gpt-5.5, family: gpt }
   shared: { id: anthropic/claude-opus-4-8, family: global, tags: [strong] }
 roles:
-  instructed: { use: [g], differentModelFrom: empty }
-  empty: { use: [shared] }
+  instructed: { use: [g], differentModelFrom: empty, effort: [low] }
+  empty: { use: [shared], effort: [medium] }
   globalOnly: { use: [g] }
 `);
   fs.writeFileSync(path.join(repo, ".moa.yml"), `
@@ -309,7 +308,7 @@ schemaVersion: 1
 models:
   shared: { id: minimax/MiniMax-M3 }
 roles:
-  instructed: { instructions: project-only }
+  instructed: { instructions: project-only, effort: [xhigh] }
   empty: {}
   direct: { use: [g] }
 `);
@@ -328,6 +327,8 @@ roles:
     assert.deepEqual(loaded.configPaths, { global: GLOBAL_CONFIG, project: path.join(repo, ".moa.yml") });
     const resolved = await opResolve({ hostModels: HOST });
     assert.ok(!resolved.error, JSON.stringify(resolved));
+    assert.deepEqual(resolved.roles.instructed.effort, ["xhigh"], "project role effort overrides global");
+    assert.deepEqual(resolved.roles.empty.effort, ["medium"], "global role effort survives the merge");
     const run = opRunStart({ task: "layered", steps: [{ phase: "work", role: "direct" }] });
     assert.ok(run.frame.config.includes(GLOBAL_CONFIG));
     assert.ok(run.frame.config.includes(path.join(repo, ".moa.yml")));

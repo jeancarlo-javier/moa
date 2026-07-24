@@ -111,7 +111,7 @@ const zConfig = z.object({
 
 // Layer validators stay derived from the effective-config contract: the global
 // file narrows it to staffing, while a project overlay only relaxes role.use.
-const zGlobalRole = zRole.pick({ use: true, differentModelFrom: true }).strict();
+const zGlobalRole = zRole.pick({ use: true, differentModelFrom: true, effort: true }).strict();
 const zGlobalConfig = zConfig.pick({
   schemaVersion: true,
   models: true,
@@ -210,7 +210,7 @@ function readConfigLayer(file, schema) {
   // only the staffing-only global layer reads through here: redirect stray per-role keys to their legal home
   validated.error.issues.forEach((issue, i) => {
     if (issue.code === "unrecognized_keys" && issue.path[0] === "roles")
-      errors[i] += " — global roles take only 'use' and 'differentModelFrom'; per-role keys like 'effort' belong in the project .moa.yml (model-level effort goes under models.<name>.effort here)";
+      errors[i] += " — global roles take only 'use', 'differentModelFrom', and 'effort'; other per-role keys like 'instructions' belong in the project .moa.yml";
   });
   return { errors };
 }
@@ -1666,6 +1666,8 @@ function normalizeInitRoles(roles) {
     normalized[name] = { use: role.use };
     if (role.differentModelFrom !== undefined)
       normalized[name].differentModelFrom = role.differentModelFrom;
+    if (role.effort !== undefined)
+      normalized[name].effort = role.effort;
   }
   return { value: normalized };
 }
@@ -1989,8 +1991,9 @@ async function startMcp() {
         z.object({
           use: z.array(z.string()),
           differentModelFrom: z.string().optional(),
+          effort: z.array(z.string()).optional(),
         }).strict(),
-      ])).optional().describe("role name → use list, optionally with an explicit independence target"),
+      ])).optional().describe("role name → use list, optionally with an explicit independence target and effort ladder"),
       force: z.boolean().optional(),
       cwd: z.string().optional().describe("repo root for project scope; defaults to server cwd"),
     },
