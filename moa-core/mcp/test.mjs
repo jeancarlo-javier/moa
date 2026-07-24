@@ -273,15 +273,18 @@ t("load: global boundary rejects project policy keys with its path", () => {
     ["master", "master: { mode: auto }\n"],
     ["runtime", "runtime: { subagents: auto }\n"],
     ["instructions", "roles:\n  planner: { use: [g], instructions: no }\n"],
+    ["effort", "roles:\n  planner: { use: [g], effort: [xhigh] }\n"],
   ];
   try {
     for (const [key, extra] of cases) {
-      const roles = key === "instructions" ? "" : "roles:\n  planner: { use: [g] }\n";
+      const roles = extra.startsWith("roles:") ? "" : "roles:\n  planner: { use: [g] }\n";
       writeGlobal(`schemaVersion: 1\nmodels:\n  g: { id: openai/gpt-5.5 }\n${roles}${extra}`);
       const errors = opLoad({ cwd: path.join(TMP, "no-project") }).errors;
       assert.ok(errors, `${key} loaded in the global layer`);
       assert.match(errors.join("\n"), new RegExp(key));
       assert.ok(errors.every((error) => error.includes(GLOBAL_CONFIG)), JSON.stringify(errors));
+      if (extra.startsWith("roles:"))
+        assert.match(errors.join("\n"), /project \.moa\.yml/, `${key} error lacks the redirect hint`);
     }
   } finally {
     clearGlobal();

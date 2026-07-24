@@ -205,9 +205,14 @@ function readConfigLayer(file, schema) {
   const parsed = parseYamlStrict(fs.readFileSync(file, "utf8"), file);
   if (parsed.errors) return { errors: parsed.errors };
   const validated = schema.safeParse(parsed.value);
-  return validated.success
-    ? { value: validated.data }
-    : { errors: schemaErrors(validated, file) };
+  if (validated.success) return { value: validated.data };
+  const errors = schemaErrors(validated, file);
+  // only the staffing-only global layer reads through here: redirect stray per-role keys to their legal home
+  validated.error.issues.forEach((issue, i) => {
+    if (issue.code === "unrecognized_keys" && issue.path[0] === "roles")
+      errors[i] += " — global roles take only 'use' and 'differentModelFrom'; per-role keys like 'effort' belong in the project .moa.yml (model-level effort goes under models.<name>.effort here)";
+  });
+  return { errors };
 }
 
 function roleGraph(roles = {}) {
