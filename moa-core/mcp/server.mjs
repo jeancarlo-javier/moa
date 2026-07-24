@@ -1732,6 +1732,11 @@ export function opInit({
     doc.setIn(["roles", rname, "use"], arr);
     if (role.differentModelFrom !== undefined)
       doc.setIn(["roles", rname, "differentModelFrom"], role.differentModelFrom);
+    if (role.effort !== undefined) {
+      const eff = doc.createNode(role.effort);
+      eff.flow = true;
+      doc.setIn(["roles", rname, "effort"], eff);
+    }
   }
 
   const globalPath = GLOBAL_CONFIG();

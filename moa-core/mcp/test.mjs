@@ -251,7 +251,7 @@ schemaVersion: 1
 models:
   g: { id: openai/gpt-5.5, tags: [strong] }
 roles:
-  planner: { use: [g] }
+  planner: { use: [g], effort: [xhigh] }
 `);
   try {
     const loaded = opLoad({ cwd });
@@ -261,6 +261,7 @@ roles:
     assert.deepEqual(Object.keys(loaded.roles), ["planner"]);
     const resolved = await opResolve({ hostModels: HOST });
     assert.equal(resolved.effectiveConfig, path.join(cwd, ".moa", "effective-config.json"));
+    assert.deepEqual(resolved.roles.planner.effort, ["xhigh"], "global-only role effort reaches resolve");
   } finally {
     clearGlobal();
   }
@@ -2255,12 +2256,13 @@ await ta("init: guards existing config; force overwrites; splice validates", asy
   const irepo = path.join(TMP, "irepo"); fs.mkdirSync(irepo, { recursive: true });
   const r1 = await opInit({ template: "lite-build", cwd: irepo,
     registry: { opus: { id: "anthropic/claude-opus-4-8", family: "claude", tags: ["strong"] } },
-    roles: { planner: ["opus", "auto"] } });
+    roles: { planner: { use: ["opus", "auto"], effort: ["xhigh"] } } });
   assert.ok(r1.written.endsWith(".moa.yml"));
   assert.equal(r1.spliced, true);
   const written = fs.readFileSync(r1.written, "utf8");
   assert.ok(written.includes("anthropic/claude-opus-4-8"));
   assert.ok(written.includes("#"), "template comments survive");
+  assert.deepEqual(YAML.parse(written).roles.planner.effort, ["xhigh"], "project splice persists role effort");
 
   const r2 = await opInit({ template: "lite-build", cwd: irepo });
   assert.ok(r2.error.includes("already exists"));
@@ -2324,6 +2326,18 @@ await ta("init: invalid project splice writes nothing and does not guard retry",
     });
     assert.match(invalid.error, /models\.broken\.id/);
     assert.equal(fs.existsSync(path.join(invalidRepo, ".moa.yml")), false);
+
+    const effortRepo = path.join(TMP, "invalid-project-effort");
+    fs.mkdirSync(effortRepo, { recursive: true });
+    const emptyEffort = await opInit({
+      scope: "project",
+      template: "lite-build",
+      cwd: effortRepo,
+      registry: { opus: { id: "anthropic/claude-opus-4-8" } },
+      roles: { planner: { use: ["opus", "auto"], effort: [] } },
+    });
+    assert.match(emptyEffort.error, /effort/);
+    assert.equal(fs.existsSync(path.join(effortRepo, ".moa.yml")), false);
   } finally {
     clearGlobal();
   }
@@ -2362,12 +2376,13 @@ await ta("init: global scope writes staffing, guards, and rejects templates", as
     const result = await opInit({
       scope: "global",
       registry: { g: { id: "openai/gpt-5.5", tags: ["strong"] } },
-      roles: { planner: ["g", "auto"], verifier: ["g", "auto"] },
+      roles: { planner: { use: ["g", "auto"], effort: ["xhigh"] }, verifier: ["g", "auto"] },
     });
     assert.equal(result.written, GLOBAL_CONFIG);
     const config = YAML.parse(fs.readFileSync(GLOBAL_CONFIG, "utf8"));
     assert.deepEqual(Object.keys(config), ["schemaVersion", "models", "roles"]);
     assert.deepEqual(config.roles.planner.use, ["g", "auto"]);
+    assert.deepEqual(config.roles.planner.effort, ["xhigh"], "global init persists role effort");
     assert.equal(config.roles.verifier.differentModelFrom, undefined);
     const guarded = await opInit({ scope: "global", roles: { planner: ["auto"] } });
     assert.match(guarded.error, new RegExp(GLOBAL_CONFIG.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")));
@@ -2386,6 +2401,13 @@ await ta("init: invalid global staffing never writes", async () => {
       roles: { planner: ["missing"] },
     });
     assert.match(result.error, /missing/);
+    assert.equal(fs.existsSync(GLOBAL_CONFIG), false);
+    const emptyEffort = await opInit({
+      scope: "global",
+      registry: { g: { id: "openai/gpt-5.5" } },
+      roles: { planner: { use: ["g"], effort: [] } },
+    });
+    assert.match(emptyEffort.error, /effort/);
     assert.equal(fs.existsSync(GLOBAL_CONFIG), false);
   } finally {
     clearGlobal();
