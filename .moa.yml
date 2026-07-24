@@ -11,37 +11,11 @@ template:
   base: custom
   projectType: moa-skill
 
-# Four models, all referenced by roles. Fable plans; Sonnet edits; Sol independently reviews
-# and verifies. MiniMax is the explicit cross-family gate fallback if Sol is unavailable.
-# Registry = the union of per-role picks, never the host's full set (AGENTS.md).
-models:
-  fable:
-    id: anthropic/claude-fable-5
-    family: claude
-    effort: [high]
-    tags: [strong]
-  sonnet:
-    id: anthropic/claude-sonnet-4-6
-    family: claude
-    effort: [high]
-    tags: [strong]
-  gpt-5.6-sol:
-    id: openai-codex/gpt-5.6-sol
-    family: gpt
-    effort: [medium]
-    context: 1000000
-    tags: [strong]
-  minimax-m3:
-    id: minimax-1m/MiniMax-M3
-    family: minimax
-    tags: [strong, cheap]
-
 master:
   mode: auto                   # right-size small edits; the critical validate gate stays absolute
 
 roles:
   planner:
-    use: [fable, auto]
     instructions: |
       Classify the change as skill, MCP, cross-cutting, narrow, or compaction work. Name exact
       files, observable contracts, regression risks, and executable evidence. Skill plans define
@@ -50,7 +24,6 @@ roles:
       State the hot-path token effect whenever SKILL.md moves.
 
   plan-reviewer:
-    use: [gpt-5.6-sol, minimax-m3, auto]
     differentModelFrom: planner
     instructions: |
       Reject nominal checks without a runnable grading path, non-discriminating skill assertions,
@@ -59,14 +32,14 @@ roles:
       reject capability deletion disguised as token reduction. APPROVE only when executable as-is.
 
   editor:
-    use: [sonnet, auto]
+    use: [auto]
     instructions: |
       Implement only approved files. Preserve runtime, task, and model agnosticism; keep skill prose
       aligned with MCP enforcement. Tighten hot-path prose before appending and surface any required
       out-of-scope write instead of silently expanding scope.
 
   diff-reviewer:
-    use: [gpt-5.6-sol, minimax-m3, auto]
+    use: [auto]
     differentModelFrom: editor
     instructions: |
       Compare the diff with the approved plan and contracts. Check scope, maintainability, duplicate
@@ -74,7 +47,7 @@ roles:
       and MCP enforcement. Static review never substitutes for execution evidence.
 
   skill-validator:
-    use: [gpt-5.6-sol, minimax-m3, auto]
+    use: [auto]
     differentModelFrom: editor
     instructions: |
       In isolation, run the changed and pre-change skills against identical evals; grade objective
@@ -83,7 +56,7 @@ roles:
       and verify references plus hot-path impact. BLOCKED, not APPROVE, when no real eval path exists.
 
   mcp-validator:
-    use: [gpt-5.6-sol, minimax-m3, auto]
+    use: [auto]
     differentModelFrom: editor
     instructions: |
       In isolation, run the complete MCP contract suite and exercise direct operations plus real
@@ -92,7 +65,7 @@ roles:
       output discipline. Require a regression test for each new observable contract.
 
   release-validator:
-    use: [gpt-5.6-sol, minimax-m3, auto]
+    use: [auto]
     differentModelFrom: editor
     instructions: |
       For cross-cutting work, require both skill and MCP evidence contracts, schema validation for
@@ -101,14 +74,14 @@ roles:
       narrow scope never excuses skipping a changed observable contract.
 
   compactor:
-    use: [sonnet, auto]
+    use: [auto]
     instructions: |
       Reduce the SKILL.md hot path through progressive disclosure, never capability deletion.
       Relocate detail to references or deterministic bundled resources; preserve each constraint's
       reason, behavioral coverage, and trigger quality.
 
   capability-verifier:
-    use: [gpt-5.6-sol, minimax-m3, auto]
+    use: [auto]
     differentModelFrom: compactor
     instructions: |
       In isolation, compare the compacted skill with the pre-change baseline. APPROVE only when
