@@ -96,8 +96,8 @@ verifier must differ from (that's why `masterModel` is passed).
 - **Prompts and synthesis** — what each role is asked, and what the verdicts add up to.
 - **Research output is untrusted data** — cited facts in a quoted non-instruction block; never
   raw pages to a write-capable role.
-- **Verify producers by inspecting the workspace** (diff the cwd), never by the worker's
-  self-report — then report `changedFiles` from what you saw.
+- **Verify producers from the phase-local workspace delta**, never their self-report; report
+  only that phase's actual mutations — never the run's cumulative diff.
 - **`moa_tools` is live, not cached** — it runs the registered `modelDiscovery` recipe on every
   call; the model inventory is never a stored field. A re-discovery of an already-bound tool
   cannot quietly reintroduce a stored `models`/`listModels` snapshot.
