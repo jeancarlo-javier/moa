@@ -991,6 +991,155 @@ await ta("resolve: adaptive-bare includes current external models", async () => 
   );
 });
 
+await ta("resolve: clean config-present pool omits unselected discovery-only rows", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "trimcli", inventory: ["vendor/pick-1", "vendor/drop-1"] }) });
+  const repo = path.join(TMP, "trim-clean");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models:
+  pick: { id: vendor/pick-1, family: fake }
+roles:
+  worker: { use: [pick] }
+pipelines: {}
+`);
+  opLoad({ cwd: repo });
+  const result = await opResolve({ hostModels: [{ id: "vendor/hosted-1", family: "fake" }] });
+  assert.equal(result.roles.worker.model, "vendor/pick-1");
+  assert.ok(!result.diagnostics.some((item) => item.state.startsWith("blocked_")));
+  assert.equal(result.pool.length, 2);
+  const ids = result.pool.map((model) => model.id);
+  assert.ok(ids.includes("vendor/pick-1"));
+  assert.ok(ids.includes("vendor/hosted-1"));
+  assert.ok(!ids.includes("vendor/drop-1"));
+});
+
+await ta("resolve: auto-selected discovery-only model appears in roles AND pool", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "keepcli", inventory: ["vendor/keep-1", "vendor/lose-1"] }) });
+  const repo = path.join(TMP, "trim-auto");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models: {}
+roles:
+  worker: { use: [auto] }
+pipelines: {}
+`);
+  opLoad({ cwd: repo });
+  const result = await opResolve({ hostModels: [] });
+  assert.equal(result.roles.worker.model, "vendor/keep-1");
+  assert.deepEqual(result.pool.map((model) => model.id), ["vendor/keep-1"]);
+});
+
+await ta("resolve: every blocked state returns the full candidate pool", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "rescuecli", inventory: ["vendor/work-1", "vendor/rescue-1"] }) });
+  const cases = [
+    ["blocked_no_binding", `
+schemaVersion: 1
+models:
+  ghost: { id: nowhere/ghost-1, family: ghost }
+roles:
+  worker: { use: [ghost] }
+pipelines: {}
+`],
+    ["blocked_no_model", `
+schemaVersion: 1
+models:
+  work: { id: vendor/work-1, family: fake }
+roles:
+  a: { use: [work] }
+  b: { use: [work], differentModelFrom: a }
+pipelines: {}
+`],
+    ["blocked_dependency", `
+schemaVersion: 1
+models:
+  work: { id: vendor/work-1, family: fake }
+roles:
+  a: { use: [work] }
+  b: { use: [work], differentModelFrom: a }
+  c: { use: [auto], differentModelFrom: b }
+pipelines: {}
+`],
+  ];
+  for (const [expected, config] of cases) {
+    const repo = path.join(TMP, `blocked-pool-${expected}`);
+    fs.mkdirSync(repo, { recursive: true });
+    fs.writeFileSync(path.join(repo, ".moa.yml"), config);
+    opLoad({ cwd: repo });
+    const result = await opResolve({ hostModels: [] });
+    assert.ok(result.diagnostics.some((item) => item.state === expected), expected);
+    const rescue = result.pool.find((model) => model.id === "vendor/rescue-1");
+    assert.ok(rescue, `${expected}: rescue row missing from pool`);
+    assert.deepEqual(rescue.sources, ["binding:rescuecli"]);
+    assert.ok(!Object.values(result.roles).some((role) => role.model === "vendor/rescue-1"));
+  }
+});
+
+await ta("resolve: config-absent return keeps the full pool", async () => {
+  resetBindings();
+  clearGlobal();
+  await opBindingSave({ profile: provenProfile({ tool: "barecli", inventory: ["vendor/bare-1"] }) });
+  const bare = path.join(TMP, "trim-bare");
+  fs.mkdirSync(bare, { recursive: true });
+  opLoad({ cwd: bare });
+  const result = await opResolve({ hostModels: [] });
+  assert.deepEqual(result.roles, {});
+  assert.ok(result.note);
+  assert.ok(result.pool.some((model) => model.id === "vendor/bare-1"));
+});
+
+await ta("resolve: non-blocked diagnostics do not widen the pool", async () => {
+  resetBindings();
+  await opBindingSave({ profile: provenProfile({ tool: "diagcli", inventory: ["vendor/live-1", "vendor/spare-1"] }) });
+  const repo = path.join(TMP, "trim-diag");
+  fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+models:
+  typo: { id: vendor/liv-1, family: fake }
+roles:
+  worker: { use: [typo, auto] }
+pipelines: {}
+`);
+  opLoad({ cwd: repo });
+  const result = await opResolve({ hostModels: [] });
+  assert.equal(result.roles.worker.model, "vendor/live-1");
+  assert.ok(result.diagnostics.some((item) => item.state === "unreachable_registry_model"));
+  assert.ok(result.diagnostics.some((item) => item.state === "degraded_resolution"));
+  assert.ok(!result.diagnostics.some((item) => item.state.startsWith("blocked_")));
+  const ids = result.pool.map((model) => model.id);
+  assert.ok(!ids.includes("vendor/spare-1"));
+  assert.ok(ids.includes("vendor/liv-1"));
+  assert.ok(ids.includes("vendor/live-1"));
+});
+
+await ta("resolve: a binding whose live discovery starts failing yields a diagnostic, not a throw", async () => {
+  resetBindings();
+  const flag = path.join(TMP, "exitcli-flag");
+  fs.rmSync(flag, { force: true });
+  const script = `if (require("fs").existsSync(${JSON.stringify(flag)})) process.exit(7); console.log("vendor/fake-9");`;
+  const save = await opBindingSave({ profile: provenProfile({
+    tool: "exitcli",
+    modelDiscovery: { argv: ["{bin}", "-e", script], output: { format: "lines" }, timeoutSeconds: 10 },
+  }) });
+  assert.ok(!save.error, JSON.stringify(save));
+  fs.writeFileSync(flag, ""); // live discovery now exits 7 CLEANLY — no spawn error, no stderr
+  const repo = path.join(TMP, "discovery-exit"); fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"),
+    "schemaVersion: 1\nmodels:\n  fake: { id: vendor/fake-9, family: fake, tags: [strong] }\nroles:\n  worker: { use: [fake] }\npipelines: {}\n");
+  opLoad({ cwd: repo });
+  const result = await opResolve({ hostModels: [{ id: "vendor/fake-9", family: "fake", tags: ["strong"] }] });
+  const diag = result.diagnostics.find((item) => item.tool === "exitcli");
+  assert.equal(diag?.state, "model_discovery_failed", JSON.stringify(result.diagnostics));
+  assert.ok(typeof diag.error === "string" && diag.error.length > 0, JSON.stringify(diag));
+  assert.equal(result.roles.worker.model, "vendor/fake-9");
+  fs.rmSync(path.join(process.env.MOA_HOME, ".moa", "bindings", "exitcli"), { recursive: true, force: true });
+});
+
 
 // --- run state machine --------------------------------------------------------
 
@@ -2638,6 +2787,66 @@ await ta("tools/call: gated runs over JSON-RPC — the floor holds at the bounda
     assert.equal(self.terminal, "done_unverified", JSON.stringify(self));
     assert.match(self.label, /approved a change written by its own model/);
   } finally { c.stop(); }
+});
+
+await ta("tools/call: retention invariant + trim survive the wire into run_start", async () => {
+  resetBindings();
+  clearGlobal();
+  await opBindingSave({ profile: provenProfile({ tool: "retaincli", inventory: ["vendor/picked-1", "vendor/extra-1"] }) });
+  const repo = path.join(TMP, "retention-wire"); fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"),
+    "schemaVersion: 1\nmodels: {}\nroles:\n  worker: { use: [auto] }\npipelines: {}\n");
+  const c = await mcpClient({ cwd: repo });
+  try {
+    assert.ok(!(await c.call("moa_load", { cwd: repo })).error);
+    const r = await c.call("moa_resolve", { hostModels: [{ id: "vendor/hosted-1", family: "fake" }] });
+    assert.ok(!r.error, JSON.stringify(r));
+    assert.ok(!r.diagnostics.some((d) => d.state.startsWith("blocked_")));
+    const ids = r.pool.map((m) => m.id);
+    for (const [name, role] of Object.entries(r.roles))
+      assert.ok(ids.includes(role.model), `role ${name} model ${role.model} missing from pool`);
+    const selected = new Set(Object.values(r.roles).map((role) => role.model));
+    for (const m of r.pool)
+      assert.ok(m.sources.includes("registry") || m.sources.includes("host") || selected.has(m.id),
+        `row ${m.id} fails the retention predicate`);
+    assert.equal(r.roles.worker.model, "vendor/picked-1");
+    assert.ok(!ids.includes("vendor/extra-1"), "unselected discovery row must be trimmed");
+    assert.ok(ids.includes("vendor/hosted-1"), "host row must be retained");
+    const run = await c.call("moa_run_start", { task: "retention",
+      steps: [{ phase: "work", role: "worker" }], masterModel: "host/master", masterFamily: "host" });
+    assert.ok(run.runId, `discovery-only resolved role must survive into run_start: ${JSON.stringify(run)}`);
+  } finally { c.stop(); }
+});
+
+await ta("tools/call: failing live discovery surfaces as a diagnostic over JSON-RPC, not an error", async () => {
+  resetBindings();
+  clearGlobal();
+  const flag = path.join(TMP, "wire-exit-flag");
+  fs.rmSync(flag, { force: true });
+  const script = `if (require("fs").existsSync(${JSON.stringify(flag)})) process.exit(7); console.log("vendor/fake-9");`;
+  const save = await opBindingSave({ profile: provenProfile({
+    tool: "wireexitcli",
+    modelDiscovery: { argv: ["{bin}", "-e", script], output: { format: "lines" }, timeoutSeconds: 10 },
+  }) });
+  assert.ok(!save.error, JSON.stringify(save));
+  fs.writeFileSync(flag, ""); // discovery now exits 7 cleanly
+  const repo = path.join(TMP, "wire-exit"); fs.mkdirSync(repo, { recursive: true });
+  fs.writeFileSync(path.join(repo, ".moa.yml"),
+    "schemaVersion: 1\nmodels:\n  fake: { id: vendor/fake-9, family: fake, tags: [strong] }\nroles:\n  worker: { use: [fake] }\npipelines: {}\n");
+  const c = await mcpClient({ cwd: repo });
+  try {
+    assert.ok(!(await c.call("moa_load", { cwd: repo })).error);
+    const r = await c.call("moa_resolve", { hostModels: [{ id: "vendor/fake-9", family: "fake", tags: ["strong"] }] });
+    assert.ok(!r.error && !r._threw && !r._rpcError, JSON.stringify(r));
+    const diag = r.diagnostics.find((item) => item.tool === "wireexitcli");
+    assert.equal(diag?.state, "model_discovery_failed", JSON.stringify(r.diagnostics));
+    assert.ok(typeof diag.error === "string" && diag.error.length > 0, JSON.stringify(diag));
+    assert.equal(r.roles.worker.model, "vendor/fake-9");
+    assert.ok(Array.isArray(r.pool) && r.pool.length > 0);
+  } finally {
+    c.stop();
+    fs.rmSync(path.join(process.env.MOA_HOME, ".moa", "bindings", "wireexitcli"), { recursive: true, force: true });
+  }
 });
 
 

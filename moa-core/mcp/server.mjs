@@ -471,12 +471,13 @@ async function discoverBindingInventories(bindings) {
     profile,
     discovery: await discoverToolModels(profile, profile.resolvedBin),
   })));
+  const failed = (item) => item.discovery.error || item.discovery.code;
   return {
-    inventories: results.filter((item) => !item.discovery.error),
-    diagnostics: results.filter((item) => item.discovery.error).map((item) => ({
+    inventories: results.filter((item) => !failed(item)),
+    diagnostics: results.filter(failed).map((item) => ({
       state: item.discovery.code,
       tool: item.profile.tool,
-      error: item.discovery.error,
+      error: item.discovery.error ?? `model discovery exited ${item.discovery.exitCode}`,
     })),
   };
 }
@@ -844,9 +845,20 @@ export async function opResolve({ hostModels = [], overrides = {} } = {}) {
       configPaths: state.loaded.configPaths,
       roles,
     }, null, 2) + "\n");
+  // Overrides were already applied above — this pool cannot change the picks in
+  // THIS response; its rows are candidates for a FOLLOW-UP moa_resolve override.
+  // Trim to what a caller can still act on: registry rows (from the merged
+  // global+project config), host rows, and the rows selected for roles. If any
+  // role is blocked_*, return the full candidate pool instead, so the rescue
+  // override can be chosen without a separate moa_tools inventory call.
+  // state.resolved (above) keeps the untrimmed pool.
+  const blocked = diagnostics.some((d) => d.state.startsWith("blocked_"));
+  const selectedIds = new Set(Object.values(roles).map((r) => r.model));
+  const returnedPool = blocked ? pool : pool.filter((m) =>
+    m.sources.includes("registry") || m.sources.includes("host") || selectedIds.has(m.id));
   return {
     roles, diagnostics,
-    pool: pool.map(poolRow),
+    pool: returnedPool.map(poolRow),
     effectiveConfig: path.join(wd, "effective-config.json"),
   };
 }
@@ -1886,7 +1898,7 @@ async function startMcp() {
 
   server.tool(
     "moa_resolve",
-    "SECOND CALL — and runnable independently. Re-runs live discovery across every learned tool, then intersects those live external routes with the models aliases in .moa.yml and the hostModels you pass; pins every role's model/effort/binding (model-level only — roles.<name>.binding is rejected) with a recorded reason, checks independence constraints, and writes effective-config.json. Calling moa_tools first is optional. Returns the per-role resolution + candidate pool + diagnostics.",
+    "SECOND CALL — and runnable independently. Re-runs live discovery across every learned tool, then combines those live external routes with the model aliases in the merged loaded config (global ~/.moa/config.yml + project .moa.yml) and the hostModels you pass, joining aliases to routes by model id; pins every resolvable role's model/effort/binding (model-level only — roles.<name>.binding is rejected) with a recorded reason, diagnoses blocked roles, checks independence constraints, and writes effective-config.json. Calling moa_tools first is optional. Returns the per-role resolution + diagnostics + a candidate pool trimmed to actionable rows: rows aliased in the merged loaded config, host-native rows, and the rows selected for roles. Config rows are kept even when no live route serves them — check unreachable_registry_model diagnostics before targeting one. If any role is blocked_*, the full candidate pool is returned instead, so you can choose an override for a follow-up moa_resolve call without a separate moa_tools inventory call.",
     {
       hostModels: z.array(z.object({
         id: z.string().regex(CANONICAL_MODEL_ID), family: z.string().optional(),
