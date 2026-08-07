@@ -17,7 +17,8 @@ const writeGlobal = (source) => {
 };
 const clearGlobal = () => fs.rmSync(GLOBAL_CONFIG, { force: true });
 
-const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opSpawnStatus, opSpawnCancel, opSpawnWait, opInit, opBindingSave } =
+const { opLoad, opTools, opResolve, opRunStart, opStepReport, opSpawn, opSpawnStatus, opSpawnCancel, opSpawnWait, opInit, opBindingSave,
+        workspaceSnapshot, computeDelta, sameModel, globToRegExp } =
   await import("./server.mjs");
 
 const CANONICAL_FAKE_MODEL = "vendor/fake-9";
@@ -1148,6 +1149,102 @@ async function freshRun() {
   await opResolve({ hostModels: HOST });
   return opRunStart({ task: "test task", pipeline: "build", masterModel: "host/master", masterFamily: "host" });
 }
+
+// A fabricated snapshot. This is the payoff of injecting the snapshot instead of reading git
+// inside op*: a snapshot is a plain object, so every delta case runs in-process,
+// deterministically, with no subprocess and no filesystem.
+const snap = (entries, { head = "h1", sinceHead = [] } = {}) =>
+  ({ root: REPO, head, entries, sinceHead, reason: null });
+// A snapshot moa REFUSED to take. Same shape workspaceSnapshot returns for a dirty submodule,
+// an unreadable path, a truncated tree, or a failed HEAD diff.
+const refusedSnap = (reason) => ({ root: REPO, head: "h1", entries: null, sinceHead: [], reason });
+
+// ONE real-git fixture mechanism, many scenarios. A fresh repo per call keeps the scenarios
+// order-independent (git init is ~10ms); returns null when there is no git binary, and each
+// caller returns early — the check still counts, so the total is the same on a machine
+// without git. Degrade, never fail: the same contract the runtime honors.
+async function gitFixture(name) {
+  const { execFileSync } = await import("node:child_process");
+  const repo = path.join(TMP, `git-${name}`);
+  fs.mkdirSync(repo, { recursive: true });
+  const git = (...args) => execFileSync("git", args, { cwd: repo, stdio: "pipe" });
+  try { git("init", "-q", "-b", "main"); } catch { return null; }
+  git("config", "user.email", "t@t"); git("config", "user.name", "t");
+  return { repo, git, write: (rel, body) => {
+    const abs = path.join(repo, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, body);
+    return abs;
+  } };
+}
+
+const { execFileSync } = await import("node:child_process");
+
+// The real git binary, resolved once — and BEFORE any shim is on PATH. gitFixture already returns
+// null without git and every caller returns early, so this is only reached on a machine with one.
+const REAL_GIT = (() => {
+  try {
+    return execFileSync("sh", ["-c", "command -v git"], { encoding: "utf8" }).trim();
+  } catch { return null; }
+})();
+
+// A REAL `git` on PATH that runs the real binary and performs one filesystem mutation either
+// strictly BEFORE or strictly AFTER the invocation whose argv contains `on`. This is scheduling,
+// not stubbing: git actually runs, and the mutation lands in a window no in-process hook can
+// reach — `execFile` is destructured at server import, so a git read's completion has no hook.
+// `execFile` resolves "git" through the child's inherited PATH at call time, so mutating
+// process.env.PATH here is enough. `" $* "` with `*" status "*` matches the status read and
+// matches NEITHER rev-parse, which is what makes the two windows addressable independently.
+//
+// The mutation is BARRIERED against the HEAD read, and that is not belt-and-braces. The snapshot
+// launches `status` and `rev-parse HEAD` CONCURRENTLY, so a mutation scheduled off `status` alone
+// races the HEAD child: land it while `.git` — or the project directory — sits between the two
+// renames and HEAD fails, the snapshot takes the unreadable-HEAD refusal, and the row fails having
+// proved nothing (seen twice in five runs under load). So the HEAD invocation writes a marker once
+// the REAL read has returned, and the mutating branch waits for that marker before touching
+// anything: the two windows are ordered by the filesystem rather than by hope.
+//
+// The wait is BOUNDED — 3s, comfortably under gitRead's 10s timeout. If the HEAD read never comes
+// the shim refuses to run git and restore() throws, so a barrier wired to a command nobody calls
+// fails the suite loudly instead of hanging it.
+// Returns a restore function; ALWAYS call it in a finally — the fixture helpers shell out to git.
+function gitShim(name, { on, when, sh }) {
+  const dir = path.join(TMP, `shim-${name}`);
+  fs.mkdirSync(dir, { recursive: true });
+  const mark = path.join(dir, "head-read");
+  const stuck = path.join(dir, "barrier-timeout");
+  for (const p of [mark, stuck]) fs.rmSync(p, { force: true });
+  // First case wins, so the HEAD read is never itself a mutation window. `rev-parse HEAD` is the
+  // only argv here carrying a bare ` HEAD `: not --show-toplevel, not --absolute-git-dir, not
+  // rev-list, not the sha-to-sha diff.
+  const head = `case " $* " in *" HEAD "*) ${REAL_GIT} "$@"; s=$?; : > "${mark}"; exit $s ;; esac`;
+  const wait = `i=0; while [ ! -f "${mark}" ]; do i=$((i+1)); ` +
+    `if [ "$i" -gt 120 ]; then : > "${stuck}"; exit 99; fi; sleep 0.025; done`;
+  fs.writeFileSync(path.join(dir, "git"), when === "before"
+    ? `#!/bin/sh\n${head}\ncase " $* " in *" ${on} "*) ${wait}; ${sh} ;; esac\nexec ${REAL_GIT} "$@"\n`
+    : `#!/bin/sh\n${head}\n${REAL_GIT} "$@"; s=$?\ncase " $* " in *" ${on} "*) ${wait}; ${sh} ;; esac\nexit $s\n`,
+    { mode: 0o755 });
+  const prev = process.env.PATH;
+  process.env.PATH = `${dir}${path.delimiter}${prev}`;
+  return () => {
+    process.env.PATH = prev;
+    if (fs.existsSync(stuck))
+      throw new Error(`gitShim(${name}): barrier timed out — the real HEAD read never completed, so the scheduled mutation never ran`);
+  };
+}
+
+// A run in REPO with ad-hoc steps and an injected entry snapshot. Not a check — plumbing for
+// the delta rows below, which all need the same three lines.
+async function deltaRun(steps, snapshot) {
+  opLoad({ cwd: REPO });
+  await opResolve({ hostModels: HOST });
+  return opRunStart({
+    task: "delta", steps, snapshot,
+    masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude",
+  });
+}
+const manifestOf = (dir, runId) =>
+  JSON.parse(fs.readFileSync(path.join(dir, ".moa", "runs", runId, "manifest.json"), "utf8"));
 
 await ta("run_start: frame + first step from data", async () => {
   const r = await freshRun();
@@ -3102,6 +3199,1081 @@ await ta("tools/call: every advertised tool answers over the wire", async () => 
       expect(r);
     }
   } finally { c.stop(); }
+});
+
+// --- observed provenance: A — computeDelta over fabricated snapshots ----------
+
+await ta("delta: an edit to an already-dirty file is observed", async () => {
+  // The 139333f shape: dirty at entry, edited again, still dirty at report. A set difference
+  // over PATHS reports nothing here; only content identity sees it.
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], snap({ "a.js": "H1" }));
+  const r = opStepReport({ runId, phase: "execute", summary: "edited again",
+    changedFiles: ["a.js"], snapshot: snap({ "a.js": "H2" }) });
+  assert.equal(r.observed.source, "git", JSON.stringify(r.observed));
+  assert.deepEqual(r.observed.files, ["a.js"], JSON.stringify(r.observed));
+});
+
+await ta("delta: a dirty→clean revert is observed", async () => {
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], snap({ "a.js": "H1" }));
+  const r = opStepReport({ runId, phase: "execute", summary: "reverted",
+    changedFiles: ["a.js"], snapshot: snap({}) });
+  assert.deepEqual(r.observed.files, ["a.js"], JSON.stringify(r.observed));
+});
+
+await ta("delta: an untouched dirty file is not a mutation", async () => {
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], snap({ "a.js": "H1" }));
+  const r = opStepReport({ runId, phase: "execute", summary: "touched nothing",
+    snapshot: snap({ "a.js": "H1" }) });
+  assert.equal(r.observed.source, "git", JSON.stringify(r.observed));
+  assert.deepEqual(r.observed.files, [], JSON.stringify(r.observed));
+});
+
+await ta("delta: a deletion is a change, not an absence", async () => {
+  // identityOf returns null for ENOENT; `undefined` (absent key) !== null, so it registers.
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], snap({}));
+  const r = opStepReport({ runId, phase: "execute", summary: "deleted a.js",
+    changedFiles: ["a.js"], snapshot: snap({ "a.js": null }) });
+  assert.deepEqual(r.observed.files, ["a.js"], JSON.stringify(r.observed));
+});
+
+await ta("delta: a committed-and-clean phase is observed via the HEAD diff", async () => {
+  // The working tree is clean at both ends; nothing but sinceHead witnesses the write.
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], snap({ "a.js": "H1" }));
+  const r = opStepReport({ runId, phase: "execute", summary: "committed",
+    changedFiles: ["a.js"], snapshot: snap({}, { head: "h2", sinceHead: ["a.js"] }) });
+  assert.deepEqual(r.observed.files, ["a.js"], JSON.stringify(r.observed));
+});
+
+await ta("delta: the run store workDir never appears, and is matched projectDir-relative", async () => {
+  // REPO's default workDir is `.moa`; excludeRelFor converts the ABSOLUTE workDirOf() into the
+  // projectDir-relative prefix the snapshot keys actually use. Compare the wrong frame and the
+  // run store's own writes read as the phase's mutations.
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], snap({}));
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a and the run store",
+    changedFiles: ["a.js"], snapshot: snap({ ".moa/runs/x.json": "H", "a.js": "H" }) });
+  assert.deepEqual(r.observed.files, ["a.js"], JSON.stringify(r.observed));
+});
+
+await ta("delta: a workDir outside the project excludes nothing", async () => {
+  // `workDir: ../shared` relative-izes to an escaping path. Returning "" or ".." there would
+  // prefix-match EVERY path and blind observation entirely — the failure worth guarding.
+  const dir = path.join(TMP, "workdir-outside");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".moa.yml"), `
+schemaVersion: 1
+runtime:
+  workDir: ../shared
+models:
+  fake: { id: vendor/fake-9, family: fake, tags: [strong] }
+roles:
+  coder: { use: [fake] }
+pipelines: {}
+`);
+  assert.equal(opLoad({ cwd: dir }).errors, undefined);
+  await opResolve({ hostModels: HOST });
+  const { runId } = opRunStart({ task: "outside", steps: [{ phase: "execute", role: "coder" }],
+    masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude", snapshot: snap({}) });
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote both",
+    snapshot: snap({ ".moa/x": "H", "a.js": "H" }) });
+  assert.deepEqual(r.observed.files, [".moa/x", "a.js"], JSON.stringify(r.observed));
+});
+
+await ta("delta: a refused snapshot degrades to unobserved and carries its reason", async () => {
+  // Both refusals the failure-mode table creates. A refusal must never read as an observation.
+  const cap = await deltaRun([{ phase: "execute", role: "coder" }], snap({ "a.js": "H1" }));
+  const capped = opStepReport({ runId: cap.runId, phase: "execute", summary: "too dirty",
+    changedFiles: ["a.js"], snapshot: refusedSnap("more than 2000 dirty paths") });
+  assert.equal(capped.observed.source, "unobserved", JSON.stringify(capped.observed));
+  assert.ok(/more than 2000/.test(capped.observed.reason), capped.observed.reason);
+
+  const sub = await deltaRun([{ phase: "execute", role: "coder" }], snap({ "a.js": "H1" }));
+  const refused = opStepReport({ runId: sub.runId, phase: "execute", summary: "dirty submodule",
+    changedFiles: ["a.js"],
+    snapshot: refusedSnap("a dirty path could not be identified — unreadable, or a directory git reports as a single path (a dirty submodule)") });
+  assert.equal(refused.observed.source, "unobserved", JSON.stringify(refused.observed));
+  assert.ok(/could not be identified/.test(refused.observed.reason), refused.observed.reason);
+});
+
+await ta("delta: a non-git projectDir yields unobserved and the declared fallback", async () => {
+  // The tripwire for the environment assumption every other row rests on: TMP is NOT a git
+  // repository, which is what keeps all 124 pre-existing checks on the declared path. If that
+  // ever stops being true, this row fails loudly instead of twenty failing mysteriously.
+  assert.equal(await workspaceSnapshot(REPO), null, "TMP must not be inside a git repository");
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }]);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a", changedFiles: ["a.js"] });
+  assert.equal(r.observed.source, "unobserved", JSON.stringify(r.observed));
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+});
+
+await ta("delta: a legacy manifest without observed uses changedFiles", async () => {
+  // Manifests written before this feature carry no `observed`; mutationsOf must fall back
+  // rather than read undefined as "nothing changed" and hand out a free `done`.
+  const { runId } = await deltaRun([
+    { phase: "execute", role: "coder" },
+    { phase: "wrap", role: "coder" },
+  ], snap({}));
+  opStepReport({ runId, phase: "execute", summary: "wrote a", changedFiles: ["a.js"],
+    snapshot: snap({ "a.js": "H1" }) });
+  const file = path.join(REPO, ".moa", "runs", runId, "manifest.json");
+  const m = JSON.parse(fs.readFileSync(file, "utf8"));
+  for (const p of m.phases) delete p.observed;
+  fs.writeFileSync(file, JSON.stringify(m));
+  const r = opStepReport({ runId, phase: "wrap", summary: "done" });
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+});
+
+await ta("run_start: the initial snapshot is stored for the first step", async () => {
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], snap({ "a.js": "H1" }));
+  const m = manifestOf(REPO, runId);
+  assert.deepEqual(m.snapshotAtStepEntry.entries, { "a.js": "H1" }, JSON.stringify(m.snapshotAtStepEntry));
+  assert.equal(m.attempt, 0);
+});
+
+// --- observed provenance: B — real git, invocation level ----------------------
+
+await ta("snapshot: a staged rename with spaces, and git-ignored paths", async () => {
+  // `-z` records are NUL-terminated with no quoting, and an R/C record is followed by a second
+  // bare record carrying the counterpart path — parse that wrong and a renamed path silently
+  // becomes two half-paths. No fabrication can check this.
+  const fx = await gitFixture("rename");
+  if (!fx) return; // no git binary: degrade, never fail — the check still counts
+  fx.write("old name.txt", "x\n");
+  fx.write(".gitignore", "ignored.txt\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+
+  const before = await workspaceSnapshot(fx.repo);
+  assert.ok(before?.entries, JSON.stringify(before));
+  fs.renameSync(path.join(fx.repo, "old name.txt"), path.join(fx.repo, "new name.txt"));
+  fx.write("ignored.txt", "noise\n");
+  fx.git("add", "-A"); // stage so git reports R, not D + ??
+  const after = await workspaceSnapshot(fx.repo, before.head);
+
+  const d = computeDelta({ before, after, declaredFiles: [] });
+  assert.equal(d.source, "git", JSON.stringify(d));
+  assert.deepEqual(d.files, ["new name.txt", "old name.txt"], JSON.stringify(d));
+  assert.ok(!d.files.includes("ignored.txt"), "git-ignored paths are out of scope");
+});
+
+await ta("snapshot: an already-dirty file edited again is observed", async () => {
+  // The invocation-level 139333f proof. Status reports {a.js} at BOTH ends, so every
+  // path-set implementation — one-way or symmetric — returns [] here.
+  const fx = await gitFixture("dirty-again");
+  if (!fx) return;
+  fx.write("a.js", "one\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+  fx.write("a.js", "two\n");
+  const before = await workspaceSnapshot(fx.repo);
+  assert.deepEqual(Object.keys(before.entries), ["a.js"], JSON.stringify(before));
+  fx.write("a.js", "three\n");
+  const after = await workspaceSnapshot(fx.repo, before.head);
+  assert.deepEqual(Object.keys(after.entries), ["a.js"], "still exactly one dirty PATH");
+
+  const d = computeDelta({ before, after, declaredFiles: [] });
+  assert.deepEqual(d.files, ["a.js"], JSON.stringify(d));
+});
+
+await ta("snapshot: a dirty file reverted clean is observed", async () => {
+  // Defeats a one-way `after \ before` subtraction; a symmetric difference also catches it.
+  const fx = await gitFixture("revert");
+  if (!fx) return;
+  fx.write("a.js", "one\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+  fx.write("a.js", "two\n");
+  const before = await workspaceSnapshot(fx.repo);
+  fx.git("checkout", "--", "a.js");
+  const after = await workspaceSnapshot(fx.repo, before.head);
+  assert.deepEqual(Object.keys(after.entries), [], "tree is clean again");
+
+  const d = computeDelta({ before, after, declaredFiles: [] });
+  assert.deepEqual(d.files, ["a.js"], JSON.stringify(d));
+});
+
+await ta("snapshot: a committed, clean tree is observed via sinceHead", async () => {
+  // A worker that commits leaves nothing for status to report. Nothing but the HEAD diff sees it.
+  const fx = await gitFixture("committed");
+  if (!fx) return;
+  fx.write("a.js", "one\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+  const before = await workspaceSnapshot(fx.repo);
+  assert.deepEqual(Object.keys(before.entries), [], "clean at entry");
+  fx.write("a.js", "two\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "work");
+  const after = await workspaceSnapshot(fx.repo, before.head);
+  assert.deepEqual(after.sinceHead, ["a.js"], JSON.stringify(after));
+  assert.deepEqual(Object.keys(after.entries), [], "clean at report too");
+
+  const d = computeDelta({ before, after, declaredFiles: [] });
+  assert.deepEqual(d.files, ["a.js"], JSON.stringify(d));
+});
+
+await ta("snapshot: a nested projectDir keys paths relative to itself", async () => {
+  // Correction 3's executable proof: porcelain paths are repo-root-relative ALWAYS, and
+  // projectDir is the CONFIG's directory. Compare those two frames directly and the workDir
+  // exclusion silently matches nothing.
+  const fx = await gitFixture("nested");
+  if (!fx) return;
+  fx.write("packages/api/a.js", "x\n");
+  fx.write("root.js", "y\n");
+  const s = await workspaceSnapshot(path.join(fx.repo, "packages", "api"));
+  assert.ok(s?.entries, JSON.stringify(s));
+  const keys = Object.keys(s.entries);
+  assert.ok(keys.includes("a.js"), JSON.stringify(keys));
+  assert.ok(!keys.includes("packages/api/a.js"), JSON.stringify(keys));
+  assert.ok(!keys.includes("root.js"), "a sibling outside projectDir is out of scope");
+  // `--show-toplevel` is physical, so compare against the resolved repo root, not the path we
+  // happened to walk in with (on macOS os.tmpdir() alone differs: /var -> /private/var).
+  assert.equal(s.root, fs.realpathSync(fx.repo), s.root);
+});
+
+await ta("snapshot: a file named __proto__ is a real entry, not the prototype", async () => {
+  // `entries["__proto__"] = hash` on a `{}` literal hits the prototype SETTER and the entry
+  // vanishes (0 own keys). Object.create(null) has no such setter, and a manifest round trip
+  // must preserve it as a real own property.
+  const fx = await gitFixture("proto");
+  if (!fx) return;
+  fx.write("__proto__", "danger\n");
+  const s = await workspaceSnapshot(fx.repo);
+  assert.ok(s?.entries, JSON.stringify(s));
+  assert.ok(Object.keys(s.entries).includes("__proto__"), JSON.stringify(Object.keys(s.entries)));
+  assert.match(s.entries["__proto__"], /^[0-9a-f]{64}$/);
+  const round = JSON.parse(JSON.stringify(s));
+  assert.ok(Object.keys(round.entries).includes("__proto__"), JSON.stringify(round.entries));
+  assert.match(round.entries["__proto__"], /^[0-9a-f]{64}$/);
+});
+
+// --- observed provenance: C — the 139333f regression, both directions ---------
+
+await ta("finalize cannot re-declare an earlier phase's writes as its own", async () => {
+  // `execute` really wrote a.js; the gate approved it; `finalize` then DECLARES a.js again
+  // while changing nothing. Declared-only, that is a post-gate mutation and the run finishes
+  // unverified. Observed, finalize mutated nothing and the run is legitimately done.
+  const { runId } = await deltaRun([
+    { phase: "execute", role: "coder" },
+    { phase: "validate", role: "verifier", gate: "critical" },
+    { phase: "finalize", role: "coder" },
+  ], snap({}));
+  const coder = { producerModel: "openai/gpt-5.5", producerFamily: "gpt" };
+  const gate = { producerModel: "anthropic/claude-opus-4-8", producerFamily: "claude" };
+  opStepReport({ runId, phase: "execute", summary: "wrote a", changedFiles: ["a.js"],
+    snapshot: snap({ "a.js": "H1" }), ...coder });
+  opStepReport({ runId, phase: "validate", verdict: "APPROVE", summary: "lgtm",
+    snapshot: snap({ "a.js": "H1" }), ...gate });
+  const r = opStepReport({ runId, phase: "finalize", summary: "no-op",
+    changedFiles: ["a.js"], snapshot: snap({ "a.js": "H1" }), ...coder });
+  assert.deepEqual(r.observed.files, [], JSON.stringify(r.observed));
+  assert.deepEqual(r.mutationDiscrepancy.phantom, ["a.js"], JSON.stringify(r.mutationDiscrepancy));
+  assert.equal(r.terminal, "done", JSON.stringify(r));
+});
+
+await ta("finalize that really writes after the critical gate still finishes unverified", async () => {
+  // The inverse, and the row that cannot pass without observation: with changedFiles: [] the
+  // DECLARED-only floor sees no post-gate write and returns `done`.
+  const { runId } = await deltaRun([
+    { phase: "execute", role: "coder" },
+    { phase: "validate", role: "verifier", gate: "critical" },
+    { phase: "finalize", role: "coder" },
+  ], snap({}));
+  const coder = { producerModel: "openai/gpt-5.5", producerFamily: "gpt" };
+  const gate = { producerModel: "anthropic/claude-opus-4-8", producerFamily: "claude" };
+  opStepReport({ runId, phase: "execute", summary: "wrote a", changedFiles: ["a.js"],
+    snapshot: snap({ "a.js": "H1" }), ...coder });
+  opStepReport({ runId, phase: "validate", verdict: "APPROVE", summary: "lgtm",
+    snapshot: snap({ "a.js": "H1" }), ...gate });
+  const r = opStepReport({ runId, phase: "finalize", summary: "quietly edited a",
+    changedFiles: [], snapshot: snap({ "a.js": "H2" }), ...coder });
+  assert.deepEqual(r.observed.files, ["a.js"], JSON.stringify(r.observed));
+  assert.deepEqual(r.mutationDiscrepancy.undeclared, ["a.js"], JSON.stringify(r.mutationDiscrepancy));
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+  assert.match(r.label, /covering the last change/);
+});
+
+// --- observed provenance: D — route observation (advisory) --------------------
+
+// Two ad-hoc steps against a registered external route: enough to report a phase and still
+// have a gate left to report next.
+async function twoStepExternalRun(profile = runnableProfile()) {
+  const saved = await opBindingSave({ profile });
+  assert.equal(saved.error, undefined, JSON.stringify(saved));
+  const repo = writeRouteRepo(`route-obs-${crypto.randomUUID()}`, "external", profile.tool);
+  assert.equal(opLoad({ cwd: repo }).errors, undefined);
+  await opResolve({ hostModels: HOST });
+  return opRunStart({
+    task: "route observation",
+    steps: [{ phase: "work", role: "worker" }, { phase: "check", role: "worker", gate: "critical" }],
+    masterModel: "host/master", masterFamily: "host",
+  });
+}
+
+await ta("step_report: a named spawnId observes the route", async () => {
+  const { run } = await startExternalRun();
+  const job = await spawnResult(run.runId, "work", "hello");
+  assert.equal(job.status, "completed", JSON.stringify(job));
+  const r = opStepReport({ runId: run.runId, phase: "work", summary: "did it",
+    producerModel: "vendor/fake-9", spawnId: job.spawnId });
+  assert.equal(r.routeObservation.source, "spawn-record", JSON.stringify(r.routeObservation));
+  assert.equal(r.routeObservation.observedRoute, "vendor/fake-9");
+  assert.equal(r.routeObservation.agrees, true, JSON.stringify(r.routeObservation));
+});
+
+await ta("step_report: a spawnId from another step is rejected", async () => {
+  // Evidence about a different PHASE is a conductor bug, not a downgrade.
+  const run = await twoStepExternalRun();
+  const job = await spawnResult(run.runId, "work", "hello");
+  assert.equal(job.status, "completed", JSON.stringify(job));
+  opStepReport({ runId: run.runId, phase: "work", summary: "did it", spawnId: job.spawnId });
+  const r = opStepReport({ runId: run.runId, phase: "check", verdict: "APPROVE",
+    summary: "lgtm", spawnId: job.spawnId });
+  assert.equal(r.code, "spawn_mismatch", JSON.stringify(r));
+});
+
+await ta("step_report: a stale completed job from a prior attempt is not observation", async () => {
+  // Correction 4: `attempt` is server-internal and appears in no response, so refusing a report
+  // over it would punish the conductor for information it is never given. Downgrade, never reject.
+  const run = await twoStepExternalRun();
+  opStepReport({ runId: run.runId, phase: "work", summary: "did it" });
+  const job = await spawnResult(run.runId, "check", "verify");
+  assert.equal(job.status, "completed", JSON.stringify(job));
+  const errored = opStepReport({ runId: run.runId, phase: "check", verdict: "ERROR",
+    summary: "gate blew up" });
+  assert.ok(errored.retry, JSON.stringify(errored));
+  const r = opStepReport({ runId: run.runId, phase: "check", verdict: "APPROVE",
+    summary: "lgtm", spawnId: job.spawnId });
+  assert.equal(r.error, undefined, JSON.stringify(r));
+  assert.equal(r.routeObservation.source, "declared", JSON.stringify(r.routeObservation));
+  assert.match(r.routeObservation.reason, /attempt 0/);
+});
+
+await ta("step_report: a native phase records 'declared', never a mismatch", async () => {
+  const { runId } = await freshRun();
+  const r = opStepReport({ runId, phase: "plan", summary: "planned" });
+  assert.equal(r.routeObservation.source, "declared", JSON.stringify(r.routeObservation));
+  assert.equal(r.routeObservation.agrees, null);
+  assert.match(r.routeObservation.reason, /no spawn record/);
+});
+
+await ta("step_report: a failed spawn is not observation", async () => {
+  // A route that ran and FAILED proves nothing about who authored the artifact.
+  const { run } = await startExternalRun(runnableProfile({ tool: "exit-route", mode: "exit" }));
+  const job = await spawnResult(run.runId, "work", "hello");
+  assert.equal(job.status, "failed", JSON.stringify(job));
+  const r = opStepReport({ runId: run.runId, phase: "work", summary: "it broke" });
+  assert.equal(r.routeObservation.source, "declared", JSON.stringify(r.routeObservation));
+  assert.match(r.routeObservation.reason, /spawn failed/);
+});
+
+await ta("step_report: decorated vs canonical model ids report indeterminate, not mismatch", () => {
+  // Correction 2: a vendor deployment id and its canonical name are ONE model wearing two
+  // names. A confident `false` there would teach the conductor to ignore the field.
+  assert.equal(sameModel("bedrock/us.anthropic.claude-sonnet-4-6-v1:0", "anthropic/claude-sonnet-4-6"), null);
+  assert.equal(sameModel("openai/gpt-5.5", "openai/gpt-5.5"), true);
+  assert.equal(sameModel("vendor/fake-9", "vendor/checker-1"), false);
+  assert.equal(sameModel(null, "x"), null);
+});
+
+await ta("step_report: a route mismatch is reported and the phase still advances", async () => {
+  const run = await twoStepExternalRun();
+  const job = await spawnResult(run.runId, "work", "hello");
+  assert.equal(job.status, "completed", JSON.stringify(job));
+  const r = opStepReport({ runId: run.runId, phase: "work", summary: "did it",
+    producerModel: "openai/gpt-5.5", spawnId: job.spawnId });
+  assert.equal(r.routeObservation.agrees, false, JSON.stringify(r.routeObservation));
+  assert.ok(r.next, JSON.stringify(r));
+});
+
+await ta("step_report: route observation cannot lift a strict critical-gate halt", async () => {
+  resetBindings();
+  const profile = runnableProfile({ tool: `strict-route-${crypto.randomUUID()}` });
+  assert.equal((await opBindingSave({ profile })).error, undefined);
+  const repo = path.join(TMP, "strict-route"); fs.mkdirSync(repo, { recursive: true });
+  // worker routes to fake-9 through the tool; verifier is host-native checker-1. The DECLARED
+  // producer is checker-1 in BOTH runs, so the producer and verifier share a group -> self-check
+  // -> strict + critical -> halt. Only the ROUTE differs from the declaration.
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+master:
+  mode: strict
+models:
+  fake:  { id: vendor/fake-9, family: fake, tags: [strong], binding: ${profile.tool} }
+  check: { id: vendor/checker-1, family: check, tags: [strong] }
+roles:
+  worker:   { use: [fake] }
+  verifier: { use: [check] }
+pipelines: {}
+`);
+  const hosts = [...HOST, { id: "vendor/checker-1", family: "check", tags: ["strong"] }];
+  const steps = [{ phase: "work", role: "worker" },
+                 { phase: "check", role: "verifier", gate: "critical" }];
+  const declared = { producerModel: "vendor/checker-1", producerFamily: "check" };
+  const start = async () => {
+    assert.equal(opLoad({ cwd: repo }).errors, undefined);
+    await opResolve({ hostModels: hosts });
+    return opRunStart({ task: "strict route", steps, masterModel: "host/master", masterFamily: "host" });
+  };
+
+  const controlRun = await start();
+  const control = opStepReport({ runId: controlRun.runId, phase: "work",
+    summary: "wrote a", changedFiles: ["a.js"], ...declared });
+
+  const mismatchRun = await start();
+  const job = await spawnResult(mismatchRun.runId, "work", "x");
+  assert.equal(job.status, "completed", JSON.stringify(job));
+  const mismatch = opStepReport({ runId: mismatchRun.runId, phase: "work",
+    summary: "wrote a", changedFiles: ["a.js"], ...declared, spawnId: job.spawnId });
+
+  // the route evidence really fired — without this the equalities below are vacuous
+  assert.equal(mismatch.routeObservation.source, "spawn-record");
+  assert.equal(mismatch.routeObservation.observedRoute, "vendor/fake-9");
+  assert.equal(mismatch.routeObservation.agrees, false, JSON.stringify(mismatch.routeObservation));
+  assert.equal(control.routeObservation.source, "declared");
+
+  // and it changed nothing that decides the run
+  assert.equal(control.terminal, "verification_unavailable", JSON.stringify(control));
+  assert.equal(mismatch.terminal, control.terminal, JSON.stringify(mismatch));
+  assert.equal(control.step.independence.grade, "self-check");
+  assert.equal(mismatch.step.independence.grade, control.step.independence.grade);
+  assert.equal(control.step.independence.pass, false);
+  assert.equal(mismatch.step.independence.pass, control.step.independence.pass);
+  assert.equal(control.step.blocked, "verification_unavailable");
+  assert.equal(mismatch.step.blocked, control.step.blocked);
+});
+
+await ta("step_report: advisories survive REVISE, BLOCKED, ERROR and terminal returns", async () => {
+  // Every decorated return, and the spread order that keeps a result key winning.
+  const carries = (r, label) => {
+    assert.ok("observed" in r, `${label}: no observed — ${JSON.stringify(r)}`);
+    assert.ok("routeObservation" in r, `${label}: no routeObservation — ${JSON.stringify(r)}`);
+  };
+  const gated = [{ phase: "execute", role: "coder" },
+                 { phase: "validate", role: "verifier", gate: "critical", loopBackTo: "execute" }];
+
+  const loop = await deltaRun(gated, snap({}));
+  opStepReport({ runId: loop.runId, phase: "execute", summary: "wrote" });
+  const looped = opStepReport({ runId: loop.runId, phase: "validate", verdict: "REVISE", summary: "no" });
+  carries(looped, "REVISE"); assert.equal(looped.looped, true, JSON.stringify(looped));
+
+  const err = await deltaRun(gated, snap({}));
+  opStepReport({ runId: err.runId, phase: "execute", summary: "wrote" });
+  const errored = opStepReport({ runId: err.runId, phase: "validate", verdict: "ERROR", summary: "boom" });
+  carries(errored, "ERROR"); assert.ok(errored.retry, JSON.stringify(errored));
+
+  const blk = await deltaRun(gated, snap({}));
+  opStepReport({ runId: blk.runId, phase: "execute", summary: "wrote" });
+  const blocked = opStepReport({ runId: blk.runId, phase: "validate", verdict: "BLOCKED", summary: "stop" });
+  carries(blocked, "BLOCKED");
+  assert.equal(blocked.terminal, "blocked_verifier_disagreement", JSON.stringify(blocked));
+
+  const nxt = await deltaRun(gated, snap({}));
+  const next = opStepReport({ runId: nxt.runId, phase: "execute", summary: "wrote" });
+  carries(next, "next"); assert.ok(next.next, JSON.stringify(next));
+
+  const fin = await deltaRun([{ phase: "execute", role: "coder" }], snap({}));
+  const done = opStepReport({ runId: fin.runId, phase: "execute", summary: "wrote nothing" });
+  carries(done, "terminal"); assert.equal(done.terminal, "done", JSON.stringify(done));
+
+  const max = await deltaRun(gated, snap({}));
+  opStepReport({ runId: max.runId, phase: "execute", summary: "wrote" });
+  let last;
+  for (let i = 0; i <= 2; i++) {
+    opStepReport({ runId: max.runId, phase: "execute", summary: "reworked" });
+    last = opStepReport({ runId: max.runId, phase: "validate", verdict: "REVISE", summary: "still no" });
+  }
+  carries(last, "max_loops_exceeded");
+  assert.equal(last.terminal, "max_loops_exceeded", JSON.stringify(last));
+});
+
+await ta("describeStep: producerObservation labels the producer phase, not the verifier", async () => {
+  const run = await twoStepExternalRun();
+  const job = await spawnResult(run.runId, "work", "hello");
+  assert.equal(job.status, "completed", JSON.stringify(job));
+  const r = opStepReport({ runId: run.runId, phase: "work", summary: "did it",
+    producerModel: "vendor/fake-9", spawnId: job.spawnId });
+  assert.equal(r.next.independence.producerObservation, "observed-route", JSON.stringify(r.next.independence));
+  const gate = opStepReport({ runId: run.runId, phase: "check", verdict: "APPROVE", summary: "lgtm" });
+  assert.equal(gate.verifierExecution, "declared", JSON.stringify(gate));
+});
+
+await ta("finish: verification counts critical gates once per phase, not per attempt", async () => {
+  const gated = [{ phase: "execute", role: "coder" },
+                 { phase: "validate", role: "verifier", gate: "critical" }];
+  const { runId } = await deltaRun(gated, snap({}));
+  opStepReport({ runId, phase: "execute", summary: "wrote nothing" });
+  opStepReport({ runId, phase: "validate", verdict: "ERROR", summary: "boom" });
+  const r = opStepReport({ runId, phase: "validate", verdict: "APPROVE", summary: "lgtm" });
+  assert.equal(r.verification.criticalGates, 1, JSON.stringify(r.verification));
+  assert.equal(r.verification.routeObserved + r.verification.declared, 1, JSON.stringify(r.verification));
+});
+
+// --- observed provenance: E — static write-set policy -------------------------
+
+await ta("write-set: a path outside the declared globs is flagged, not blocked", async () => {
+  const { runId } = await deltaRun([
+    { phase: "execute", role: "coder", writeSet: ["src/**"] },
+    { phase: "validate", role: "verifier", gate: "critical" },
+  ], snap({}));
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote infra",
+    changedFiles: ["infra/main.tf"], snapshot: snap({ "infra/main.tf": "H1" }) });
+  assert.deepEqual(r.writeSetViolation, ["infra/main.tf"], JSON.stringify(r));
+  assert.ok(r.next, "advisory only — the run advances");
+});
+
+await ta("write-set: absent writeSet means unconstrained", async () => {
+  const { runId } = await deltaRun([
+    { phase: "execute", role: "coder" },
+    { phase: "validate", role: "verifier", gate: "critical" },
+  ], snap({}));
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote infra",
+    changedFiles: ["infra/main.tf"], snapshot: snap({ "infra/main.tf": "H1" }) });
+  assert.ok(!("writeSetViolation" in r), JSON.stringify(r));
+});
+
+await ta("write-set: an unobserved delta never produces a violation", async () => {
+  // Policy is checked against OBSERVATION only: flagging a declared list would report the
+  // conductor's own words back to it as evidence.
+  const { runId } = await deltaRun([
+    { phase: "execute", role: "coder", writeSet: ["src/**"] },
+    { phase: "validate", role: "verifier", gate: "critical" },
+  ]);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote infra",
+    changedFiles: ["infra/main.tf"] });
+  assert.equal(r.observed.source, "unobserved", JSON.stringify(r.observed));
+  assert.ok(!("writeSetViolation" in r), JSON.stringify(r));
+});
+
+await ta("write-set: the dialect is anchored and ** crosses directories, * does not", () => {
+  const yes = (p, f) => assert.ok(globToRegExp(p).test(f), `${p} should match ${f}`);
+  const no = (p, f) => assert.ok(!globToRegExp(p).test(f), `${p} should NOT match ${f}`);
+  yes("src/*.js", "src/a.js");   no("src/*.js", "src/a/b.js");  no("src/*.js", "lib/src/a.js");
+  yes("src/**", "src/a/b.js");   no("src/**", "srcx/a.js");
+  yes("**/x.ts", "a/b/x.ts");    yes("**/x.ts", "x.ts");        no("**/x.ts", "a/x.tsx");
+  yes("infra/", "infra/main.tf"); yes("infra/", "infra/a/b.tf"); no("infra/", "infrax/a");
+  yes("a/**/b", "a/b");          yes("a/**/b", "a/x/y/b");      no("a/**/b", "a/x/c");
+  yes(".github/**", ".github/w/ci.yml");
+  no("src/a.js", "src/aXjs"); // '.' is escaped, not a wildcard
+});
+
+await ta("write-set: malformed patterns are rejected at config load", async () => {
+  // One validator, three rejected forms plus a positive control — the dialect must fail loudly
+  // rather than compile a pattern that can only ever match nothing.
+  const dir = path.join(TMP, "writeset-config");
+  fs.mkdirSync(dir, { recursive: true });
+  const load = (pattern) => {
+    fs.writeFileSync(path.join(dir, ".moa.yml"), `
+schemaVersion: 1
+models:
+  fake: { id: vendor/fake-9, family: fake, tags: [strong] }
+roles:
+  coder: { use: [fake] }
+pipelines:
+  build:
+    steps:
+      - { phase: execute, role: coder, writeSet: [${pattern}] }
+`);
+    return opLoad({ cwd: dir });
+  };
+  const deep = load('"a**b"').errors;
+  assert.ok(deep, "a**b loaded without error");
+  assert.match(JSON.stringify(deep), /writeSet/);
+  assert.match(JSON.stringify(deep), /whole path segment/);
+
+  const sep = load('"src\\\\a"').errors;
+  assert.ok(sep, "src\\a loaded without error");
+  assert.match(JSON.stringify(sep), /separator/);
+
+  const empty = load('"a//b"').errors;
+  assert.ok(empty, "a//b loaded without error");
+  assert.match(JSON.stringify(empty), /empty path segment/);
+
+  assert.equal(load('"src/**"').errors, undefined, "a legal pattern must load clean");
+});
+
+await ta("write-set: survives, and is rejected, at the real JSON-RPC boundary", async () => {
+  const c = await mcpClient({ cwd: REPO });
+  try {
+    assert.ok(!(await c.call("moa_load", { cwd: REPO })).error);
+    assert.ok(!(await c.call("moa_resolve", { hostModels: HOST })).error);
+    const start = (step) => c.call("moa_run_start", {
+      task: "write-set boundary", steps: [step],
+      masterModel: "anthropic/claude-opus-4-8", masterFamily: "claude",
+    });
+
+    // (a) the field survives the boundary — the inline schema used to strip it
+    const ok = await start({ phase: "execute", role: "coder", writeSet: ["src/**"] });
+    assert.deepEqual(ok.next.writeSet, ["src/**"], JSON.stringify(ok));
+
+    // (b) a malformed pattern is a zod failure: isError with a NON-JSON body
+    const bad = await start({ phase: "execute", role: "coder", writeSet: ["a**b"] });
+    assert.match(bad._threw ?? JSON.stringify(bad), /Input validation error/);
+    assert.match(bad._threw ?? JSON.stringify(bad), /writeSet/);
+
+    // (c) compatibility: an unknown ad-hoc step key is still SILENTLY STRIPPED, never rejected.
+    // This is the row that fails if zStep is reused at the boundary without .strip().
+    const legacy = await start({ phase: "execute", role: "coder", bogus: 1 });
+    assert.ok(legacy.next, JSON.stringify(legacy));
+    assert.equal("bogus" in legacy.next, false, JSON.stringify(legacy.next));
+  } finally { c.stop(); }
+});
+
+// --- observed provenance: F — refusals: an unreadable HEAD, and a frame that will not hold ---
+
+await ta("snapshot: an unreadable HEAD is refused, an unborn repo is still observed", async () => {
+  // Both halves are required. gitRead collapses EVERY failure to null, so a corrupt ref arrives
+  // in the same shape as an unborn repo — and accepting it would skip the sinceHead term and
+  // report a committed-and-clean phase as ZERO mutations, as a confident observation.
+  const broken = await gitFixture("head-broken");
+  if (!broken) return;
+  broken.write("a.js", "one\n");
+  broken.git("add", "-A"); broken.git("commit", "-qm", "seed");
+  const healthy = await workspaceSnapshot(broken.repo);
+  assert.ok(healthy?.entries, JSON.stringify(healthy));
+  broken.write("a.js", "two\n"); // status must be non-empty, so only HEAD is broken
+  // the default branch name varies by machine — read it from .git/HEAD rather than assuming
+  const ref = fs.readFileSync(path.join(broken.repo, ".git", "HEAD"), "utf8").trim().replace(/^ref:\s*/, "");
+  fs.writeFileSync(path.join(broken.repo, ".git", ref), "not-a-sha-at-all\n");
+
+  const s = await workspaceSnapshot(broken.repo, healthy.head);
+  assert.equal(s.entries, null, JSON.stringify(s));
+  assert.match(s.reason, /unborn/);
+  const d = computeDelta({ before: healthy, after: s, declaredFiles: ["a.js"] });
+  assert.equal(d.source, "unobserved", JSON.stringify(d));
+  // ...and the floor lands on the declared list rather than on a confident zero
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], healthy);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a",
+    changedFiles: ["a.js"], snapshot: s });
+  assert.equal(r.observed.source, "unobserved", JSON.stringify(r.observed));
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+
+  // (b) a genuinely unborn repository is still OBSERVED — a fix that refuses on every null
+  // head would break every repo before its first commit.
+  const unborn = await gitFixture("head-unborn");
+  if (!unborn) return;
+  unborn.write("a.js", "one\n");
+  const u = await workspaceSnapshot(unborn.repo);
+  assert.ok(u?.entries, JSON.stringify(u));
+  assert.equal(u.head, null, JSON.stringify(u));
+  assert.deepEqual(u.sinceHead, [], JSON.stringify(u));
+});
+
+await ta("snapshot: a project directory that cannot be resolved is refused, not assumed", async () => {
+  // The symlink fix's own failure mode, and the last silent degradation in this function. All
+  // three git reads SUCCEED — only the frame is lost — so falling back to the unresolved path
+  // leaves `source: "git"` with an empty entry map while the tree demonstrably changed. That is
+  // a confident zero, and because observation outranks the declaration it clears the mutation
+  // floor with no critical gate at all.
+  const fx = await gitFixture("realpath-gone");
+  if (!fx) return;
+  fx.write("a.js", "seed\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+  // A symlink whose basename differs from its target, so the resolved and unresolved frames
+  // disagree on EVERY platform — not only where os.tmpdir() is itself a symlink (macOS
+  // /var -> /private/var). Without that the fallback would look correct on Linux.
+  const link = path.join(TMP, "realpath-link");
+  fs.rmSync(link, { force: true });
+  fs.symlinkSync(fx.repo, link);
+
+  // The baseline is taken while the tree is CLEAN, on purpose. From a DIRTY baseline the
+  // fallback's `{}` still differs from `{a.js: …}`, so the delta is non-empty and the run still
+  // finishes `done_unverified` — the terminal assertion below would then pass with or without
+  // the fix. From clean, the fallback yields `{}` on both sides: the actual false zero, reported
+  // as `source: "git"` with terminal `done`.
+  const healthy = await workspaceSnapshot(link);
+  assert.ok(healthy?.entries, JSON.stringify(healthy));
+  assert.deepEqual(Object.keys(healthy.entries), [], JSON.stringify(healthy));
+
+  fx.write("a.js", "dirty\n"); // the mutation a fallback snapshot would miss
+  // A STABLE symlink still observes normally: the frame is resolved twice and the two
+  // resolutions agree, so nothing refuses. This is the row that fails if the guard is written
+  // to refuse every symlinked project rather than only an unstable one.
+  const stable = await workspaceSnapshot(link, healthy.head);
+  assert.deepEqual(Object.keys(stable?.entries ?? {}), ["a.js"], JSON.stringify(stable));
+
+  // realpath is the only caller of its kind inside workspaceSnapshot, so hooking it here is
+  // scheduling, not stubbing: the real syscall runs and the ENOENT below is a real ENOENT.
+  const realpath = fs.promises.realpath;
+  let gonePre, gonePost;
+  try {
+    // (a) the link is gone before the frame is ever pinned
+    fs.promises.realpath = (...a) => { fs.rmSync(link, { force: true }); return realpath(...a); };
+    gonePre = await workspaceSnapshot(link, healthy.head);
+    // (b) ...and gone only AFTER the three git reads returned, which nothing but the second
+    // resolution can catch — the reads all succeeded and the frame died under them.
+    fs.symlinkSync(fx.repo, link);
+    let resolutions = 0;
+    fs.promises.realpath = (...a) => {
+      if (++resolutions === 2) fs.rmSync(link, { force: true });
+      return realpath(...a);
+    };
+    gonePost = await workspaceSnapshot(link, healthy.head);
+  } finally { fs.promises.realpath = realpath; }
+
+  // (1) both refuse — restore the fallback and each is `{}` carrying reason null
+  for (const s of [gonePre, gonePost]) {
+    assert.equal(s.entries, null, JSON.stringify(s));
+    assert.match(s.reason, /could not be resolved/);
+  }
+  // (2) so the delta is unobserved, not an observation of nothing
+  const d = computeDelta({ before: healthy, after: gonePre, declaredFiles: ["a.js"] });
+  assert.equal(d.source, "unobserved", JSON.stringify(d));
+  assert.deepEqual(d.files, [], JSON.stringify(d));
+
+  // (3) the declaration stays authoritative and (4) the ungated mutation cannot finish `done`.
+  // Observation contributes NOTHING here, so only the declared list can hold the floor up.
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], healthy);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a",
+    changedFiles: ["a.js"], snapshot: gonePre });
+  assert.equal(r.observed.source, "unobserved", JSON.stringify(r.observed));
+  assert.deepEqual(r.observed.files, [], JSON.stringify(r.observed));
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+});
+
+await ta("snapshot: a project directory retargeted mid-observation is refused, not re-framed", async () => {
+  // Retarget the symlink after the git reads returned and realpath SUCCEEDS — against a different
+  // repository. With the frame pinned first every read goes through the PHYSICAL root, so a
+  // retarget can no longer by itself re-frame the entry map; this refusal is now defence in depth
+  // over computeDelta's cross-snapshot guard, and it is still the only thing that notices the
+  // caller's path stopped naming the repository we photographed.
+  //
+  // The retarget is scheduled by a real git on PATH, not by hooking realpath: under the old hook
+  // ("on the second realpath call") deleting the guard also deleted the second call, so the
+  // retarget never happened and the row passed vacuously. Here it happens either way.
+  const fx = await gitFixture("retarget-from");
+  const other = await gitFixture("retarget-to");
+  if (!fx || !other) return;
+  fx.write("a.js", "seed\n"); fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+  other.write("b.js", "seed\n"); other.git("add", "-A"); other.git("commit", "-qm", "seed");
+
+  const link = path.join(TMP, "retarget-link");
+  fs.rmSync(link, { force: true });
+  fs.symlinkSync(fx.repo, link);
+  const healthy = await workspaceSnapshot(link); // clean baseline, same reason as the row above
+  assert.ok(healthy?.entries, JSON.stringify(healthy));
+  assert.deepEqual(Object.keys(healthy.entries), [], JSON.stringify(healthy));
+
+  fx.write("a.js", "dirty\n"); // the mutation a re-framed snapshot would miss
+  // Move the link once the status read has returned — i.e. after the reads, which is exactly
+  // where the previous fix was broken. The real binary still runs; only its timing is ours.
+  const restore = gitShim("retarget", { on: "status", when: "after",
+    sh: `rm -f "${link}"; ln -s "${other.repo}" "${link}"` });
+  let s;
+  try { s = await workspaceSnapshot(link, healthy.head); }
+  finally { restore(); }
+
+  // (1) the shim really fired: the link now names the other repository
+  assert.equal(fs.readlinkSync(link), other.repo, fs.readlinkSync(link));
+  // (2) both resolutions succeeded and named different repositories, so it refuses
+  assert.equal(s.entries, null, JSON.stringify(s));
+  assert.match(s.reason, /retargeted/);
+  // (3) the delta is unobserved, not an observation of a repository we never read
+  const d = computeDelta({ before: healthy, after: s, declaredFiles: ["a.js"] });
+  assert.equal(d.source, "unobserved", JSON.stringify(d));
+  assert.deepEqual(d.files, [], JSON.stringify(d));
+  // (4) and the ungated mutation cannot finish `done` on a re-framed zero
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], healthy);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a",
+    changedFiles: ["a.js"], snapshot: s });
+  assert.equal(r.observed.source, "unobserved", JSON.stringify(r.observed));
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+});
+
+await ta("delta: a project swapped between the two snapshots is not a before and an after", async () => {
+  // The frame guard inside workspaceSnapshot holds ONE observation together. Swap the project
+  // between step entry and report and each snapshot is individually honest — two clean trees —
+  // while the PAIR reports `files: []` as a confident `source: "git"` observation and the writes
+  // to the first repository are never looked at. The two are compared by `root`.
+  const from = await gitFixture("swap-from");
+  if (!from) return;
+  from.write("seed.txt", "seed\n");
+  from.git("add", "-A"); from.git("commit", "-qm", "seed");
+  // A CLONE, not a second fixture: it shares HEAD by construction, so the sinceHead term is not
+  // taken and this row cannot pass on the HEAD-diff refusal instead of the one it is testing.
+  const { execFileSync } = await import("node:child_process");
+  const clone = path.join(TMP, "swap-clone");
+  fs.rmSync(clone, { recursive: true, force: true });
+  execFileSync("git", ["clone", "-q", from.repo, clone], { stdio: "pipe" });
+  const link = path.join(TMP, "swap-link");
+  fs.rmSync(link, { force: true });
+  fs.symlinkSync(from.repo, link);
+
+  const before = await workspaceSnapshot(link);
+  from.write("a.js", "written by the worker\n"); // the mutation the swapped frame loses
+  fs.rmSync(link, { force: true });
+  fs.symlinkSync(clone, link);
+  const after = await workspaceSnapshot(link, before.head);
+  // both snapshots are individually clean and individually honest — that is exactly the problem
+  assert.ok(before.entries && after.entries, JSON.stringify({ before, after }));
+  assert.equal(before.head, after.head, JSON.stringify({ before, after }));
+  assert.notEqual(before.root, after.root, JSON.stringify({ before, after }));
+
+  // drop the root comparison and this is `source: "git"` with `files: []` and terminal `done`
+  const d = computeDelta({ before, after, declaredFiles: ["a.js"] });
+  assert.equal(d.source, "unobserved", JSON.stringify(d));
+  assert.match(d.reason, /different repository/);
+  assert.deepEqual(d.files, [], JSON.stringify(d));
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], before);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a",
+    changedFiles: ["a.js"], snapshot: after });
+  assert.equal(r.observed.source, "unobserved", JSON.stringify(r.observed));
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+});
+
+await ta("delta: a project replaced at the same path between the two snapshots is not a before and an after", async () => {
+  // The row above is the `root` witness: two different pathnames, and the root comparison alone
+  // carries it. This row is the `frame` witness, and nothing else in the suite is one — `root`,
+  // `head` and `entries` are all EQUAL across the pair, so filesystem identity is the ONLY field
+  // that differs. Delete `before.frame !== after.frame` from computeDelta and this is the row
+  // that fails.
+  //
+  // The replacement here is PERSISTENT and lands between the two observations, so each snapshot
+  // holds its own frame for the length of its own observation and each is individually honest.
+  // Nothing inside workspaceSnapshot can see this; only the cross-snapshot comparison can.
+  const fx = await gitFixture("frame-witness");
+  if (!fx) return;
+  fx.write("a.js", "seed\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+  // A byte copy of the whole repository, `.git` included: the same HEAD by construction, so the
+  // sinceHead term is not taken and this row cannot pass on the HEAD-diff refusal instead of the
+  // comparison it is testing. Same paths and same content, so `entries` matches too.
+  const copy = path.join(TMP, "frame-witness-copy");
+  const aside = path.join(TMP, "frame-witness-aside");
+  for (const p of [copy, aside]) fs.rmSync(p, { recursive: true, force: true });
+  fs.cpSync(fx.repo, copy, { recursive: true });
+
+  const before = await workspaceSnapshot(fx.repo);
+  fs.writeFileSync(path.join(fx.repo, "a.js"), "written by the worker\n"); // the lost mutation
+  // Swapped at the SAME pathname, so every string on both snapshots stays equal.
+  fs.renameSync(fx.repo, aside);
+  fs.renameSync(copy, fx.repo);
+  const after = await workspaceSnapshot(fx.repo, before.head);
+
+  // both individually clean and individually honest — that is exactly the problem
+  assert.ok(before.entries && after.entries, JSON.stringify({ before, after }));
+  assert.equal(before.root, after.root, JSON.stringify({ before, after }));   // NOT the root case
+  assert.equal(before.head, after.head, JSON.stringify({ before, after }));
+  assert.deepEqual(before.entries, after.entries, JSON.stringify({ before, after }));
+  assert.ok(before.frame && after.frame, JSON.stringify({ before, after })); // neither is null
+  assert.notEqual(before.frame, after.frame, JSON.stringify({ before, after })); // the ONE difference
+
+  // drop the frame comparison and this is `source: "git"` with `files: []` and terminal `done`
+  const d = computeDelta({ before, after, declaredFiles: ["a.js"] });
+  assert.equal(d.source, "unobserved", JSON.stringify(d));
+  assert.match(d.reason, /different repository/);
+  assert.deepEqual(d.files, [], JSON.stringify(d));
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], before);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a",
+    changedFiles: ["a.js"], snapshot: after });
+  assert.equal(r.observed.source, "unobserved", JSON.stringify(r.observed));
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+});
+
+await ta("snapshot: a project directory replaced at the same path mid-observation is refused", async () => {
+  // The window a PATHNAME comparison cannot see, and the reason the frame is filesystem identity.
+  // `status` runs against the real tree; the directory at that same pathname is REPLACED before
+  // identitiesOf hashes anything; every string — projectDir, realpath, root, HEAD — stays equal.
+  // The snapshot then keys the replacement's content to the real tree's status and answers
+  // `source: "git"`, `files: []`, terminal `done`, about a workspace it never compared.
+  const fx = await gitFixture("replace-dir");
+  if (!fx) return;
+  fx.write("a.js", "seed\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+
+  // The baseline is taken DIRTY on purpose. From a clean baseline the swapped-in tree's
+  // `{a.js: hash}` would differ from `{}` and the delta would be non-empty for the wrong reason —
+  // the row would pass without the guard. From dirty, both sides hash "dirty1": the actual zero.
+  fx.write("a.js", "dirty1\n");
+  const healthy = await workspaceSnapshot(fx.repo);
+  assert.deepEqual(Object.keys(healthy?.entries ?? {}), ["a.js"], JSON.stringify(healthy));
+
+  const copy = path.join(TMP, "replace-dir-copy");
+  const aside = path.join(TMP, "replace-dir-aside");
+  fs.rmSync(copy, { recursive: true, force: true });
+  fs.rmSync(aside, { recursive: true, force: true });
+  fs.cpSync(fx.repo, copy, { recursive: true }); // baseline content, same HEAD, same paths
+  fx.write("a.js", "dirty2\n"); // the mutation the replacement hides
+
+  // AFTER status: git reports a.js off the real (dirty2) tree, then the renames complete before
+  // the child exits, so gitRead resolves only once the swap is done and identitiesOf reads
+  // "dirty1" out of the replacement.
+  const restore = gitShim("replace-dir", { on: "status", when: "after",
+    sh: `mv "${fx.repo}" "${aside}"; mv "${copy}" "${fx.repo}"` });
+  let s;
+  try { s = await workspaceSnapshot(fx.repo, healthy.head); }
+  finally { restore(); }
+
+  assert.ok(fs.existsSync(aside), "the shim did not fire — no swap happened");
+  assert.equal(s.entries, null, JSON.stringify(s));
+  assert.match(s.reason, /replaced at the same path/);
+  const d = computeDelta({ before: healthy, after: s, declaredFiles: ["a.js"] });
+  assert.equal(d.source, "unobserved", JSON.stringify(d));
+  assert.deepEqual(d.files, [], JSON.stringify(d));
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], healthy);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a",
+    changedFiles: ["a.js"], snapshot: s });
+  assert.equal(r.observed.source, "unobserved", JSON.stringify(r.observed));
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+});
+
+await ta("snapshot: a .git replaced at the same path before the reads is refused", async () => {
+  // The same class one level in: the work tree is untouched and the METADATA is swapped, for a
+  // git directory with the same root and the same HEAD whose index hides the edited file. This is
+  // also the structural proof that the frame is pinned BEFORE the reads — pin it after `status`
+  // instead and the swapped inode is the one recorded, so this row fails.
+  const fx = await gitFixture("replace-gitdir");
+  if (!fx) return;
+  fx.write("a.js", "seed\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+
+  const gitdir = path.join(fx.repo, ".git");
+  const hidden = path.join(TMP, "replace-gitdir-hidden");
+  const real = path.join(TMP, "replace-gitdir-real");
+  for (const p of [hidden, real]) fs.rmSync(p, { recursive: true, force: true });
+  fs.cpSync(gitdir, hidden, { recursive: true });
+  // assume-unchanged is a real, documented flag, not a corruption: same root, same HEAD, an index
+  // that makes an edited file invisible to `status`.
+  execFileSync("git", ["--git-dir", hidden, "--work-tree", fx.repo,
+    "update-index", "--assume-unchanged", "a.js"], { stdio: "pipe" });
+
+  const healthy = await workspaceSnapshot(fx.repo);
+  assert.deepEqual(Object.keys(healthy?.entries ?? {}), [], JSON.stringify(healthy));
+  fx.write("a.js", "dirty\n"); // the mutation the swapped index hides
+
+  // BEFORE status, so the swap lands after the pin and before every read that depends on it — and,
+  // via the shim's barrier, after the CONCURRENT `rev-parse HEAD` has returned. Without that
+  // ordering the parallel HEAD child sometimes read the pathname between the two renames, failed,
+  // and the snapshot refused with the unreadable-HEAD reason instead of this one: a green run that
+  // never exercised the guard. The pin is still upstream of the swap, which is what the row is for.
+  const restore = gitShim("replace-gitdir", { on: "status", when: "before",
+    sh: `mv "${gitdir}" "${real}"; mv "${hidden}" "${gitdir}"` });
+  let s;
+  try { s = await workspaceSnapshot(fx.repo, healthy.head); }
+  finally { restore(); }
+
+  assert.ok(fs.existsSync(real), "the shim did not fire — no swap happened");
+  assert.equal(s.entries, null, JSON.stringify(s));
+  assert.match(s.reason, /replaced at the same path/);
+  const d = computeDelta({ before: healthy, after: s, declaredFiles: ["a.js"] });
+  assert.equal(d.source, "unobserved", JSON.stringify(d));
+  assert.deepEqual(d.files, [], JSON.stringify(d));
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], healthy);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a",
+    changedFiles: ["a.js"], snapshot: s });
+  assert.equal(r.observed.source, "unobserved", JSON.stringify(r.observed));
+  assert.equal(r.terminal, "done_unverified", JSON.stringify(r));
+});
+
+await ta("snapshot: KNOWN LIMITATION — a directory replaced during hashing and restored before the recheck is NOT caught", async () => {
+  // THIS ROW PINS A HOLE, NOT A GUARD. Every assertion below states what the observation
+  // currently does, and what it currently does is MISS this case. Read `source: "git"` and
+  // `terminal: "done"` here as the documented limitation they are, not as a passing check.
+  //
+  // The endpoint comparison sees identity at two instants and nothing in between. Replace the
+  // project directory after `status`, let identitiesOf hash the replacement, then put the
+  // original back before the final realpath/stat: both endpoints observe the SAME inode, the
+  // frame holds, and the snapshot answers `source: "git"` with `files: []` about content it
+  // never read — the declared write surviving only as `phantom`, and an ungated mutation
+  // finishing `done`.
+  //
+  // What closing it would take: reads bound to a directory HANDLE instead of re-resolved from a
+  // pathname — openat(2) semantics. Node exposes none of it. `fs.openat` and
+  // `fs.promises.openat` are undefined (verified on v22.22.3), `fs.Dir` offers only
+  // read/readSync/close/entries with no way to open a file relative to the handle, and there is
+  // no /proc/self/fd on macOS to fall back through. `process.chdir` anchors the top component
+  // only — every nested component and `$GIT_DIR` still resolve by name, git's own opens cannot
+  // be anchored at all, and it costs global process state in a server that observes
+  // concurrently — so it narrows the hole rather than closing it.
+  //
+  // So this is a NAMED BOUNDARY, documented in run-store.md and anti-self-certification.md
+  // beside in-place `$GIT_DIR/index` replacement, and for the same reason: it takes an actor
+  // manipulating the filesystem DURING the observation to hide a write, and any guard strong
+  // enough to catch that also refuses on ordinary operation, which makes the observation inert.
+  // If a runtime ever offers anchored reads, this row is the one that fails, and that failure is
+  // the signal to close it rather than to update the expectation.
+  const fx = await gitFixture("aba-restore");
+  if (!fx) return;
+  fx.write("a.js", "seed\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+  fx.write("a.js", "dirty1\n");
+  const healthy = await workspaceSnapshot(fx.repo);
+  assert.deepEqual(Object.keys(healthy?.entries ?? {}), ["a.js"], JSON.stringify(healthy));
+
+  // An EMPTY commit, so the observation takes the `previousHead !== head` branch and runs one
+  // more git process AFTER the hashing. That is the only seam between identitiesOf and the
+  // recheck, and therefore the only place a real out-of-process actor can put the tree back —
+  // which is the point: the restore is scheduled by the filesystem, not by a stubbed function.
+  // Empty, so the diff is empty and `sinceHead` stays [] rather than manufacturing a delta this
+  // case is not about.
+  fx.git("commit", "--allow-empty", "-qm", "tick");
+  const copy = path.join(TMP, "aba-restore-copy");
+  const aside = path.join(TMP, "aba-restore-aside");
+  for (const p of [copy, aside]) fs.rmSync(p, { recursive: true, force: true });
+  fs.cpSync(fx.repo, copy, { recursive: true }); // holds dirty1, and BOTH commits so the diff works
+  fx.write("a.js", "dirty2\n"); // the mutation the round trip hides
+
+  // `-z` is on the argv of `status` and of `diff` and of NEITHER rev-parse, so one shim addresses
+  // both windows: swap the replacement in after the status read, swap the original back after
+  // the HEAD diff.
+  const restore = gitShim("aba-restore", { on: "-z", when: "after", sh:
+    `case " $* " in ` +
+    `*" status "*) mv "${fx.repo}" "${aside}"; mv "${copy}" "${fx.repo}" ;; ` +
+    `*" diff "*) mv "${fx.repo}" "${copy}"; mv "${aside}" "${fx.repo}" ;; esac` });
+  let s;
+  try { s = await workspaceSnapshot(fx.repo, healthy.head); }
+  finally { restore(); }
+
+  // (1) both windows fired: the observation hashed the REPLACEMENT's dirty1 — byte-identical to
+  // the baseline identity — while the file back on disk is the original's dirty2.
+  assert.equal(fs.readFileSync(path.join(fx.repo, "a.js"), "utf8"), "dirty2\n");
+  assert.equal(s.entries?.["a.js"], healthy.entries["a.js"], JSON.stringify(s));
+  // (2) ...and NOTHING refused: same frame at both endpoints, no reason. The limitation, asserted.
+  assert.equal(s.reason, null, JSON.stringify(s));
+  assert.equal(s.frame, healthy.frame, JSON.stringify(s));
+  assert.deepEqual(s.sinceHead, [], JSON.stringify(s));
+  // (3) so the pair is a CONFIDENT ZERO: observed, empty, the declared write only a phantom
+  const d = computeDelta({ before: healthy, after: s, declaredFiles: ["a.js"] });
+  assert.equal(d.source, "git", JSON.stringify(d));
+  assert.equal(d.reason, null, JSON.stringify(d));
+  assert.deepEqual(d.files, [], JSON.stringify(d));
+  assert.deepEqual(d.phantom, ["a.js"], JSON.stringify(d));
+  // (4) and end to end the ungated write finishes `done`, not `done_unverified`. Pinned so that
+  // closing the hole surfaces here as a failing expectation rather than as silence.
+  const { runId } = await deltaRun([{ phase: "execute", role: "coder" }], healthy);
+  const r = opStepReport({ runId, phase: "execute", summary: "wrote a",
+    changedFiles: ["a.js"], snapshot: s });
+  assert.equal(r.observed.source, "git", JSON.stringify(r.observed));
+  assert.deepEqual(r.observed.files, [], JSON.stringify(r.observed));
+  assert.equal(r.terminal, "done", JSON.stringify(r));
+});
+
+await ta("snapshot: an ordinary project still observes — symlinked tmp, symlinked parent, relative path, plain directory", async () => {
+  // The negative controls. A guard that refuses an ordinary project is not a safe guard, it is an
+  // INERT feature: every phase would degrade to the declared list and the mutation floor would go
+  // back to trusting the producer. All four halves must observe `a.js` with `reason: null`.
+  const fx = await gitFixture("ordinary");
+  if (!fx) return;
+  fx.write("a.js", "seed\n");
+  fx.git("add", "-A"); fx.git("commit", "-qm", "seed");
+  fx.write("a.js", "dirty\n");
+
+  // (b) a symlinked PARENT: the repo itself is a real directory reached through a link.
+  const parentLink = path.join(TMP, "ordinary-parent");
+  fs.rmSync(parentLink, { force: true });
+  fs.symlinkSync(TMP, parentLink);
+
+  const cases = {
+    // (a) os.tmpdir() is itself a symlink on macOS (/var -> /private/var), so this path resolves
+    // to a DIFFERENT string than it names. The two nevertheless stat to the identical {dev, ino}
+    // — one directory, two spellings — and the guard only refuses when identity CHANGES.
+    "symlinked tmp": fx.repo,
+    "symlinked parent": path.join(parentLink, path.basename(fx.repo)),
+    // (c) relative, resolved against the real cwd — no chdir, no global state. Proves the frame is
+    // stat'd on the RESOLVED projectRoot and not on the caller's string.
+    "relative path": path.relative(process.cwd(), fx.repo),
+    // (d) fully resolved, no link anywhere in it
+    "plain directory": fs.realpathSync(fx.repo),
+  };
+  for (const [label, dir] of Object.entries(cases)) {
+    const s = await workspaceSnapshot(dir);
+    assert.deepEqual(Object.keys(s?.entries ?? {}), ["a.js"], `${label}: ${JSON.stringify(s)}`);
+    assert.equal(s.reason, null, `${label}: ${JSON.stringify(s)}`);
+  }
 });
 
 console.log(`\n${n} checks passed`);

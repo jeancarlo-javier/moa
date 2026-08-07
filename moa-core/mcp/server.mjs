@@ -12,7 +12,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import crypto from "node:crypto";
-import { spawn } from "node:child_process";
+import { spawn, execFile } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import YAML from "yaml";
 import { z } from "zod";
@@ -64,12 +64,42 @@ const zRole = z.object({
   differentModelFrom: z.string().optional(),
 }).strict();
 
+// The dialect lives in ONE function: schema/config.schema.json mirrors it, zStep enforces it,
+// globToRegExp compiles what survives it. Returns null when the pattern is legal, else the
+// reason it is not. Rejecting loudly beats compiling a pattern that can only ever match
+// nothing — a silent write-set is a policy that is not there.
+function writeSetPatternError(pattern) {
+  if (typeof pattern !== "string" || pattern === "") return "must be a non-empty string";
+  if (pattern.includes("\\")) return "must use '/' as its separator — '\\' is not a path separator here";
+  if (pattern.startsWith("/")) return "must be project-relative and must not start with '/'";
+  const segments = pattern.split("/");
+  if (segments[segments.length - 1] === "") segments.pop(); // trailing '/' is the '/**' shorthand
+  if (segments.length === 0) return "must name at least one path segment";
+  for (const segment of segments) {
+    if (segment === "") return "must not contain an empty path segment ('//')";
+    if (segment === "." || segment === "..") return "must not contain a '.' or '..' segment";
+    if (segment.includes("**") && segment !== "**")
+      return "may use '**' only as a whole path segment ('a/**/b', not 'a**b')";
+  }
+  return null;
+}
+
+// The ONE step shape. Used by zPipeline (config-loaded pipelines) and by opRunStart's ad-hoc
+// validation as-is, and by the moa_run_start tool registration via .strip() — the boundary must
+// keep accepting unknown keys. It was duplicated inline at the MCP boundary, and the copies had
+// already drifted — a field added to only one of them is silently stripped from every adaptive
+// run before opRunStart ever sees it.
 const zStep = z.object({
   phase: z.string(),
   role: z.string(),
   gate: z.enum(["none", "standard", "critical"]).optional(),
   fanout: z.enum(["none", "byDisjointWriteSet"]).optional(),
   loopBackTo: z.string().optional(),
+  writeSet: z.array(z.string().superRefine((p, ctx) => {
+    const problem = writeSetPatternError(p);
+    if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `writeSet pattern '${p}' ${problem}` });
+  })).optional()
+    .describe("static policy: glob patterns this step's writes must stay within. Anchored; '*' does not cross '/', '**' does and must be a whole segment; no negation, no classes; '..', '//', '\\' and a leading '/' are rejected. Advisory — a write outside them is reported to the gate, never blocked."),
 }).strict();
 
 const zPipeline = z.object({
@@ -466,6 +496,22 @@ function independenceGroup(id) {
 }
 const shortName = (id) => String(id).split("/").pop().split(":")[0];
 
+// true = one model; false = confidently two; null = cannot tell. independenceGroup collapses
+// the provider prefix and the :effort suffix but NOT vendor deployment ids (see
+// references/anti-self-certification.md) — 'us.anthropic.claude-sonnet-4-6-v1' and
+// 'claude-sonnet-4-6' are one model wearing two names. When one group CONTAINS the other, that
+// is exactly the decoration shape, so say indeterminate rather than manufacture a mismatch: a
+// false alarm here would teach the conductor to ignore the field.
+// ponytail: substring test, not an alias table. The alias table is the real fix and belongs
+// with the grader, not with an advisory label. Its ceiling: gpt-5 vs gpt-5.5 reads
+// indeterminate. Losing a true mismatch is the correct trade for never inventing a false one.
+export function sameModel(a, b) {
+  if (!a || !b) return null;
+  const [x, y] = [independenceGroup(a), independenceGroup(b)];
+  if (x === y) return true;
+  return (x.includes(y) || y.includes(x)) ? null : false;
+}
+
 async function discoverBindingInventories(bindings) {
   const results = await Promise.all(bindings.map(async (profile) => ({
     profile,
@@ -582,6 +628,377 @@ const state = { loaded: null, resolved: null };
 function workDirOf(loaded) {
   const wd = loaded.config?.runtime?.workDir ?? ".moa";
   return path.join(loaded.projectDir, wd);
+}
+
+// --- workspace observation ------------------------------------------------
+// The mutation floor's input. Every function here is best-effort and NEVER throws: a missing
+// git binary, a non-repo directory, a rewritten history, an unreadable path or a slow
+// filesystem all degrade to "we did not observe this", and the floor falls back to the
+// DECLARED changedFiles. moa runs research and design tasks in directories that are not
+// repositories; that path must stay exactly as it is today.
+//
+// There are exactly THREE return shapes, and the difference is load-bearing:
+//   null                                          -> not a repository / git unusable
+//   { root, head, entries: null, frame, reason }  -> a repository we REFUSE to claim we observed
+//   { root, head, entries, sinceHead, frame }     -> observed
+// Anything that is not the third shape becomes `source: "unobserved"` downstream. There is no
+// fourth shape and no "partial" observation: a snapshot we cannot stand behind is not evidence.
+
+const SNAPSHOT_MAX_PATHS = 2000; // ponytail: above this the map costs more to persist than it
+// is worth (it is rewritten into manifest.json on every step report); refuse rather than grow
+// the manifest without bound. Raise it if a real pipeline trips it.
+
+const IDENTITY_CONCURRENCY = 32; // ponytail: enough open files to keep a disk busy, far under
+// any default fd limit even with spawned workers holding descriptors. Sequential would serialize
+// 2000 round trips into every step report; unbounded would EMFILE, which under the rule below
+// refuses the whole snapshot — so the bound is correctness, not just throughput.
+
+function gitRead(args, cwd) {
+  return new Promise((resolve) => {
+    execFile("git", args, {
+      cwd,
+      encoding: "utf8",
+      timeout: 10_000,      // a pathological repo must not stall every step report
+      maxBuffer: 8 << 20,   // porcelain of a very dirty tree; overflow errors -> null -> refused
+      windowsHide: true,
+    }, (error, stdout) => resolve(error ? null : stdout));
+  });
+}
+
+const nulSplit = (text) => text.split("\0").filter((record) => record.length > 0);
+
+// The one thing we cannot honestly answer. Distinct from `null` (the path is GONE) and from a
+// hash. One of these anywhere refuses the WHOLE snapshot — see identitiesOf.
+const UNOBSERVABLE = Symbol("unobservable");
+
+// Content identity of one working-tree path. NOT a git blob hash: identity is all the delta
+// needs, and hashing in Node removes `git hash-object`'s argv limit, its per-batch failure on
+// directories/submodules/dangling symlinks, and one subprocess round trip.
+//
+//   ENOENT            -> null. The ONLY benign failure, and the whole reason the map is keyed
+//                        by identity: a deleted path is a CHANGE, not an absence.
+//   any other error   -> UNOBSERVABLE. EACCES, EIO, EMFILE, ELOOP, ERR_FS_FILE_TOO_LARGE.
+//                        Returning null for these would claim we watched a file vanish when we
+//                        merely failed to read it, and computeDelta would answer source:"git"
+//                        about a workspace it never saw.
+//   non-regular entry -> UNOBSERVABLE. A directory here is a DIRTY SUBMODULE: porcelain reports
+//                        a whole nested repository as one path, and any constant token derived
+//                        from lstat (mode, size, mtime-free) is IDENTICAL before and after a
+//                        commit inside it. That is precisely the path-set bug this design
+//                        exists to kill, so refuse instead of emitting a confident constant.
+//                        Same for fifos and sockets, which have no content to hash.
+//
+// ponytail: reads the whole file. Fine for source trees; the ceiling is a file larger than
+// Buffer's max length, which refuses the snapshot rather than lying about it. Stream it if a
+// real repository ever trips that.
+async function identityOf(abs) {
+  try {
+    const stat = await fs.promises.lstat(abs);
+    if (stat.isSymbolicLink()) return `symlink:${await fs.promises.readlink(abs)}`;
+    if (!stat.isFile()) return UNOBSERVABLE;
+    return crypto.createHash("sha256").update(await fs.promises.readFile(abs)).digest("hex");
+  } catch (error) {
+    return error?.code === "ENOENT" ? null : UNOBSERVABLE;
+  }
+}
+
+// Bounded fan-out over [relPath, absPath] pairs. Returns the identity map, or null when ANY
+// path was unobservable. Object.create(null) is not decoration: `entries["__proto__"] = hash`
+// on a `{}` literal invokes the prototype setter and the entry vanishes, so a repository file
+// named `__proto__` would silently drop out of observation. A null-prototype object has no
+// such setter, and JSON.stringify/JSON.parse round-trip it as a real own key (verified).
+async function identitiesOf(pairs) {
+  const entries = Object.create(null);
+  let cursor = 0, refused = false;
+  const worker = async () => {
+    while (cursor < pairs.length && !refused) {
+      const [rel, abs] = pairs[cursor++];
+      const identity = await identityOf(abs);
+      if (identity === UNOBSERVABLE) { refused = true; return; }
+      entries[rel] = identity;
+    }
+  };
+  await Promise.all(Array.from(
+    { length: Math.min(IDENTITY_CONCURRENCY, pairs.length) }, worker));
+  return refused ? null : entries;
+}
+
+// Repository-root-relative -> projectDir-relative POSIX, or null when the path escapes
+// projectDir (a sibling package in a monorepo). See Correction 3: porcelain paths are ALWAYS
+// repo-root-relative, projectDir is the CONFIG's directory, and they are not the same frame.
+function toProjectRel(projectDir, abs) {
+  const rel = path.relative(projectDir, abs);
+  if (!rel || rel === ".." || rel.startsWith(".." + path.sep) || path.isAbsolute(rel)) return null;
+  return rel.split(path.sep).join("/");
+}
+
+// Filesystem identity of the repository frame: the resolved work-tree root and the ABSOLUTE git
+// directory, as one comparable string. `{dev, ino}` is the whole point — a pathname comparison
+// cannot see a directory SWAPPED OUT from under it at the same path, which is how three previous
+// fixes each closed only the shape they were shown (symlink removed, symlink retargeted, inode
+// replaced). stat, not lstat: `root` is already realpath-resolved so the two agree there, and a
+// git directory reached through a symlink must be identified by the DIRECTORY, not by the link —
+// lstat would happily hold still while the target was replaced. `bigint: true` because an inode
+// number above 2^53 loses precision as a double, and two different inodes comparing EQUAL is the
+// one error direction this guard cannot afford. A string, not an object, so it survives the
+// manifest.json round trip and compares with `!==` like every other identity in this file.
+async function frameOf(root, gitDir) {
+  try {
+    const [r, g] = await Promise.all([
+      fs.promises.stat(root, { bigint: true }),
+      fs.promises.stat(gitDir, { bigint: true }),
+    ]);
+    return `${r.dev}:${r.ino}|${g.dev}:${g.ino}`;
+  } catch { return null; }
+}
+
+// path -> content identity, for the paths git currently reports as dirty, keyed RELATIVE TO
+// projectDir. A phase's mutations are the paths whose identity CHANGED between entry and
+// report — appeared, disappeared, or different hash. Path presence alone is not enough: a file
+// dirty at entry and edited again is still dirty at report, so a set difference reports nothing
+// while the file demonstrably changed. That is the shape of the 139333f bug.
+//
+// The map is SPARSE — it holds only dirty paths — and that is correct for all four cases:
+//   clean -> edited   : absent in before, present in after     -> changed
+//   dirty -> edited   : different hash                         -> changed
+//   dirty -> reverted : present in before, absent in after     -> changed
+//   dirty -> untouched: same hash                              -> not changed
+//
+// `sinceHead` carries the paths a phase COMMITTED, which leave the working tree clean and are
+// therefore invisible to status. Pass the previous snapshot's head to populate it.
+export async function workspaceSnapshot(projectDir, previousHead = null) {
+  if (!projectDir) return null;
+
+  // `--show-toplevel` is PHYSICAL (symlinks resolved) while projectDir is whatever the caller
+  // walked to — and on macOS os.tmpdir() alone is enough to differ (/var -> /private/var). Left
+  // unresolved, every `path.relative(projectDir, <physical abs>)` escapes, toProjectRel drops
+  // the whole tree, and the snapshot reports `source: "git"` with ZERO entries: a confident
+  // observation of a workspace we never actually compared. Same frame-mismatch class as the
+  // monorepo case below, so it gets the same answer — compare like with like.
+  //
+  // Falling back to the unresolved projectDir would produce EXACTLY that confident zero: the git
+  // reads have already succeeded, so the snapshot would still be `source: "git"` with an empty
+  // entry map while the tree demonstrably changed — and because observation outranks the
+  // declaration, a mutating phase could clear the mutation floor with no gate at all. So the
+  // frame is PINNED FIRST and git is read against the pinned physical path.
+  const projectRoot = await fs.promises.realpath(projectDir).catch(() => null);
+  if (projectRoot === null)
+    return { root: null, head: null, entries: null, sinceHead: [], frame: null,
+      reason: "the project directory could not be resolved" };
+
+  // The FRAME is established before the observation and re-validated after ALL of it. Two reads,
+  // in parallel, kept SEPARATE on purpose: `rev-parse --show-toplevel --absolute-git-dir` would
+  // return both on two lines, and a repository path containing a newline would then silently
+  // truncate `root` — which drops every path through toProjectRel and produces exactly the
+  // confident zero this function exists to kill. Two processes, one round trip, no parsing.
+  //
+  // `--absolute-git-dir` and not `--git-dir`: the latter prints a RELATIVE `.git` from the
+  // toplevel, and it names the wrong directory in the two cases that matter — a linked worktree,
+  // whose per-worktree admin dir holds the `index` and `HEAD` that decide whether a file looks
+  // clean, and a submodule, whose `.git` is a gitfile. Synthesizing `join(root, ".git")` is worse
+  // still: in a worktree that is a FILE, so stat would pin the pointer, not the metadata.
+  const [rootOut, gitDirOut] = await Promise.all([
+    gitRead(["rev-parse", "--show-toplevel"], projectRoot),
+    gitRead(["rev-parse", "--absolute-git-dir"], projectRoot),
+  ]);
+  if (rootOut === null || gitDirOut === null) return null;
+  const root = rootOut.trim(), gitDir = gitDirOut.trim();
+  // A git old enough not to know --absolute-git-dir echoes the flag back instead of failing.
+  if (!path.isAbsolute(root) || !path.isAbsolute(gitDir)) return null;
+
+  let head = null;
+  // projectRoot, not root: projectRoot is the directory the observation is SCOPED to, which in a
+  // monorepo can be `<root>/packages/api`. Pinning it also catches a replacement of the repo root,
+  // because re-stat-ing the projectRoot pathname walks through the new root onto a new inode;
+  // pinning `root` alone would miss a replacement of the scoped subdirectory.
+  const frame = await frameOf(projectRoot, gitDir);
+  // `let head` above, so a refusal raised after the HEAD read still carries the real head.
+  const refuse = (reason) => ({ root, head, entries: null, sinceHead: [], frame, reason });
+  if (frame === null) return refuse("the repository identity could not be read");
+
+  const [statusOut, headOut] = await Promise.all([
+    // porcelain v1 paths are ALWAYS repository-root-relative regardless of cwd and of
+    // status.relativePaths (verified against git 2.49) — hence --show-toplevel above. `-- .`
+    // scopes the walk to projectDir, which matters in a monorepo whose .moa.yml is not at the
+    // repo root. -z because v1 quotes paths with spaces and renders renames as `old -> new`.
+    gitRead(["status", "--porcelain=v1", "-z", "--untracked-files=all", "--", "."], projectRoot),
+    gitRead(["rev-parse", "HEAD"], projectRoot), // fails on an UNBORN repo and on a BROKEN one
+  ]);
+  if (statusOut === null) return null;
+  head = headOut ? headOut.trim() : null;
+
+  // `head: null` has exactly ONE honest meaning: the repository has no commits yet. But gitRead
+  // collapses every failure to null, so a timeout, an I/O error or a corrupt ref arrives in the
+  // same shape as an unborn repo — and each of those would skip the sinceHead term below and let
+  // a committed-and-clean phase report zero mutations as a CONFIDENT observation. So a failed
+  // HEAD read is not accepted, it is CONFIRMED: `rev-list --all --max-count=1` succeeds with
+  // empty output on a genuinely unborn repo and prints a sha once anything is committed.
+  // Verified on git 2.49: unborn -> rev-parse HEAD exit 128, rev-list exit 0 with no stdout;
+  // a repo whose branch ref holds garbage -> rev-parse exit 128 AND rev-list exit 128, while
+  // --show-toplevel and status both still exit 0. That second case is the one this guard exists
+  // for, and it is the only shape that reaches the refusal.
+  if (headOut === null) {
+    const anyCommit = await gitRead(["rev-list", "--all", "--max-count=1"], projectRoot);
+    if (anyCommit === null || anyCommit.trim() !== "")
+      return refuse("HEAD could not be read and the repository was not confirmed to be unborn");
+  }
+
+  // Records are `XY <path>` NUL-terminated. R (rename) and C (copy) emit a SECOND record with
+  // the counterpart path and no status prefix. We consume it and keep BOTH paths as candidates:
+  // which of the two is the new one does not matter, because identityOf assigns the hash to
+  // whichever exists and `null` to whichever does not.
+  const records = nulSplit(statusOut);
+  const candidates = [];
+  for (let i = 0; i < records.length; i++) {
+    const record = records[i];
+    if (record.length < 4) continue;
+    const status = record.slice(0, 2);
+    candidates.push(record.slice(3));
+    if (/[RC]/.test(status) && i + 1 < records.length) candidates.push(records[++i]);
+  }
+  if (candidates.length > SNAPSHOT_MAX_PATHS)
+    return refuse(`more than ${SNAPSHOT_MAX_PATHS} dirty paths`);
+
+  const scoped = [];
+  for (const repoRel of candidates) {
+    const abs = path.resolve(root, repoRel);
+    const rel = toProjectRel(projectRoot, abs);
+    if (rel) scoped.push([rel, abs]); // outside projectDir: out of scope, documented boundary
+  }
+  const entries = await identitiesOf(scoped);
+  if (!entries)
+    return refuse("a dirty path could not be identified — unreadable, or a directory git reports as a single path (a dirty submodule)");
+
+  // Committed-and-clean: the paths HEAD moved over since the previous snapshot. A failed diff
+  // (rewritten history, unreachable commit) means we know HEAD moved and cannot see what — say
+  // so rather than report an empty delta.
+  let sinceHead = [];
+  if (previousHead && head && previousHead !== head) {
+    const diff = await gitRead(["diff", "--name-only", "-z", previousHead, head, "--", "."], projectRoot);
+    if (diff === null) return refuse("HEAD moved and the diff against the previous HEAD failed");
+    sinceHead = nulSplit(diff)
+      .map((repoRel) => toProjectRel(projectRoot, path.resolve(root, repoRel)))
+      .filter(Boolean);
+  }
+
+  // The frame is re-validated AFTER EVERY READ — status, the identity reads, and the HEAD diff —
+  // and not one line earlier. A check above `identitiesOf` cannot see the window this function
+  // exists to close: the pathname resolves, the git reads succeed, and the directory at that
+  // pathname is REPLACED before the contents are hashed, so the snapshot keys one tree's
+  // photograph to another tree's status and reports `files: []` about a workspace it never
+  // compared. Both checks are needed and neither subsumes the other: a retarget moves the
+  // pathname while the old directory lives on, a replacement holds the pathname still while the
+  // directory underneath changes. Identity is the only thing that sees the second one.
+  //
+  // The pathname comparison is physical-to-physical on purpose, and the identity comparison only
+  // refuses when identity CHANGES: a stable symlink resolves to the same target twice and stats
+  // to the same inode twice, so an ordinary project — including macOS's /var -> /private/var —
+  // observes normally. A frame we cannot establish, or cannot hold for the length of one
+  // observation, is an observation we cannot make, so it refuses like every other failure here.
+  //
+  // NAMED BOUNDARY — what this cannot see: two ENDPOINTS, and nothing between them. A directory
+  // replaced after the pin and restored before this recheck (ABA) stats identical at both ends,
+  // so the frame holds and the snapshot answers `source: "git"` over content it never read.
+  // Closing it needs every read bound to a directory HANDLE instead of re-resolved from a
+  // pathname — `openat` semantics Node does not expose (no fs.openat, fs.Dir cannot open a file
+  // relative to itself, no /proc/self/fd on macOS), and git's own opens are unanchorable from
+  // here regardless. A pathname-based guard strong enough to catch it refuses on ordinary
+  // operation, which is inert, not safe — the same disposition as in-place `$GIT_DIR/index`
+  // replacement. Documented in run-store.md and anti-self-certification.md and pinned by the
+  // `KNOWN LIMITATION` row in test.mjs. It is NOT a refusal reason: nothing below fires.
+  const recheck = await fs.promises.realpath(projectDir).catch(() => null);
+  if (recheck === null) return refuse("the project directory could not be resolved");
+  if (recheck !== projectRoot)
+    return refuse("the project directory was retargeted while it was being observed");
+  if (await frameOf(projectRoot, gitDir) !== frame)
+    return refuse("the repository was replaced at the same path while it was being observed");
+
+  return { root, head, entries, sinceHead, frame, reason: null };
+}
+
+// Pure. Takes two snapshots and the declaration, returns what the floor should believe.
+// `excludeRel` is the run store, already converted to a projectDir-relative POSIX prefix by
+// excludeRelFor() — porcelain is repo-relative and workDirOf() is absolute, so comparing them
+// directly silently matches nothing.
+export function computeDelta({ before, after, declaredFiles = [], excludeRel = null }) {
+  const unobserved = (reason) => ({ source: "unobserved", reason, files: [], undeclared: [], phantom: [] });
+  if (!before) return unobserved("no snapshot at step entry");
+  if (!after) return unobserved("workspace not observable at report time");
+  // One refusal shape, one branch. Truncation, an unreadable path, a dirty submodule, an
+  // unconfirmed HEAD read and a failed HEAD diff all arrive here carrying their own reason.
+  if (!before.entries) return unobserved(`at step entry: ${before.reason ?? "workspace not observable"}`);
+  if (!after.entries) return unobserved(`at report time: ${after.reason ?? "workspace not observable"}`);
+  // Two photographs of DIFFERENT repositories are not a before and an after. workspaceSnapshot
+  // holds the frame together WITHIN one observation; only this holds it together ACROSS the pair.
+  // A project directory retargeted between step entry and report otherwise compares repository
+  // A's baseline against repository B's report — two individually honest, individually clean
+  // trees — and reports `files: []` as a confident `source: "git"` observation while the worker's
+  // writes to A are never looked at. Reproduced; same confident zero, one frame wider.
+  //
+  // `root` catches a retarget; `frame` catches the same directory pathname holding a DIFFERENT
+  // directory at report time — same string, different inode, two unrelated trees. A snapshot
+  // injected without a frame compares unequal to a real one and degrades to unobserved, which is
+  // the safe direction: a missing field must not silently switch the guard off.
+  if (before.root !== after.root || before.frame !== after.frame)
+    return unobserved("the project resolved to a different repository between step entry and report");
+
+  // A snapshot read back from manifest.json has Object.prototype, so a bare `entries[p]` on an
+  // absent key can return an inherited method. hasOwn keeps the comparison to real entries.
+  const idOf = (entries, p) => (Object.hasOwn(entries, p) ? entries[p] : undefined);
+  const inScope = (p) => !excludeRel || !(p === excludeRel || p.startsWith(excludeRel + "/"));
+  const files = new Set();
+  // Symmetric difference over content identity. An absent key reads `undefined`, which is
+  // distinct from the `null` a deleted path carries — so a deletion is a change.
+  for (const p of new Set([...Object.keys(before.entries), ...Object.keys(after.entries)]))
+    if (idOf(before.entries, p) !== idOf(after.entries, p) && inScope(p)) files.add(p);
+  // A worker that committed its work left a clean tree; the HEAD diff is the only witness.
+  for (const p of after.sinceHead ?? []) if (inScope(p)) files.add(p);
+
+  const declared = new Set(declaredFiles.map((f) => String(f).split(path.sep).join("/")));
+  return {
+    source: "git",
+    reason: null,
+    files: [...files].sort(),
+    undeclared: [...files].filter((p) => !declared.has(p)).sort(),
+    phantom: [...declared].filter((p) => !files.has(p)).sort(),
+  };
+}
+
+// workDirOf() is absolute (`path.join(projectDir, runtime.workDir)`), snapshot keys are
+// projectDir-relative. A workDir configured OUTSIDE the project (`workDir: ../shared`) must
+// exclude NOTHING — returning "" or ".." here would prefix-match every path and blind the
+// observation completely, which is the failure mode worth guarding against. Called with the
+// RUN's projectDir; if a different project is loaded the relative path escapes and we exclude
+// nothing, which is the safe direction.
+function excludeRelFor(projectDir) {
+  if (!state.loaded) return null;
+  return toProjectRel(projectDir, workDirOf(state.loaded));
+}
+
+// Compiles what writeSetPatternError already accepted: anchored, '*' does not cross '/', '**'
+// crosses and is always a whole segment, everything else literal. Escape every regex
+// metacharacter, then re-open exactly the two wildcards.
+export function globToRegExp(pattern) {
+  const normalized = pattern.endsWith("/") ? pattern + "**" : pattern;
+  const body = normalized.split("/").map((segment) =>
+    segment === "**" ? "\0DEEP\0"
+      : segment.replace(/[.*+?^${}()|[\]\\]/g, "\\$&").replaceAll("\\*", "[^/]*")
+  ).join("/");
+  // a leading/trailing '**' segment must also swallow its own separator
+  const source = body
+    .replaceAll("\0DEEP\0/", "(?:.*/)?")
+    .replaceAll("/\0DEEP\0", "(?:/.*)?")
+    .replaceAll("\0DEEP\0", ".*");
+  return new RegExp(`^${source}$`);
+}
+
+// Advisory. A path matching no pattern is reported to the gate, which decides whether the
+// excursion is legitimate. It NEVER blocks — a policy that halts a run on a plausible-looking
+// glob is a policy that gets deleted. Patterns reaching here already passed zStep.
+function writeSetViolations(files, patterns) {
+  if (!Array.isArray(patterns) || patterns.length === 0) return [];
+  const matchers = patterns.map(globToRegExp);
+  return files.filter((file) => !matchers.some((re) => re.test(file)));
 }
 
 // --- operations -----------------------------------------------------------
@@ -1097,14 +1514,19 @@ function publicSpawn(job) {
   if (JOB_STATUS[job.status]) return { ...base, failure: job.failure, durationMs: job.durationMs };
   return base;
 }
-function latestSpawnForCurrentStep(manifest) {
+// `attempt` narrows the lookup to one pass through the step: REVISE and ERROR re-enter a phase
+// without changing stepIndex, so a completed job from attempt 1 would otherwise read as
+// evidence about attempt 2. Omit it (opSpawnStatus does) to recover the latest job for the
+// step whatever attempt produced it — that is a recovery read, not an evidence read.
+function latestSpawnForCurrentStep(manifest, { attempt } = {}) {
   const dir = spawnDir(manifest.runId);
   let files = [];
   try { files = fs.readdirSync(dir).filter((name) => name.endsWith(".json")); }
   catch { return null; }
   return files
     .map((name) => JSON.parse(fs.readFileSync(path.join(dir, name), "utf8")))
-    .filter((job) => job.stepIndex === manifest.current)
+    .filter((job) => job.stepIndex === manifest.current
+      && (attempt === undefined || (job.attempt ?? 0) === attempt))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0] ?? null;
 }
 
@@ -1158,6 +1580,7 @@ function describeStep(manifest, i) {
   const out = {
     index: i, phase: s.phase, role: s.role, gate,
     loopBackTo: s.loopBackTo ?? null,
+    writeSet: s.writeSet ?? null,
     isMaster,
   };
   if (r) {
@@ -1186,12 +1609,19 @@ function describeStep(manifest, i) {
       out.blocked = "verification_unavailable";
       out.note = "strict mode: a critical gate with no different-model verifier halts — pin a different model, connect a tool (/moa learn-tool), or override";
     }
+    // Advisory ONLY. It never touches grade, pass, or the strict halt above: a completed spawn
+    // proves a route returned a result, not that it authored the artifact, and grading on it
+    // would be a new lie rather than a fixed one. producerFor() above still reads the DECLARED
+    // producerModel and nothing else.
+    const prodRec = prod ? manifest.phases.findLast((p) => p.phase === prod.phase) : null;
+    out.independence.producerObservation =
+      prodRec?.routeObservation?.source === "spawn-record" ? "observed-route" : "declared";
     out.verdictRequired = true;
   }
   return out;
 }
 
-export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } = {}) {
+export function opRunStart({ task, pipeline, steps, masterModel, masterFamily, snapshot } = {}) {
   if (!state.loaded) return { error: "call moa_load first" };
   if (!state.resolved) return { error: "call moa_resolve first (pass the host-native model list)" };
   const { config: cfg, dispatch, configPath, configPaths } = state.loaded;
@@ -1241,6 +1671,8 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } 
     roleInstructions: Object.fromEntries(Object.entries(cfg?.roles ?? {}).map(([n, r]) => [n, r.instructions ?? null])),
     masterModel: masterModel ?? null, masterFamily: masterFamily ?? null,
     phases: [], loops: {}, usage: [], status: "running",
+    attempt: 0,
+    snapshotAtStepEntry: snapshot ?? null,
     createdAt: new Date().toISOString(),
   };
   saveRun(manifest);
@@ -1257,7 +1689,7 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily } 
   return { runId, frame, next: describeStep(manifest, 0) };
 }
 
-export function opStepReport({ runId, phase, verdict, summary, changedFiles = [], producerModel, producerFamily, usage } = {}) {
+export function opStepReport({ runId, phase, verdict, summary, changedFiles = [], producerModel, producerFamily, usage, spawnId, snapshot } = {}) {
   const manifest = loadRun(runId);
   if (!manifest) return { error: `unknown runId '${runId}'` };
   if (manifest.status !== "running") return { error: `run is '${manifest.status}' — start a new run`, status: manifest.status };
@@ -1297,12 +1729,67 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
     };
   }
 
+  // What the server saw about which ROUTE ran, which is not the same as which model authored
+  // the artifact — a completed job proves a route returned a result, nothing more. This is
+  // evidence that a declaration is FALSE, never proof that it is true, which is exactly why it
+  // labels the phase and never grades it.
+  let job = null;
+  if (spawnId) {
+    try { job = loadSpawn(runId, spawnId); }
+    catch { return { error: "spawnId is invalid", code: "invalid_spawn_id" }; }
+    // Evidence about a different run or a different phase is a conductor bug worth surfacing.
+    // An attempt mismatch is NOT rejected: `attempt` is a server-internal counter the conductor
+    // is never shown, so refusing a report over it would punish it for information it lacks.
+    // It downgrades to `declared` with the reason recorded instead (Correction 4).
+    if (!job || job.runId !== runId || job.stepIndex !== manifest.current)
+      return { error: `spawn '${spawnId}' does not belong to phase '${phase}' of this run`, code: "spawn_mismatch" };
+    if ((job.attempt ?? 0) !== (manifest.attempt ?? 0)) job = { ...job, staleAttempt: true };
+  } else {
+    job = latestSpawnForCurrentStep(manifest, { attempt: manifest.attempt ?? 0 });
+  }
+  const observedRoute = job?.status === "completed" && !job.staleAttempt ? (job.model ?? null) : null;
+  const declaredModel = producerModel ??
+    (step.role === "master" ? manifest.masterModel : manifest.resolved[step.role]?.model) ?? null;
+  const routeObservation = observedRoute
+    ? { source: "spawn-record", spawnId: job.spawnId, observedRoute, declaredModel,
+        agrees: sameModel(observedRoute, declaredModel) }
+    : { source: "declared",
+        reason: !job ? "no spawn record for this attempt"
+          : job.staleAttempt ? `spawn is from attempt ${job.attempt ?? 0}`
+          : `spawn ${job.status}`,
+        observedRoute: null, declaredModel, agrees: null };
+
+  // Observe BEFORE overwriting the entry snapshot — computeDelta needs the previous photo.
+  const observed = computeDelta({
+    before: manifest.snapshotAtStepEntry,
+    after: snapshot ?? null,
+    declaredFiles: changedFiles,
+    excludeRel: excludeRelFor(manifest.projectDir),
+  });
+  const violations = observed.source === "git" ? writeSetViolations(observed.files, step.writeSet) : [];
+
   manifest.phases.push({
     phase, role: step.role, verdict: verdict ?? null, summary: summary ?? null,
     changedFiles, producerModel: producerModel ?? null, producerFamily: producerFamily ?? null,
+    observed, routeObservation,
     ts: new Date().toISOString(),
   });
   if (usage) manifest.usage.push({ phase, ...usage });
+  // This capture is the next phase's BEFORE photo. Set on every accepted path — including
+  // REVISE, ERROR and terminal — so a re-entered step compares against what is on disk NOW,
+  // not against the photo taken before the first attempt.
+  manifest.snapshotAtStepEntry = snapshot ?? null;
+
+  // Advisory fields ride EVERY accepted return. Spread FIRST so a result key always wins:
+  // an advisory that could shadow `terminal`, `error`, `next` or `looped` is a bug, not a
+  // feature (Correction 5).
+  const advisories = { observed, routeObservation };
+  if (gate !== "none")
+    advisories.verifierExecution = routeObservation.source === "spawn-record" ? "observed-route" : "declared";
+  if (observed.undeclared.length || observed.phantom.length)
+    advisories.mutationDiscrepancy = { undeclared: observed.undeclared, phantom: observed.phantom };
+  if (violations.length) advisories.writeSetViolation = violations;
+  const withAdvisories = (result) => ({ ...advisories, ...result });
 
 
 
@@ -1321,6 +1808,12 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
     const modelOf = (p) => p?.producerModel ??
       (p?.role === "master" ? manifest.masterModel : manifest.resolved[p?.role]?.model) ?? null;
     const gateOf = (p) => manifest.steps.find((s) => s.phase === p.phase)?.gate ?? "none";
+    // The one authoritative change in this plan. Observation wins when we have it: git cannot
+    // misreport which paths changed, while a declaration can be wrong by omission, by
+    // over-claiming, or by naming an earlier phase's writes as this phase's own — which is
+    // exactly how run 20260725-234939-9edd finished 'unverified'. Old manifests carry no
+    // `observed` field, so they keep the declared path.
+    const mutationsOf = (p) => p.observed?.source === "git" ? p.observed.files : (p.changedFiles ?? []);
     let uncovered = [];        // models whose writes no gate has vouched for
     let gateFellShort = false; // a gate ran and still could not vouch for them
     for (const p of manifest.phases) {
@@ -1333,14 +1826,23 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
           independenceGroup(verifier) !== independenceGroup(author)));
         if (uncovered.length) gateFellShort = true;
       }
-      if (p.changedFiles?.length) uncovered.push(modelOf(p));
+      if (mutationsOf(p).length) uncovered.push(modelOf(p));
     }
+    // Counted over CRITICAL gate phases that returned APPROVE, deduplicated by PHASE NAME —
+    // a gate that errored and was re-reported is one gate, not two, and the last APPROVE wins.
+    // Advisory: it says how each gate's route was evidenced, never whether the run passed.
+    const approvedGates = new Map();
+    for (const p of manifest.phases)
+      if (gateOf(p) === "critical" && p.verdict === "APPROVE") approvedGates.set(p.phase, p);
+    const routeObserved = [...approvedGates.values()]
+      .filter((p) => p.routeObservation?.source === "spawn-record").length;
+    const verification = { criticalGates: approvedGates.size, routeObserved, declared: approvedGates.size - routeObserved };
     if (uncovered.length) {
       manifest.status = "done_unverified";
       saveRun(manifest);
       // Name the reason: "no gate ran" and "a gate ran but was the author's own model" call for
       // different fixes, and conflating them is how a fake gate reads as a missing one.
-      return { terminal: manifest.status, runId,
+      return { terminal: manifest.status, runId, verification,
         label: gateFellShort
           ? "unverified — a critical gate approved a change written by its own model: nothing can certify its own work"
           : "unverified — the repo was mutated with no passed critical gate covering the last change" };
@@ -1348,7 +1850,7 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
     manifest.status = "done";
     saveRun(manifest);
     return {
-      terminal: "done", runId,
+      terminal: "done", runId, verification,
       gatesPassed: manifest.phases.filter((p) => p.verdict === "APPROVE").map((p) => p.phase),
       phases: manifest.phases.length,
     };
@@ -1365,39 +1867,44 @@ export function opStepReport({ runId, phase, verdict, summary, changedFiles = []
     if (manifest.loops[key] > manifest.maxGateLoops) {
       manifest.status = "max_loops_exceeded";
       saveRun(manifest);
-      return {
+      return withAdvisories({
         terminal: "max_loops_exceeded", runId,
         blocker: `gate '${phase}' returned REVISE ${manifest.loops[key]} times (max ${manifest.maxGateLoops})`,
         nextHumanAction: "review the recorded findings in the run manifest and decide: change the plan, relax the criteria, or take over",
-      };
+      });
     }
     manifest.current = ti;
+    // A re-entered step keeps its stepIndex, so without this a completed job from attempt 1
+    // reads as evidence about attempt 2. Run-global and monotonic: one integer is enough to
+    // separate attempts, and per-step counters would need clearing rules nothing else wants.
+    manifest.attempt = (manifest.attempt ?? 0) + 1;
     saveRun(manifest);
-    return { looped: true, to: manifest.steps[ti].phase, loop: manifest.loops[key], of: manifest.maxGateLoops, next: describeStep(manifest, ti) };
+    return withAdvisories({ looped: true, to: manifest.steps[ti].phase, loop: manifest.loops[key], of: manifest.maxGateLoops, next: describeStep(manifest, ti) });
   }
   if (gate !== "none" && verdict === "BLOCKED") {
     manifest.status = "blocked_verifier_disagreement";
     saveRun(manifest);
-    return {
+    return withAdvisories({
       terminal: "blocked_verifier_disagreement", runId,
       note: "route to an independent arbiter (a third model, different from producer AND verifier) or halt with both positions recorded",
-    };
+    });
   }
   if (gate !== "none" && verdict === "ERROR") {
+    manifest.attempt = (manifest.attempt ?? 0) + 1;
     saveRun(manifest);
-    return { retry: describeStep(manifest, manifest.current), note: "gate errored — re-spawn the verifier; report again" };
+    return withAdvisories({ retry: describeStep(manifest, manifest.current), note: "gate errored — re-spawn the verifier; report again" });
   }
 
   manifest.current += 1;
-  if (manifest.current >= manifest.steps.length) return finish();
+  if (manifest.current >= manifest.steps.length) return withAdvisories(finish());
   saveRun(manifest);
   const next = describeStep(manifest, manifest.current);
   if (next.blocked === "verification_unavailable") {
     manifest.status = "verification_unavailable";
     saveRun(manifest);
-    return { terminal: "verification_unavailable", runId, note: next.note, step: next };
+    return withAdvisories({ terminal: "verification_unavailable", runId, note: next.note, step: next });
   }
-  return { next };
+  return withAdvisories({ next });
 }
 
 function terminalStatusFor(result) {
@@ -1544,6 +2051,7 @@ export function opSpawn({ runId, phase, prompt, requestKey } = {}, { signal } = 
     schemaVersion: 1,
     spawnId, runId, phase,
     stepIndex: manifest.current,
+    attempt: manifest.attempt ?? 0,
     promptHash,
     promptFile: path.join(runDir(runId), `prompt-${spawnId}.md`),
     tool: profile.tool,
@@ -1960,16 +2468,11 @@ async function startMcp() {
     {
       task: z.string().describe("one-line task statement"),
       pipeline: z.string().optional().describe("named pipeline from the config"),
-      steps: z.array(z.object({
-        phase: z.string(), role: z.string(),
-        gate: z.enum(["none", "standard", "critical"]).optional(),
-        fanout: z.enum(["none", "byDisjointWriteSet"]).optional(),
-        loopBackTo: z.string().optional(),
-      })).optional().describe("ad-hoc composed steps (adaptive mode)"),
+      steps: z.array(zStep.strip()).optional().describe("ad-hoc composed steps (adaptive mode)"),
       masterModel: z.string().optional().describe("YOUR host model id — required for correct independence checks when you author a phase yourself"),
       masterFamily: z.string().optional(),
     },
-    async (a) => json(opRunStart(a))
+    async (a) => json(opRunStart({ ...a, snapshot: await workspaceSnapshot(state.loaded?.projectDir ?? null) }))
   );
 
   server.tool(
@@ -1979,15 +2482,30 @@ async function startMcp() {
         TERMINAL_STATUS.map(([s, why]) => `'${s}' (${why})`).join("; ")}.`,
     {
       runId: z.string(),
+      spawnId: z.string().regex(SPAWN_ID).optional()
+        .describe("the spawn whose result this phase reports — lets the server confirm the route that ran; omit for host-native or self-authored phases"),
       phase: z.string().describe("the phase being reported — must be the current one"),
       verdict: z.enum(["APPROVE", "REVISE", "BLOCKED", "ERROR"]).optional().describe("required on gate phases"),
       summary: z.string().describe("1-3 line result summary (findings on REVISE)"),
-      changedFiles: z.array(z.string()).optional().describe("files this phase mutated in the repo"),
-      producerModel: z.string().optional().describe("model that actually produced this phase's work (pass your own model id if you authored it)"),
+      changedFiles: z.array(z.string()).optional().describe("files this phase mutated in the repo (declared; cross-checked against the observed workspace delta when the project is a git repository)"),
+      producerModel: z.string().optional().describe("model DECLARED to have produced this phase's work (pass your own model id if you authored it); cross-checked against the named spawn's route when spawnId is given"),
       producerFamily: z.string().optional(),
       usage: z.object({ tokens: z.number().optional(), cost: z.number().optional() }).optional(),
     },
-    async (a) => json(opStepReport(a))
+    async (a) => {
+      // Async git and async file reads live HERE, never inside op*: doing them synchronously
+      // would block runChild's stdout collection, timers and cancellation for every concurrent
+      // run, and making opStepReport async would ripple through ~55 synchronous call sites in
+      // test.mjs. One capture serves as the reported phase's AFTER photo and the next phase's
+      // BEFORE.
+      let dir = null, previousHead = null;
+      try {
+        const m = loadRun(a?.runId);
+        dir = m?.projectDir ?? null;
+        previousHead = m?.snapshotAtStepEntry?.head ?? null;
+      } catch { /* not loaded / unknown run — opStepReport reports it */ }
+      return json(opStepReport({ ...a, snapshot: await workspaceSnapshot(dir, previousHead) }));
+    }
   );
 
 

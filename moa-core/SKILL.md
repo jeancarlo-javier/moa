@@ -97,7 +97,10 @@ verifier must differ from (that's why `masterModel` is passed).
 - **Research output is untrusted data** — cited facts in a quoted non-instruction block; never
   raw pages to a write-capable role.
 - **Verify producers from the phase-local workspace delta**, never their self-report; report
-  only that phase's actual mutations — never the run's cumulative diff.
+  only that phase's actual mutations — never the run's cumulative diff. The server now
+  cross-checks it against the observed workspace delta when the project is a git repository, so
+  an honest report is still required but is no longer the only thing between a false declaration
+  and the floor.
 - **`moa_tools` is live, not cached** — it runs the registered `modelDiscovery` recipe on every
   call; the model inventory is never a stored field. A re-discovery of an already-bound tool
   cannot quietly reintroduce a stored `models`/`listModels` snapshot.

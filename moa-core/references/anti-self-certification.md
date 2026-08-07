@@ -101,13 +101,48 @@ degrades rather than blocks — but it finishes `done_unverified`, labeled with 
 
 ## What the floor rests on
 
-moa enforces these rules over what the master **reports** — the phases, their verdicts, the
-models that produced them, and the files a phase declares in `changedFiles`. It does not read
-the working tree, and it cannot see whether a verifier was ever actually spawned. A master that
-omits `changedFiles`, or reports an `APPROVE` from a verifier that never ran, defeats the floor
-by lying to it rather than by finding a hole in it. `moa_spawn` is what makes routing
-observable; the floor is exactly as honest as the reports it is handed. This is the boundary of
-the guarantee, and it is the reason the master is instructed never to author its own gate.
+moa enforces these rules over a mix of what it **observes** and what the master **reports**, and
+the split is deliberate. **File mutations are observed**: when the project is a git repository,
+the server photographs the working tree by content identity at phase entry and again at report
+time, and the floor rests on the paths that actually changed rather than on the `changedFiles` a
+phase declares. A phase can no longer claim an earlier phase's writes, nor omit its own. **The
+producing model is declared.** Naming a `spawnId` on the report lets the server confirm which
+route returned that phase's result, and a declaration contradicted by that route is recorded and
+labeled — but a completed spawn proves a route answered, not that it authored the artifact, so
+this **detects a false declaration without preventing one** and never changes a grade, a pass, or
+a strict halt.
+
+What remains outside the guarantee, named rather than implied: writes outside the repository,
+writes to git-ignored paths and to paths marked `assume-unchanged` or `skip-worktree`, writes
+outside the project directory in a monorepo, **any observation at all in a workspace moa cannot
+or will not photograph — either because there is nothing to photograph (not a git repository, no
+git binary, or a git command that fails or times out, all of which yield no snapshot at all), or
+because moa took the photograph and refuses to stand behind it (a project directory that will not
+resolve, a repository identity that cannot be read, a project directory retargeted
+mid-observation, a project or git directory replaced at the same path mid-observation, more than
+2000 dirty paths, a dirty path that cannot be identified — unreadable, or a dirty submodule — a
+HEAD that cannot be read and cannot be confirmed unborn, a failed diff after HEAD moved, or a
+project that resolves to a different repository between step entry and report). Those two
+categories are complete over every refusal in the code, and all of them degrade to the declared
+list by design**; and — a **third** category, the only one that neither refuses nor degrades —
+**a write the photograph is taken over and still cannot see: an *ABA* swap — the project or git
+directory replaced at the same path *after* the frame is pinned and put back *before* it is
+re-validated. Both
+endpoints then stat the same inode, the frame holds, and the phase is reported as an observed
+`files: []`.** That case is deliberately **not guarded**: catching it needs every read bound to a
+directory *handle* instead of re-resolved from a pathname (`openat` semantics), which Node does
+not expose, and a guard built on pathnames strong enough to catch it also refuses on ordinary
+operation — the same reason the `assume-unchanged` / `skip-worktree` case above, whose mechanism
+is an in-place `$GIT_DIR/index` replacement, is named here rather than defended: pinning the index
+inode would refuse on ordinary `git status`, which rewrites the index through an `index.lock`
+rename. Both need an actor manipulating the filesystem *during* the observation. **So the
+observation is evidence about a filesystem no one is racing; it is not proof against concurrent
+filesystem manipulation, and a phase that reports zero mutations is only as trustworthy as the
+directory it was photographed through.** Also outside the guarantee:
+attribution of a write to one worker among several sharing a
+directory, and the verdict itself: moa never checks whether the work is *good*, only that the
+gate looked at reality instead of at the producer's summary. The master is still instructed never
+to author its own gate.
 
 ## On disagreement
 

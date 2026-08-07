@@ -134,7 +134,15 @@
                 "gate": { "enum": ["none", "standard", "critical"], "default": "none",
                   "description": "Gate tier — collapses the old gate+critical booleans and the top-level gatesRequired list into one field. 'none' (default, omit): a producing/master phase, right-sizeable in auto mode. 'standard': a mandatory checkpoint whose verifier is a DIFFERENT family than the producer (the nearest preceding non-gate, non-master phase). 'critical': standard PLUS the verifier carries all master.hardVerificationTags. No optional gates — a lighter flow is a different pipeline. Because 'critical' is a value of 'gate', 'critical-without-a-gate' is unrepresentable." },
                 "fanout": { "enum": ["none", "byDisjointWriteSet"], "default": "none" },
-                "loopBackTo": { "type": "string", "description": "Phase to return to on REVISE; must name a phase in this pipeline." }
+                "loopBackTo": { "type": "string", "description": "Phase to return to on REVISE; must name a phase in this pipeline." },
+                "writeSet": {
+                  "type": "array",
+                  "items": {
+                    "type": "string",
+                    "pattern": "^(?:\\*\\*|(?!\\.\\.?(?:/|$))(?:[^/*\\\\]|\\*(?!\\*))+)(?:/(?:\\*\\*|(?!\\.\\.?(?:/|$))(?:[^/*\\\\]|\\*(?!\\*))+))*/?$"
+                  },
+                  "description": "Static write-set policy: glob patterns this step's writes must stay within, relative to the project directory. Anchored; '*' does not cross '/', '**' does and must be a whole path segment ('a/**/b', never 'a**b'); no negation, no character classes, no braces. Rejected: an empty pattern, a leading '/', '\\' anywhere, '//', and '.' or '..' segments. A trailing '/' is shorthand for '/**'. ADVISORY — the server reports a write outside them to the gate and never blocks."
+                }
               }
             }
           }

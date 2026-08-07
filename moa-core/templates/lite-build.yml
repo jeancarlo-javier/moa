@@ -36,8 +36,9 @@ roles:
     use: [auto]
     differentModelFrom: coder
     instructions: |
-      In an isolated worktree, run the planner's verification commands and check
-      the diff against the done-criteria. Independent of the coder (a different model).
+      Run the planner's verification commands in the project directory and check the
+      phase-local delta against the done-criteria — not the run's cumulative diff.
+      Independent of the coder (a different model).
 
 pipelines:
   build:

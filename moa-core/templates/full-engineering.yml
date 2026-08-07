@@ -55,8 +55,9 @@ roles:
     use: [auto]             # init pins a strong, coder-independent model (gate floor)
     differentModelFrom: coder
     instructions: |
-      In an isolated worktree, run the planner's verification commands and confirm
-      the framed done-criteria. Independent of the coder (a different model).
+      Run the planner's verification commands in the project directory and confirm the
+      framed done-criteria against the phase-local delta. Independent of the coder
+      (a different model).
 
 pipelines:
   engineering:
