@@ -292,7 +292,7 @@ t("load: global boundary rejects project policy keys with its path", () => {
   }
 });
 
-await ta("load: project roles inherit global staffing without role union", async () => {
+await ta("load: project roles union global staffing with per-key overrides", async () => {
   const repo = path.join(TMP, "layered");
   fs.mkdirSync(repo, { recursive: true });
   writeGlobal(`
@@ -324,7 +324,7 @@ roles:
     });
     assert.deepEqual(loaded.roles.empty.use, ["shared"]);
     assert.deepEqual(loaded.roles.direct.use, ["g"]);
-    assert.equal(loaded.roles.globalOnly, undefined);
+    assert.deepEqual(loaded.roles.globalOnly.use, ["g"]);
     assert.deepEqual(loaded.models.shared, { id: "minimax/MiniMax-M3" });
     assert.deepEqual(loaded.configPaths, { global: GLOBAL_CONFIG, project: path.join(repo, ".moa.yml") });
     const resolved = await opResolve({ hostModels: HOST });
@@ -334,6 +334,116 @@ roles:
     const run = opRunStart({ task: "layered", steps: [{ phase: "work", role: "direct" }] });
     assert.ok(run.frame.config.includes(GLOBAL_CONFIG));
     assert.ok(run.frame.config.includes(path.join(repo, ".moa.yml")));
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("load: overlay without roles inherits the global palette", async () => {
+  const repo = path.join(TMP, "layered-no-roles");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  g: { id: openai/gpt-5.5, family: gpt }
+roles:
+  planner: { use: [g] }
+  coder: { use: [g] }
+  verifier: { use: [g] }
+`);
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+runtime: { workDir: project }
+template: { base: engineering }
+`);
+  try {
+    const loaded = opLoad({ cwd: repo });
+    assert.ok(!loaded.errors, JSON.stringify(loaded.errors));
+    assert.deepEqual(Object.keys(loaded.roles), ["planner", "coder", "verifier"]);
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("load: overlay subset keeps its inherited differentModelFrom target", async () => {
+  const repo = path.join(TMP, "layered-dependency");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  coderModel: { id: minimax/MiniMax-M3, family: minimax }
+  verifierModel: { id: openai/gpt-5.5, family: gpt }
+roles:
+  coder: { use: [coderModel] }
+  verifier: { use: [verifierModel], differentModelFrom: coder }
+`);
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+roles:
+  verifier: {}
+`);
+  try {
+    const loaded = opLoad({ cwd: repo });
+    assert.ok(!loaded.errors, JSON.stringify(loaded.errors));
+    assert.deepEqual(Object.keys(loaded.roles), ["coder", "verifier"]);
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("load: overlay pipeline may name a global-only role", async () => {
+  const repo = path.join(TMP, "layered-pipeline");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  g: { id: openai/gpt-5.5, family: gpt }
+roles:
+  globalOnly: { use: [g] }
+`);
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+pipelines:
+  default:
+    steps:
+      - { phase: execute, role: globalOnly }
+`);
+  try {
+    const loaded = opLoad({ cwd: repo });
+    assert.ok(!loaded.errors, JSON.stringify(loaded.errors));
+    assert.equal(loaded.pipelines.default.steps[0], "execute(globalOnly)");
+  } finally {
+    clearGlobal();
+  }
+});
+
+await ta("resolve: an inherited differentModelFrom constraint is still enforced", async () => {
+  const repo = path.join(TMP, "layered-dependency-resolve");
+  fs.mkdirSync(repo, { recursive: true });
+  writeGlobal(`
+schemaVersion: 1
+models:
+  coderModel: { id: minimax/MiniMax-M3, family: minimax }
+  verifierModel: { id: openai/gpt-5.5, family: gpt }
+roles:
+  coder: { use: [coderModel] }
+  verifier: { use: [verifierModel], differentModelFrom: coder }
+`);
+  fs.writeFileSync(path.join(repo, ".moa.yml"), `
+schemaVersion: 1
+roles:
+  verifier: {}
+`);
+  try {
+    assert.ok(!opLoad({ cwd: repo }).errors);
+    const resolved = await opResolve({ hostModels: HOST });
+    assert.notEqual(resolved.roles.verifier.group, resolved.roles.coder.group);
+
+    const blocked = await opResolve({ hostModels: [] });
+    assert.equal(
+      blocked.diagnostics.find((diagnostic) => diagnostic.role === "verifier")?.state,
+      "blocked_dependency",
+    );
   } finally {
     clearGlobal();
   }

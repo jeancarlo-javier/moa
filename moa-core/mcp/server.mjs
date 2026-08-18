@@ -322,12 +322,12 @@ function mergeConfigLayers(globalConfig, projectConfig) {
   const merged = { ...projectConfig };
   if (globalConfig.models || projectConfig.models)
     merged.models = { ...(globalConfig.models ?? {}), ...(projectConfig.models ?? {}) };
-  if (projectConfig.roles) {
-    merged.roles = Object.fromEntries(Object.entries(projectConfig.roles).map(([name, role]) =>
+  if (globalConfig.roles || projectConfig.roles)
+    merged.roles = Object.fromEntries(Object.entries({
+      ...(globalConfig.roles ?? {}),
+      ...(projectConfig.roles ?? {}),
+    }).map(([name, role]) =>
       [name, { ...(globalConfig.roles?.[name] ?? {}), ...role }]));
-  } else {
-    delete merged.roles;
-  }
   return merged;
 }
 
