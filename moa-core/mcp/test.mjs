@@ -2781,6 +2781,7 @@ models:
 roles:
   planner: { use: [reasoner, auto] }
   coder: { use: [implementer, auto] }
+  globalOnly: { use: [reasoner, auto] }
 `);
   try {
     const result = await opInit({
@@ -2808,6 +2809,7 @@ roles:
     assert.ok(!loaded.errors, JSON.stringify(loaded.errors));
     assert.deepEqual(loaded.roles.planner.use, ["reasoner", "auto"]);
     assert.deepEqual(loaded.roles.coder.use, ["implementer", "auto"]);
+    assert.deepEqual(loaded.roles.globalOnly.use, ["reasoner", "auto"]);
     assert.deepEqual(loaded.roles.verifier.use, ["checker", "auto"]);
   } finally {
     clearGlobal();
