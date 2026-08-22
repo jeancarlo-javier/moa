@@ -66,6 +66,13 @@ Both say the same thing; the second hides nothing that matters and never sends t
   and stop — do **not** write anything (bare `init --force` now regenerates the machine
   defaults, not the project file, so a stale habit must never overwrite the wrong target).
 
+## How the two settings files combine
+
+Your project’s custom rules sit on top of your default AI setup. Names you set in the project
+replace or add to matching defaults; names you leave out stay available. If the project file
+omits `models` or `roles`, it keeps that section from the default setup, so a project pipeline
+can use a default role without repeating it.
+
 ## Procedure
 
 1. **Parse args** — the command selects the target: `init` → global, `project` → project

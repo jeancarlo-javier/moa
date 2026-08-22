@@ -39,7 +39,7 @@
 
     "models": {
       "type": "object",
-      "description": "Selected model preferences, keyed by project alias. Init writes only aliases used by roles, never the full host or learned-tool inventory. Configured aliases remain distinct candidates even when they share one canonical model ID. Roles select aliases through roles.<name>.use.",
+      "description": "Project model keys merge over global model keys; global-only keys are retained, and omitting the section inherits the global layer. Selected model preferences, keyed by project alias. Init writes only aliases used by roles, never the full host or learned-tool inventory. Configured aliases remain distinct candidates even when they share one canonical model ID. Roles select aliases through roles.<name>.use.",
       "additionalProperties": {
         "type": "object",
         "additionalProperties": false,
@@ -94,6 +94,7 @@
 
     "roles": {
       "type": "object",
+      "description": "Project role keys merge over global role keys; global-only keys are retained, and omitting the section inherits the global layer.",
       "minProperties": 1,
       "additionalProperties": {
         "type": "object",
