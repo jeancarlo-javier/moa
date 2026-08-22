@@ -1,49 +1,119 @@
 ## Purpose
 
-Lets a run declare inputs that already exist (a reviewed plan, prior research, a design) so the pipeline skips the steps whose only job is to produce them — one pipeline serves fresh work and pre-planned work, and every skip is visible in the frame.
+Lets a run declare phases whose output already exists (a reviewed plan, prior research, a design) so those steps — and the steps that depend on them — are skipped. One pipeline serves fresh work and pre-planned work, every skip is visible in the frame, and a well-formed run is never blocked.
+
+Throughout this spec, **the reference pipeline** is:
+
+| # | phase | role | gate | loopBackTo | other |
+|---|-------|------|------|------------|-------|
+| 0 | frame | master | — | — | — |
+| 1 | plan | planner | — | — | `skippable: true` |
+| 2 | review-plan | plan-reviewer | standard | plan | — |
+| 3 | execute | coder | — | plan | — |
+| 4 | review-work | code-reviewer | standard | execute | — |
+| 5 | validate | verifier | critical | execute | — |
+| 6 | finalize | master | — | — | — |
 
 ## ADDED Requirements
 
-### Requirement: Step declares the input that makes it unnecessary
-A pipeline step MAY declare `unless: <input-name>` (non-empty string), in config pipelines and in ad-hoc steps alike. Steps without `unless` SHALL never be skipped.
+### Requirement: A step declares whether a run may skip it
+A pipeline step MAY declare `skippable: true`, in config pipelines and in ad-hoc steps alike. A step without it SHALL never be skipped by `provided`. `skippable` SHALL be rejected on any step with a `gate` other than `none` — `provided` is written by the run, and a run SHALL NOT remove a gate directly.
 
-#### Scenario: Config validation accepts unless
-- **WHEN** a `.moa.yml` pipeline step has `unless: plan`
-- **THEN** `moa_load` accepts the config and reports the field on the step
+#### Scenario: Config validation accepts skippable
+- **WHEN** a `.moa.yml` pipeline step has `skippable: true` and no gate
+- **THEN** `moa_load` accepts the config and its pipeline listing reports the field on that step
+
+#### Scenario: skippable on a gate is rejected at load
+- **WHEN** a `.moa.yml` pipeline step has both `skippable: true` and `gate: standard`
+- **THEN** `moa_load` reports an error naming the phase and stating that a gate cannot be marked skippable
+
+#### Scenario: skippable on an ad-hoc gate is rejected at run start
+- **WHEN** `moa_run_start` is called with ad-hoc `steps` containing a step with `skippable: true` and `gate: critical`
+- **THEN** it returns an error naming the phase and no run manifest is written
 
 #### Scenario: Unknown fields still rejected
 - **WHEN** a step has an unrecognized field
 - **THEN** `moa_load` rejects it as before (strict step shape unchanged)
 
-### Requirement: Run start skips steps whose input is provided
-`moa_run_start` SHALL accept an optional `provided: string[]`. Every step whose `unless` value is in `provided` SHALL be removed from the run's steps before the manifest is written; the remaining steps SHALL keep their order and semantics; the manifest SHALL record `provided` and `skipped` (phase + unless).
+### Requirement: A step's parent determines whether it follows a skip
+Every step SHALL resolve a parent phase: its `requires: <phase>` when declared, otherwise its `loopBackTo` **when the step is a gate**, otherwise none. A non-gate step's `loopBackTo` SHALL NOT make it a dependent — that field's only other meaning is the effort-ladder key. `requires` MAY be declared on any step, gates included, and MAY name any phase in the same pipeline.
 
-#### Scenario: Provided plan skips planning phases
-- **WHEN** pipeline steps are frame, plan (unless: plan), review-plan (unless: plan, gate: standard, loopBackTo: plan), execute, validate (gate: critical, loopBackTo: execute), finalize and the run starts with `provided: ["plan"]`
-- **THEN** the run's steps are frame, execute, validate, finalize; the manifest lists skipped plan and review-plan; the first step returned is frame
+#### Scenario: Gate inherits its parent from loopBackTo
+- **WHEN** the reference pipeline runs with `provided: ["plan"]`
+- **THEN** `review-plan` is skipped because its `loopBackTo` names the skipped `plan`, without declaring `requires`
+
+#### Scenario: Non-gate loopBackTo does not create a dependent
+- **WHEN** the reference pipeline runs with `provided: ["plan"]`
+- **THEN** `execute` runs, even though its `loopBackTo` names the skipped `plan`
+
+#### Scenario: requires declares a parent where no loopBackTo exists
+- **WHEN** a pipeline has `execute` (`skippable: true`, no gate) followed by `q&a` (`requires: execute`, no gate, no `loopBackTo`) and the run starts with `provided: ["execute"]`
+- **THEN** both `execute` and `q&a` are skipped
+
+#### Scenario: requires overrides loopBackTo on a gate
+- **WHEN** a gate declares both `requires: frame` and `loopBackTo: plan`, and the run starts with `provided: ["plan"]`
+- **THEN** the gate runs, because its parent is `frame`, which was not skipped
+
+### Requirement: Run start skips provided phases and their dependents
+`moa_run_start` SHALL accept an optional `provided: string[]` naming phases of the chosen pipeline. A step SHALL be skipped when it is `skippable` and its phase is in `provided`, or when its parent was skipped — applied transitively until no further step is removed. Remaining steps SHALL keep their order and semantics. The manifest SHALL record `provided` and `skipped` as `{phase, reason}`, where `reason` is `provided` or `child of <parent-phase>`. Skipping SHALL happen before the manifest is written, so every later consumer sees only surviving steps.
+
+#### Scenario: Provided plan skips the planner and its review gate
+- **WHEN** the reference pipeline starts with `provided: ["plan"]`
+- **THEN** the run's steps are `frame`, `execute`, `review-work`, `validate`, `finalize`; the manifest records `skipped` as `plan (provided)` and `review-plan (child of plan)`; the first step returned is `frame`
 
 #### Scenario: Nothing provided, nothing skipped
-- **WHEN** the same pipeline starts without `provided`
-- **THEN** all six steps run in order (behavior identical to today)
+- **WHEN** the reference pipeline starts without `provided`
+- **THEN** all seven steps run in order and the manifest carries no `skipped` entries (behavior identical to today)
 
-#### Scenario: Provided input no step declares
-- **WHEN** the run starts with `provided: ["research"]` and no step has `unless: research`
-- **THEN** no step is skipped and the frame notes that `research` was provided but unused
+#### Scenario: Cascade is transitive
+- **WHEN** a pipeline has `plan` (`skippable: true`), `review-plan` (gate, `loopBackTo: plan`) and `sign-off` (`requires: review-plan`), and the run starts with `provided: ["plan"]`
+- **THEN** all three are skipped, `sign-off` with reason `child of review-plan`
+
+#### Scenario: Repeated provided entries are idempotent
+- **WHEN** the reference pipeline starts with `provided: ["plan", "plan"]`
+- **THEN** the result is identical to `provided: ["plan"]`
+
+### Requirement: Run start rejects only authoring mistakes
+`moa_run_start` SHALL fail, writing no manifest, when: no step survives; `provided` names a phase absent from the chosen pipeline; `provided` names a phase that is not `skippable`; or `provided` is non-empty while `master.mode` is `strict`, which is defined as running the pipeline verbatim. Each error SHALL name the offending phase and the fix. No other condition SHALL block a run.
+
+#### Scenario: Provided names an unknown phase
+- **WHEN** the reference pipeline starts with `provided: ["research"]`
+- **THEN** `moa_run_start` returns an error naming `research` and listing the pipeline's skippable phases; no run manifest is written
+
+#### Scenario: Provided names a phase that is not skippable
+- **WHEN** the reference pipeline starts with `provided: ["execute"]`
+- **THEN** `moa_run_start` returns an error stating that `execute` is not marked `skippable`; no run manifest is written
+
+#### Scenario: Every step skipped
+- **WHEN** a pipeline's every step is `skippable` or a dependent, and `provided` names them all
+- **THEN** `moa_run_start` returns an error stating that no steps remain; no run manifest is written
+
+#### Scenario: Strict mode rejects provided
+- **WHEN** the config sets `master.mode: strict` and the run starts with a non-empty `provided`
+- **THEN** `moa_run_start` returns an error stating that strict mode runs the pipeline verbatim; no run manifest is written
+
+#### Scenario: A gate with no loopBackTo and no requires survives
+- **WHEN** the reference pipeline is amended so `review-plan` has neither `loopBackTo` nor `requires`, and the run starts with `provided: ["plan"]`
+- **THEN** `plan` is skipped, `review-plan` runs, and a later REVISE at `review-plan` resolves its loop-back target among surviving steps exactly as it does today
 
 ### Requirement: Skips are visible in the frame
-The frame returned by `moa_run_start` SHALL list skipped phases with the input that caused each skip, and the pipeline string SHALL show only surviving phases.
+The frame returned by `moa_run_start` SHALL list every skipped phase with its reason, and the pipeline string SHALL show only surviving phases. The order of listed skips SHALL follow the pipeline's original step order.
 
 #### Scenario: Frame reports skips
-- **WHEN** plan and review-plan were skipped because `plan` was provided
-- **THEN** the frame contains `skipped: plan, review-plan (provided: plan)` and `pipeline: frame→execute→validate→finalize`
+- **WHEN** `plan` and `review-plan` were skipped because `plan` was provided
+- **THEN** the frame contains `skipped: plan (provided), review-plan (child of plan)` and `pipeline: frame→execute→review-work→validate→finalize`
 
-### Requirement: A gate must keep a reachable loop-back target
-At run start, every surviving gate step SHALL resolve a loop-back target among surviving steps — its explicit `loopBackTo`, or, when absent, the nearest previous non-gate non-master step. If it cannot, `moa_run_start` SHALL fail with an error naming the gate, the skipped target, and the fix (add `unless` to the gate too, or change `loopBackTo`), and SHALL NOT create a run. A non-gate step's `loopBackTo` to a skipped phase SHALL NOT be an error.
+#### Scenario: Frame omits the line when nothing was skipped
+- **WHEN** a run starts without `provided`
+- **THEN** the frame carries no `skipped` line
 
-#### Scenario: Gate pointing at a skipped phase fails fast
-- **WHEN** review-plan (gate: standard, loopBackTo: plan) has no `unless` and the run starts with `provided: ["plan"]`
-- **THEN** `moa_run_start` returns an error mentioning `review-plan`, `plan` and `unless`; no run manifest is written
+### Requirement: The effort ladder survives a skipped loop-back target
+A step's effort rung SHALL be read from the loop counter of its `loopBackTo` phase only while that phase is among the run's steps; otherwise it SHALL be read from the step's own phase. A REVISE that sends work back to a step SHALL therefore raise that step's effort whether or not its `loopBackTo` target survived.
 
-#### Scenario: Non-gate loop-back to a skipped phase is tolerated
-- **WHEN** execute (no gate, loopBackTo: plan) survives and plan is skipped
-- **THEN** the run starts normally
+#### Scenario: Execute escalates after a REVISE when plan was skipped
+- **WHEN** the reference pipeline runs with `provided: ["plan"]` and `validate` returns REVISE, sending the run back to `execute`
+- **THEN** the next `execute` step is described at effort rung 1, not rung 0
+
+#### Scenario: Escalation via a surviving target is unchanged
+- **WHEN** the reference pipeline runs without `provided` and `review-plan` returns REVISE, sending the run back to `plan`
+- **THEN** `execute` is subsequently described at the rung recorded for `plan`, exactly as today
