@@ -95,6 +95,10 @@ const zStep = z.object({
   gate: z.enum(["none", "standard", "critical"]).optional(),
   fanout: z.enum(["none", "byDisjointWriteSet"]).optional(),
   loopBackTo: z.string().optional(),
+  skippable: z.literal(true).optional()
+    .describe("the run may skip this phase by naming it in moa_run_start's `provided`. Illegal on a gate: `provided` is written by the run, and a run never removes a gate directly — a gate leaves only by following a skipped parent."),
+  requires: z.string().min(1).optional()
+    .describe("this step's parent phase: skipped whenever that phase is skipped, transitively. Defaults, for a GATE only, to `loopBackTo` — a gate guards the phase it sends work back to. Declare it for a child with no loopBackTo, or to override a gate's default."),
   writeSet: z.array(z.string().superRefine((p, ctx) => {
     const problem = writeSetPatternError(p);
     if (problem) ctx.addIssue({ code: z.ZodIssueCode.custom, message: `writeSet pattern '${p}' ${problem}` });
@@ -298,9 +302,16 @@ function crossCheck(cfg) {
       if (s.role !== "master" && !roleNames.has(s.role))
         errs.push(`pipeline '${pname}': step '${s.phase}' names unknown role '${s.role}'`);
     }
-    for (const s of pipe.steps)
+    for (const s of pipe.steps) {
       if (s.loopBackTo && !phases.has(s.loopBackTo))
         errs.push(`pipeline '${pname}': step '${s.phase}' loopBackTo names unknown phase '${s.loopBackTo}'`);
+      // `provided` is written by the run; letting it name a gate would let a master delete its
+      // own verification by declaration. A gate leaves a run only by following a skipped parent.
+      if (s.skippable && (s.gate ?? "none") !== "none")
+        errs.push(`pipeline '${pname}': step '${s.phase}' is a ${s.gate} gate and cannot be 'skippable' — a gate is skipped only by following a skipped parent (requires/loopBackTo)`);
+      if (s.requires && !phases.has(s.requires))
+        errs.push(`pipeline '${pname}': step '${s.phase}' requires names unknown phase '${s.requires}'`);
+    }
   }
   return errs;
 }
@@ -1088,7 +1099,8 @@ export function opLoad({ cwd = process.cwd() } = {}) {
     models: cfg.models ?? {},
     pipelines: Object.fromEntries(Object.entries(cfg.pipelines ?? {}).map(([n, p]) => [n, {
       description: p.description,
-      steps: p.steps.map((s) => `${s.phase}(${s.role}${s.gate && s.gate !== "none" ? `,gate:${s.gate}` : ""})`),
+      steps: p.steps.map((s) => `${s.phase}(${s.role}${s.gate && s.gate !== "none" ? `,gate:${s.gate}` : ""}${
+        s.skippable ? ",skippable" : ""}${s.requires ? `,requires:${s.requires}` : ""})`),
     }])),
     defaults: cfg.runtime?.defaults ?? {},
     subagents: cfg.runtime?.subagents ?? "auto",
@@ -1584,7 +1596,12 @@ function describeStep(manifest, i) {
     isMaster,
   };
   if (r) {
-    const rung = Math.min(manifest.loops[s.loopBackTo ?? s.phase] ?? 0, r.effort.length - 1);
+    // The rung tracks the loop counter of the phase this step's rework is driven by. REVISE writes
+    // loops[<target>.phase] (see opStepReport), so reading loops[loopBackTo] only agrees while that
+    // target is IN the run. When it is absent — skipped by `provided`, or never declared — fall back
+    // to this step's own phase, or a step sent back to by a gate would stay frozen at rung 0.
+    const rungKey = s.loopBackTo && manifest.steps.some((o) => o.phase === s.loopBackTo) ? s.loopBackTo : s.phase;
+    const rung = Math.min(manifest.loops[rungKey] ?? 0, r.effort.length - 1);
     out.model = r.model;
     out.family = r.family;
     out.effort = r.effort[rung];
@@ -1621,7 +1638,7 @@ function describeStep(manifest, i) {
   return out;
 }
 
-export function opRunStart({ task, pipeline, steps, masterModel, masterFamily, snapshot } = {}) {
+export function opRunStart({ task, pipeline, steps, provided, masterModel, masterFamily, snapshot } = {}) {
   if (!state.loaded) return { error: "call moa_load first" };
   if (!state.resolved) return { error: "call moa_resolve first (pass the host-native model list)" };
   const { config: cfg, dispatch, configPath, configPaths } = state.loaded;
@@ -1648,6 +1665,14 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily, s
           error: `ad-hoc critical role '${s.role}' lacks required model tags [${missing.join(", ")}] — call moa_resolve again with an override to a qualifying model`,
         };
     }
+    // Same rule the loader enforces on config pipelines: `provided` is written by the run, so
+    // letting it name a gate would let a master delete its own verification by declaration.
+    const skippableGate = steps.find((s) => s.skippable && (s.gate ?? "none") !== "none");
+    if (skippableGate)
+      return { error: `step '${skippableGate.phase}' is a ${skippableGate.gate} gate and cannot be 'skippable' — a gate is skipped only by following a skipped parent (requires/loopBackTo)` };
+    const badRequires = steps.find((s) => s.requires && !steps.some((o) => o.phase === s.requires));
+    if (badRequires)
+      return { error: `step '${badRequires.phase}' requires names unknown phase '${badRequires.requires}'` };
     chosen = steps; name = "ad-hoc";
   } else if (cfg) {
     name = pipeline ?? (dispatch === "workflow" ? "default" : null);
@@ -1659,6 +1684,50 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily, s
     chosen = cfg.pipelines[name].steps;
   } else return { error: "no config: pass explicit steps" };
 
+  // A step's parent: `requires` when declared, else — for a GATE ONLY — its loopBackTo. A gate
+  // guards the phase it sends work back to, so that edge is already the dependency and declaring
+  // it twice would be a second source of truth. The gate-only restriction is load-bearing:
+  // `execute` carries `loopBackTo: plan` in every shipped pipeline and must NEVER follow plan out.
+  // On a non-gate step loopBackTo keeps its one other meaning, the effort-ladder key.
+  const parentOf = (s) => s.requires ?? ((s.gate ?? "none") !== "none" ? s.loopBackTo ?? null : null);
+  const declared = provided ?? [];
+  const skipReason = new Map(); // phase -> 'provided' | `child of <parent>`
+  const declaredOrder = chosen;  // pre-filter list: `skipped` is reported down the pipeline
+  if (declared.length) {
+    // strict is defined as running the pipeline verbatim (config.schema.json master.mode); honoring
+    // `provided` there would quietly weaken the guarantee CI and release runs are built on.
+    if ((cfg?.master?.mode ?? "auto") === "strict")
+      return { error: `master.mode is 'strict' — the pipeline runs verbatim, so 'provided' is not allowed. Use mode 'auto', or drop provided (${declared.join(", ")}).` };
+    const byPhase = new Map(chosen.map((s) => [s.phase, s]));
+    const skippable = chosen.filter((s) => s.skippable).map((s) => s.phase);
+    for (const phase of declared) {
+      const step = byPhase.get(phase);
+      if (!step)
+        return { error: `provided names '${phase}', which is not a phase of pipeline '${name}' — skippable phases here: ${skippable.join(", ") || "none"}` };
+      if (!step.skippable)
+        return { error: `provided names '${phase}', which is not marked 'skippable' in pipeline '${name}' — add 'skippable: true' to that step, or drop it from provided` };
+      skipReason.set(phase, "provided");
+    }
+    // Cascade to a fixed point: a step whose parent is skipped is skipped, however deep the chain.
+    for (let changed = true; changed; ) {
+      changed = false;
+      for (const s of chosen) {
+        const parent = parentOf(s);
+        if (parent && !skipReason.has(s.phase) && skipReason.has(parent)) {
+          skipReason.set(s.phase, `child of ${parent}`);
+          changed = true;
+        }
+      }
+    }
+    const survivors = chosen.filter((s) => !skipReason.has(s.phase));
+    if (!survivors.length)
+      return { error: `provided (${declared.join(", ")}) skips every step of pipeline '${name}' — nothing would run` };
+    chosen = survivors;
+  }
+  // Original step order, so the frame reads down the pipeline rather than down `provided`.
+  const skipped = declaredOrder.filter((s) => skipReason.has(s.phase))
+    .map((s) => ({ phase: s.phase, reason: skipReason.get(s.phase) }));
+
   const runId = "run-" + new Date().toISOString().slice(0, 19).replace(/[-:T]/g, "").replace(/^(\d{8})/, "$1-") + "-" + crypto.randomBytes(2).toString("hex");
   const manifest = {
     runId, task, pipeline: name,
@@ -1667,6 +1736,8 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily, s
     dispatch,
     maxGateLoops: cfg?.runtime?.defaults?.maxGateLoops ?? 2,
     steps: chosen, current: 0,
+    provided: declared.length ? [...declared] : null,
+    skipped,
     resolved: state.resolved.roles,
     roleInstructions: Object.fromEntries(Object.entries(cfg?.roles ?? {}).map(([n, r]) => [n, r.instructions ?? null])),
     masterModel: masterModel ?? null, masterFamily: masterFamily ?? null,
@@ -1683,6 +1754,8 @@ export function opRunStart({ task, pipeline, steps, masterModel, masterFamily, s
       : "none",
     mode: manifest.mode, dispatch: name === "ad-hoc" ? "adaptive→composed" : dispatch === "workflow" ? "workflow:default" : `adaptive→named:${name}`,
     pipeline: chosen.map((s) => s.phase).join("→"),
+    // Never silent: a skipped gate the master did not name itself has to be readable in the frame.
+    ...(skipped.length ? { skipped: skipped.map((s) => `${s.phase} (${s.reason})`).join(", ") } : {}),
     gates: gates.join(", ") || "none",
     roles: Object.fromEntries(Object.entries(manifest.resolved).map(([n, r]) => [n, `${r.model}:${r.effort[0]} (${r.family ?? "?"})`])),
   };
@@ -2469,6 +2542,7 @@ async function startMcp() {
       task: z.string().describe("one-line task statement"),
       pipeline: z.string().optional().describe("named pipeline from the config"),
       steps: z.array(zStep.strip()).optional().describe("ad-hoc composed steps (adaptive mode)"),
+      provided: z.array(z.string().min(1)).optional().describe("phases whose output the brief ALREADY carries — each must be declared 'skippable' in the pipeline. Those steps are skipped, and so is anything that depends on them. Rejected under master.mode 'strict'."),
       masterModel: z.string().optional().describe("YOUR host model id — required for correct independence checks when you author a phase yourself"),
       masterFamily: z.string().optional(),
     },

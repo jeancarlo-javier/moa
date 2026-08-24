@@ -64,7 +64,7 @@ pipelines:
     description: Full 7-phase flow with plan-review and code-review gates; for non-trivial features, refactors, and migrations with real mutation risk.
     steps:
       - { phase: frame,       role: master }
-      - { phase: plan,        role: planner }
+      - { phase: plan,        role: planner, skippable: true }
       - { phase: review-plan, role: plan-reviewer, gate: standard, loopBackTo: plan }
       - { phase: execute,     role: coder, fanout: byDisjointWriteSet, loopBackTo: plan }
       - { phase: review-work, role: code-reviewer, gate: standard, loopBackTo: execute }
@@ -75,7 +75,7 @@ pipelines:
     description: Lean 5-phase flow (no review gates) with a critical validate gate; for low-risk, well-scoped changes.
     steps:
       - { phase: frame,    role: master }
-      - { phase: plan,     role: planner }
+      - { phase: plan,     role: planner, skippable: true }
       - { phase: execute,  role: coder, loopBackTo: plan }
       - { phase: validate, role: verifier, gate: critical, loopBackTo: execute }
       - { phase: finalize, role: master }

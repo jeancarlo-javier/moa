@@ -44,7 +44,7 @@ pipelines:
   build:
     steps:
       - { phase: frame,    role: master }
-      - { phase: plan,     role: planner }
+      - { phase: plan,     role: planner, skippable: true }
       - { phase: execute,  role: coder, loopBackTo: plan }
       - { phase: validate, role: verifier, gate: critical, loopBackTo: execute }
       - { phase: finalize, role: master }

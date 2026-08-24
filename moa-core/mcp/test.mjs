@@ -4388,4 +4388,359 @@ await ta("snapshot: an ordinary project still observes — symlinked tmp, symlin
   }
 });
 
+
+// ─────────────────────────────────────────────────────────────────────────────
+// provided-inputs: a run declares phases whose output already exists, and the
+// steps that depend on them drop out. See openspec specs/provided-inputs/spec.md.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// The spec's reference pipeline, verbatim: frame, plan(skippable), review-plan(gate→plan),
+// execute(loopBackTo plan, NOT a gate), review-work(gate→execute), validate(critical→execute), finalize.
+const PROVIDED_CONFIG = `
+schemaVersion: 1
+models:
+  opus: { id: anthropic/claude-opus-4-8, family: claude, tags: [strong] }
+  gpt: { id: openai/gpt-5.5, family: gpt, tags: [strong], effort: [medium, xhigh] }
+  mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong, cheap], cost: cheap }
+roles:
+  planner: { use: [opus, auto], effort: [low, high] }
+  coder: { use: [mini], effort: [low, high] }
+  reviewer: { use: [gpt, auto], differentModelFrom: planner }
+  verifier: { use: [gpt, auto], differentModelFrom: coder }
+pipelines:
+  reference:
+    steps:
+      - { phase: frame, role: master }
+      - { phase: plan, role: planner, skippable: true }
+      - { phase: review-plan, role: reviewer, gate: standard, loopBackTo: plan }
+      - { phase: execute, role: coder, loopBackTo: plan }
+      - { phase: review-work, role: reviewer, gate: standard, loopBackTo: execute }
+      - { phase: validate, role: verifier, gate: critical, loopBackTo: execute }
+      - { phase: finalize, role: master }
+`;
+const PROVIDED_REPO = path.join(TMP, "provided-repo");
+fs.mkdirSync(PROVIDED_REPO, { recursive: true });
+fs.writeFileSync(path.join(PROVIDED_REPO, ".moa.yml"), PROVIDED_CONFIG);
+
+// A one-off config in its own dir, for the load-time rejection cases.
+const loadCfg = (name, body) => {
+  const dir = path.join(TMP, `provided-${name}`);
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".moa.yml"), body);
+  return opLoad({ cwd: dir });
+};
+async function providedRun(provided, { pipeline = "reference" } = {}) {
+  opLoad({ cwd: PROVIDED_REPO });
+  await opResolve({ hostModels: HOST });
+  return opRunStart({
+    task: "provided task", pipeline, provided,
+    masterModel: "host/master", masterFamily: "host",
+  });
+}
+const phasesOf = (r) => r.frame.pipeline.split("→");
+
+// ── 4.1 load-time ────────────────────────────────────────────────────────────
+
+t("provided: a skippable non-gate step loads and is reported on the step", () => {
+  const r = opLoad({ cwd: PROVIDED_REPO });
+  assert.equal(r.errors, undefined, JSON.stringify(r.errors));
+  const plan = r.pipelines.reference.steps.find((s) => s.startsWith("plan("));
+  assert.ok(plan.includes("skippable"), plan);
+});
+
+t("provided: skippable on a gate is rejected at load", () => {
+  const r = loadCfg("gate-skippable", `
+schemaVersion: 1
+roles:
+  planner: { use: [auto] }
+  reviewer: { use: [auto] }
+pipelines:
+  p:
+    steps:
+      - { phase: plan, role: planner }
+      - { phase: review-plan, role: reviewer, gate: standard, loopBackTo: plan, skippable: true }
+`);
+  assert.ok(r.errors?.some((e) => e.includes("review-plan") && e.includes("skippable")), JSON.stringify(r.errors));
+});
+
+t("provided: requires naming an unknown phase is rejected at load", () => {
+  const r = loadCfg("bad-requires", `
+schemaVersion: 1
+roles:
+  planner: { use: [auto] }
+  qa: { use: [auto] }
+pipelines:
+  p:
+    steps:
+      - { phase: plan, role: planner }
+      - { phase: q-and-a, role: qa, requires: nope }
+`);
+  assert.ok(r.errors?.some((e) => e.includes("q-and-a") && e.includes("nope")), JSON.stringify(r.errors));
+});
+
+t("provided: the step shape is still strict — an unknown field is rejected", () => {
+  const r = loadCfg("unknown-field", `
+schemaVersion: 1
+roles:
+  planner: { use: [auto] }
+pipelines:
+  p:
+    steps:
+      - { phase: plan, role: planner, skipabble: true }
+`);
+  assert.ok(r.errors?.length, "a misspelled 'skippable' loaded without error");
+});
+
+// ── 4.2 skip resolution ──────────────────────────────────────────────────────
+
+await ta("provided: a provided plan skips the planner AND its review gate", async () => {
+  const r = await providedRun(["plan"]);
+  assert.equal(r.error, undefined, r.error);
+  assert.deepEqual(phasesOf(r), ["frame", "execute", "review-work", "validate", "finalize"]);
+  const m = manifestOf(PROVIDED_REPO, r.runId);
+  assert.deepEqual(m.skipped, [
+    { phase: "plan", reason: "provided" },
+    { phase: "review-plan", reason: "child of plan" },
+  ]);
+  assert.deepEqual(m.provided, ["plan"]);
+  assert.equal(r.next.phase, "frame");
+});
+
+await ta("provided: absent → every step runs and nothing is recorded skipped", async () => {
+  const r = await providedRun(undefined);
+  assert.deepEqual(phasesOf(r), ["frame", "plan", "review-plan", "execute", "review-work", "validate", "finalize"]);
+  const m = manifestOf(PROVIDED_REPO, r.runId);
+  assert.deepEqual(m.skipped, []);
+  assert.equal(m.provided, null);
+});
+
+await ta("provided: a NON-gate loopBackTo does not make a step a dependent", async () => {
+  // execute carries loopBackTo: plan in every shipped pipeline. If loopBackTo cascaded on
+  // non-gates too, providing a plan would delete the one step that does the work.
+  const r = await providedRun(["plan"]);
+  assert.ok(phasesOf(r).includes("execute"));
+});
+
+await ta("provided: requires cascades where there is no loopBackTo to infer from", async () => {
+  const dir = path.join(TMP, "provided-requires");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".moa.yml"), `
+schemaVersion: 1
+models:
+  mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong, cheap] }
+roles:
+  coder: { use: [mini] }
+  qa: { use: [mini] }
+pipelines:
+  p:
+    steps:
+      - { phase: execute, role: coder, skippable: true }
+      - { phase: q-and-a, role: qa, requires: execute }
+      - { phase: finalize, role: master }
+`);
+  opLoad({ cwd: dir });
+  await opResolve({ hostModels: HOST });
+  const r = opRunStart({ task: "t", pipeline: "p", provided: ["execute"], masterModel: "host/m", masterFamily: "host" });
+  assert.equal(r.error, undefined, r.error);
+  assert.deepEqual(r.frame.pipeline.split("→"), ["finalize"]);
+  assert.deepEqual(manifestOf(dir, r.runId).skipped, [
+    { phase: "execute", reason: "provided" },
+    { phase: "q-and-a", reason: "child of execute" },
+  ]);
+});
+
+await ta("provided: requires overrides a gate's loopBackTo as the parent", async () => {
+  const dir = path.join(TMP, "provided-override");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".moa.yml"), `
+schemaVersion: 1
+models:
+  gpt: { id: openai/gpt-5.5, family: gpt, tags: [strong] }
+  mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong, cheap] }
+roles:
+  planner: { use: [mini] }
+  reviewer: { use: [gpt] }
+pipelines:
+  p:
+    steps:
+      - { phase: frame, role: master }
+      - { phase: plan, role: planner, skippable: true }
+      - { phase: review-plan, role: reviewer, gate: standard, loopBackTo: plan, requires: frame }
+`);
+  opLoad({ cwd: dir });
+  await opResolve({ hostModels: HOST });
+  const r = opRunStart({ task: "t", pipeline: "p", provided: ["plan"], masterModel: "host/m", masterFamily: "host" });
+  assert.equal(r.error, undefined, r.error);
+  // parent is frame, which survived — so the gate survives even though loopBackTo points at plan
+  assert.deepEqual(r.frame.pipeline.split("→"), ["frame", "review-plan"]);
+});
+
+await ta("provided: the cascade is transitive", async () => {
+  const dir = path.join(TMP, "provided-transitive");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".moa.yml"), `
+schemaVersion: 1
+models:
+  gpt: { id: openai/gpt-5.5, family: gpt, tags: [strong] }
+  mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong, cheap] }
+roles:
+  planner: { use: [mini] }
+  reviewer: { use: [gpt] }
+pipelines:
+  p:
+    steps:
+      - { phase: plan, role: planner, skippable: true }
+      - { phase: review-plan, role: reviewer, gate: standard, loopBackTo: plan }
+      - { phase: sign-off, role: reviewer, requires: review-plan }
+      - { phase: finalize, role: master }
+`);
+  opLoad({ cwd: dir });
+  await opResolve({ hostModels: HOST });
+  const r = opRunStart({ task: "t", pipeline: "p", provided: ["plan"], masterModel: "host/m", masterFamily: "host" });
+  assert.equal(r.error, undefined, r.error);
+  assert.deepEqual(r.frame.pipeline.split("→"), ["finalize"]);
+  assert.deepEqual(manifestOf(dir, r.runId).skipped.map((s) => s.reason), [
+    "provided", "child of plan", "child of review-plan",
+  ]);
+});
+
+await ta("provided: a repeated entry is idempotent", async () => {
+  const once = await providedRun(["plan"]);
+  const twice = await providedRun(["plan", "plan"]);
+  assert.deepEqual(phasesOf(twice), phasesOf(once));
+  assert.deepEqual(manifestOf(PROVIDED_REPO, twice.runId).skipped,
+    manifestOf(PROVIDED_REPO, once.runId).skipped);
+});
+
+// ── 4.3 run-start errors ─────────────────────────────────────────────────────
+
+const runsUnder = (dir) => {
+  try { return fs.readdirSync(path.join(dir, ".moa", "runs")).length; }
+  catch { return 0; }
+};
+
+await ta("provided: naming a phase the pipeline does not have is refused, no manifest", async () => {
+  const before = runsUnder(PROVIDED_REPO);
+  const r = await providedRun(["research"]);
+  assert.ok(r.error?.includes("research"), r.error);
+  assert.ok(r.error.includes("plan"), "the error should list the skippable phases");
+  assert.equal(runsUnder(PROVIDED_REPO), before);
+});
+
+await ta("provided: naming a phase that is not skippable is refused, no manifest", async () => {
+  const before = runsUnder(PROVIDED_REPO);
+  const r = await providedRun(["execute"]);
+  assert.ok(r.error?.includes("execute") && r.error.includes("skippable"), r.error);
+  assert.equal(runsUnder(PROVIDED_REPO), before);
+});
+
+await ta("provided: skipping every step is refused, no manifest", async () => {
+  const dir = path.join(TMP, "provided-empty");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".moa.yml"), `
+schemaVersion: 1
+models:
+  mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong, cheap] }
+roles:
+  planner: { use: [mini] }
+  coder: { use: [mini] }
+pipelines:
+  p:
+    steps:
+      - { phase: plan, role: planner, skippable: true }
+      - { phase: execute, role: coder, requires: plan }
+`);
+  opLoad({ cwd: dir });
+  await opResolve({ hostModels: HOST });
+  const r = opRunStart({ task: "t", pipeline: "p", provided: ["plan"], masterModel: "host/m", masterFamily: "host" });
+  assert.ok(r.error?.includes("nothing would run"), r.error);
+  assert.equal(runsUnder(dir), 0);
+});
+
+await ta("provided: strict mode runs the pipeline verbatim and refuses provided", async () => {
+  const dir = path.join(TMP, "provided-strict");
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, ".moa.yml"), `
+schemaVersion: 1
+models:
+  mini: { id: minimax/MiniMax-M3, family: minimax, tags: [strong, cheap] }
+master:
+  mode: strict
+roles:
+  planner: { use: [mini] }
+  coder: { use: [mini] }
+pipelines:
+  p:
+    steps:
+      - { phase: plan, role: planner, skippable: true }
+      - { phase: execute, role: coder }
+`);
+  opLoad({ cwd: dir });
+  await opResolve({ hostModels: HOST });
+  const r = opRunStart({ task: "t", pipeline: "p", provided: ["plan"], masterModel: "host/m", masterFamily: "host" });
+  assert.ok(r.error?.includes("strict"), r.error);
+  assert.equal(runsUnder(dir), 0);
+  // ...and the same config starts fine without provided
+  const ok = opRunStart({ task: "t", pipeline: "p", masterModel: "host/m", masterFamily: "host" });
+  assert.equal(ok.error, undefined, ok.error);
+});
+
+await ta("provided: an ad-hoc gate marked skippable is refused at the tool boundary", async () => {
+  opLoad({ cwd: PROVIDED_REPO });
+  await opResolve({ hostModels: HOST });
+  const r = opRunStart({
+    task: "t", masterModel: "host/m", masterFamily: "host",
+    steps: [
+      { phase: "plan", role: "planner" },
+      { phase: "review-plan", role: "reviewer", gate: "critical", loopBackTo: "plan", skippable: true },
+    ],
+  });
+  assert.ok(r.error?.includes("review-plan") && r.error.includes("skippable"), r.error);
+});
+
+// ── 4.4 frame ────────────────────────────────────────────────────────────────
+
+await ta("provided: the frame names every skipped phase and its reason", async () => {
+  const r = await providedRun(["plan"]);
+  assert.equal(r.frame.skipped, "plan (provided), review-plan (child of plan)");
+  assert.equal(r.frame.pipeline, "frame→execute→review-work→validate→finalize");
+});
+
+await ta("provided: no skipped line when nothing was skipped", async () => {
+  const r = await providedRun(undefined);
+  assert.equal("skipped" in r.frame, false, JSON.stringify(r.frame));
+});
+
+// ── 4.5 effort ladder ────────────────────────────────────────────────────────
+
+await ta("provided: a REVISE still escalates a step whose loopBackTo target was skipped", async () => {
+  // execute has loopBackTo: plan. With plan skipped, loops.plan is never written again, so
+  // reading the rung from loopBackTo would freeze execute at rung 0 across every REVISE.
+  const r = await providedRun(["plan"]);
+  const step = (res) => res.next ?? res;
+  // frame (master) → execute
+  let cur = opStepReport({ runId: r.runId, phase: "frame", verdict: "APPROVE", summary: "framed" });
+  assert.equal(step(cur).phase, "execute");
+  assert.equal(step(cur).effort, "low", JSON.stringify(step(cur)));
+  cur = opStepReport({ runId: r.runId, phase: "execute", verdict: "APPROVE", summary: "wrote", producerModel: "minimax/MiniMax-M3", producerFamily: "minimax" });
+  assert.equal(step(cur).phase, "review-work");
+  cur = opStepReport({ runId: r.runId, phase: "review-work", verdict: "APPROVE", summary: "ok", producerModel: "openai/gpt-5.5", producerFamily: "gpt" });
+  assert.equal(step(cur).phase, "validate");
+  const looped = opStepReport({ runId: r.runId, phase: "validate", verdict: "REVISE", summary: "redo", producerModel: "openai/gpt-5.5", producerFamily: "gpt" });
+  assert.equal(looped.to, "execute", JSON.stringify(looped));
+  assert.equal(looped.next.effort, "high", "execute stayed at rung 0 after a REVISE — the ladder is frozen");
+});
+
+await ta("provided: escalation through a SURVIVING loopBackTo target is unchanged", async () => {
+  const r = await providedRun(undefined);
+  let cur = opStepReport({ runId: r.runId, phase: "frame", verdict: "APPROVE", summary: "framed" });
+  assert.equal(cur.next.phase, "plan");
+  assert.equal(cur.next.effort, "low");
+  cur = opStepReport({ runId: r.runId, phase: "plan", verdict: "APPROVE", summary: "planned", producerModel: "anthropic/claude-opus-4-8", producerFamily: "claude" });
+  assert.equal(cur.next.phase, "review-plan");
+  const looped = opStepReport({ runId: r.runId, phase: "review-plan", verdict: "REVISE", summary: "redo", producerModel: "openai/gpt-5.5", producerFamily: "gpt" });
+  assert.equal(looped.to, "plan");
+  // plan's own rung climbed, and execute reads loops.plan because plan is still IN the run
+  assert.equal(looped.next.effort, "high");
+});
 console.log(`\n${n} checks passed`);

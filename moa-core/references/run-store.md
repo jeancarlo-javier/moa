@@ -22,6 +22,13 @@ Precedence (highest wins): **per-run override > project config > template defaul
 `blocked_no_binding`, `blocked_no_model`, `verification_unavailable`,
 `blocked_verifier_disagreement`, `max_loops_exceeded`).
 
+Two run-level fields record what the run chose NOT to do. `provided` is the phase list the caller
+passed to `moa_run_start` (`null` when it passed none), and `skipped` is `[{phase, reason}]` in
+pipeline order, where `reason` is `provided` (the caller declared that phase's output already
+exists) or `child of <phase>` (its parent was skipped). `steps` holds only the survivors, so every
+index into it — `current`, `stepIndex` on a spawn record, the loop counters — counts survivors and
+nothing else; the skipped phases live only in `skipped`.
+
 The manifest also carries two run-level observation fields. `attempt` is a run-global monotonic
 counter incremented on every REVISE loop-back and every gate ERROR retry: a re-entered step keeps
 its `stepIndex`, so without it a completed spawn from attempt 1 would read as evidence about

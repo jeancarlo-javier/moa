@@ -50,8 +50,10 @@ subagent; synthesize what returns. The `mcp__moa__*` tools hold the state and en
    plainly (`blocked_no_model` → offer to adjust the registry or `/moa learn-tool`).
 3. **`moa_run_start`** — pass the task plus a named pipeline, or ad-hoc `steps` you composed
    (adaptive), or nothing in workflow mode. **Always pass `masterModel`/`masterFamily`** — your own
-   model — so independence is checked against you when you author a phase. Print the returned
-   `frame` to the user before any action, then execute `next`.
+   model — so independence is checked against you when you author a phase. If the brief already
+   carries what a phase would produce, name that phase in `provided` — those steps and anything
+   depending on them are skipped, and the frame says which. Print the returned `frame` to the user
+   before any action, then execute `next`.
 4. **Execute each step, then `moa_step_report`** — the ONLY way to advance. Per step:
    - `spawn.kind: native` → launch the subagent with your host capability on the step's
      `model`/`effort`, giving it the tools the role's work needs, as far as the host allows.

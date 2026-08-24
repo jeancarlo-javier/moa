@@ -75,7 +75,7 @@
       "description": "The conductor = the agent running the skill (host agent). Not a spawn target.",
       "properties": {
         "mode": { "enum": ["strict", "auto"], "default": "auto",
-          "description": "How literally the master runs the pipeline. 'strict': pipeline verbatim — every declared phase runs with its declared role×model, nothing skipped/merged/inlined, master performs no producing role (use for CI/release). 'auto' (default): master may right-size non-gate, non-critical phases and may author small mutations itself, each with a logged reason — but the gate floor is absolute: every gatesRequired phase runs with the config-resolved model, and verifier independence holds against the ACTUAL producer (the coder, or the master if it authored the change)." },
+          "description": "How literally the master runs the pipeline. 'strict': pipeline verbatim — every declared phase runs with its declared role×model, nothing skipped/merged/inlined, master performs no producing role (use for CI/release); moa_run_start rejects a non-empty `provided` here, since honoring it would skip declared phases. 'auto' (default): master may right-size non-gate, non-critical phases and may author small mutations itself, each with a logged reason — but the gate floor is absolute: every gatesRequired phase runs with the config-resolved model, and verifier independence holds against the ACTUAL producer (the coder, or the master if it authored the change)." },
         "modelAdvisory": {
           "type": "object",
           "additionalProperties": false,
@@ -135,7 +135,9 @@
                 "gate": { "enum": ["none", "standard", "critical"], "default": "none",
                   "description": "Gate tier — collapses the old gate+critical booleans and the top-level gatesRequired list into one field. 'none' (default, omit): a producing/master phase, right-sizeable in auto mode. 'standard': a mandatory checkpoint whose verifier is a DIFFERENT family than the producer (the nearest preceding non-gate, non-master phase). 'critical': standard PLUS the verifier carries all master.hardVerificationTags. No optional gates — a lighter flow is a different pipeline. Because 'critical' is a value of 'gate', 'critical-without-a-gate' is unrepresentable." },
                 "fanout": { "enum": ["none", "byDisjointWriteSet"], "default": "none" },
-                "loopBackTo": { "type": "string", "description": "Phase to return to on REVISE; must name a phase in this pipeline." },
+                "loopBackTo": { "type": "string", "description": "Phase to return to on REVISE; must name a phase in this pipeline. On a GATE it also acts as the default `requires` parent — a gate guards the phase it sends work back to. On a non-gate step it has no effect on skipping; it only selects whose loop counter drives this step's effort rung." },
+                "skippable": { "const": true, "description": "The run may skip this phase by naming it in moa_run_start's `provided`. Illegal on a gate: `provided` is written by the run, and a run never removes a gate directly — a gate leaves only by following a skipped parent." },
+                "requires": { "type": "string", "minLength": 1, "description": "This step's parent phase: skipped whenever that phase is skipped, transitively. Must name a phase in this pipeline. Defaults, for a GATE only, to `loopBackTo`. Declare it for a child with no loopBackTo, or to override a gate's default." },
                 "writeSet": {
                   "type": "array",
                   "items": {
