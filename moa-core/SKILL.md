@@ -1,6 +1,6 @@
 ---
 name: moa
-version: 1.0.0
+version: 1.1.0
 allowed-tools: mcp__moa__*
 description: |
   Master of Agents (moa) — runtime-AGNOSTIC multi-agent orchestration. Become the conductor:

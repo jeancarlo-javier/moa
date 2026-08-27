@@ -2460,7 +2460,7 @@ if (isMain) await startMcp();
 async function startMcp() {
   const { McpServer } = await import("@modelcontextprotocol/sdk/server/mcp.js");
   const { StdioServerTransport } = await import("@modelcontextprotocol/sdk/server/stdio.js");
-  const server = new McpServer({ name: "moa", version: "1.0.0" });
+  const server = new McpServer({ name: "moa", version: "1.1.0" });
   const json = (r) => ({ content: [{ type: "text", text: JSON.stringify(r) }], isError: !!r?.error });
 
   server.tool(
